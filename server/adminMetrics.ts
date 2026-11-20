@@ -1,0 +1,14 @@
+import {getSupabaseTransport} from './supabaseStore.ts';
+let pendingMetrics:Promise<any>|null=null;
+export async function readAdminMetricInput(){if(pendingMetrics)return pendingMetrics;const current=getSupabaseTransport()('inex_admin_metrics',{});pendingMetrics=current;try{return await current;}finally{if(pendingMetrics===current)pendingMetrics=null;}}
+export function mapAdminMetrics(input:any,range='7d'){
+ const m={...input.totals},daily=new Map<string,any>((input.daily||[]).map((d:any)=>[d.day,d])),hours=new Map<number,any>((input.hourly||[]).map((h:any)=>[h.hour,h]));
+ const today=new Date(input.today+'T12:00:00Z'),weekdays=['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+ const point=(data:any,date:string,label:string)=>{const deposits=Number(data?.deposits||0),withdrawals=Number(data?.withdrawals||0),depositsCount=Number(data?.deposit_count||0),withdrawalsCount=Number(data?.withdrawal_count||0);return{date,label,deposits,withdrawals,depositsCount,withdrawalsCount,netBalance:deposits-withdrawals,volumeTotal:deposits+withdrawals,txCountTotal:depositsCount+withdrawalsCount};};
+ const days=Array.from({length:30},(_,i)=>{const d=new Date(today);d.setUTCDate(d.getUTCDate()-29+i);const iso=d.toISOString().slice(0,10),date=iso.slice(8,10)+'/'+iso.slice(5,7);return point(daily.get(iso),date,i===29?'Hoje ('+date+')':weekdays[d.getUTCDay()]+' '+date);});
+ const intraday=Array.from({length:8},(_,i)=>{const hour=String(i*3).padStart(2,'0')+':00';return point(hours.get(i*3),hour,`Hoje ${hour} - ${String(i*3+3).padStart(2,'0')}:00`);});
+ const series={today:intraday,sevenDays:days.slice(-7),thirtyDays:days};
+ m.gameGgr=Math.round((m.totalWagered-m.totalPayout)*100)/100;m.netProfit=Math.round((m.gameGgr-m.totalAffiliateCommissionsPaid)*100)/100;m.cashFlow=m.totalDepositsAmount-m.approvedWithdrawalsAmount;m.totalLiabilities=m.totalBalance+m.totalAffiliateBalance;m.totalOrganicUsers=m.totalUsers-m.totalReferredUsers;m.profitMarginPercent=m.totalWagered?m.netProfit/m.totalWagered*100:0;m.todaySalesAmount=Number(daily.get(input.today)?.deposits||0);m.todaySalesPercentChange=input.yesterdaySales?(m.todaySalesAmount-input.yesterdaySales)/input.yesterdaySales*100:m.todaySalesAmount?100:0;
+ m.financialResultBasis='Resultado dos jogos menos comissões registradas, antes de taxas, tributos e custos operacionais';m.chartSeries=series;m.chartData=['today','1d'].includes(range)?series.today:['30d','month'].includes(range)?series.thirtyDays:series.sevenDays;
+ m.recentActivities=(input.activities||[]).map((a:any)=>{const seconds=Math.max(0,Math.floor((Date.parse(input.observedAt)-Number(a.createdAt))/1000));return{id:a.id,type:a.type,title:a.title,userName:a.userName,amount:a.amount,timeAgo:seconds<60?'Agora mesmo':seconds<3600?`Há ${Math.floor(seconds/60)} min`:seconds<86400?`Há ${Math.floor(seconds/3600)} h`:new Date(Number(a.createdAt)).toLocaleDateString('pt-BR',{timeZone:'America/Sao_Paulo'})};});return m;
+}

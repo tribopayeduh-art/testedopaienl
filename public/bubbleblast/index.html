@@ -1,0 +1,623 @@
+<!DOCTYPE html><html lang="pt-BR"><head>
+    <meta charset="utf-8">
+    <base href="/">
+    <script>
+      (function () {
+        try {
+          if (location.pathname.startsWith('/bubbleblast')) {
+            var b = document.querySelector('base');
+            if (b) b.setAttribute('href', '/bubbleblast/');
+          }
+        } catch (_) {}
+      })();
+    </script>
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#c9a8e8">
+    <meta name="description" content="Bubbles — jogo de bolhas para celular com partidas interativas.">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Bubbles">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/favicon-iconb.png">
+    <link rel="apple-touch-icon" href="images/apple-touch-iconb.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="images/apple-touch-iconb.png">
+    <link rel="manifest" href="js/manifest.json">
+    <title>Bubble Blast — Estoure e Ganhe no PIX | jogarbubble.online</title>
+    <script defer src="js/demo-auth.js"></script>
+    <script src="js/theme-boot.js"></script>
+    <script defer src="js/tutorial-audio-unlock.js"></script>
+    <script>window.__BB_PUBLIC_CONFIG__={"site_nome":"Bubbles Win","site_logo_url":"\/images\/logos\/logoblock.png","site_favicon_url":"\/favicon.png","suporte_links":[],"deposito_valores_rapidos":[25,30,50,100,150,200],"deposito_botoes_labels":{"30":"MINIMO","50":"EXCELENTE","100":"BÔNUS","150":"BÔNUS","200":"BÔNUS"},"deposito_botoes_cores":{"30":"#10e40c","50":"#e40c0c","100":"#6010c1","150":"#facc15","200":"#6010c1"},"entrada_valores":[5,10,20,30,50,100],"demo_jogo":{"ativo":true,"label":"Jogar grátis"},"fin":{"deposito_minimo":25,"deposito_maximo":10000,"saque_minimo":50,"saque_maximo":5000,"taxa_saque_ativo":false,"taxa_saque_valor":0,"saque_afiliado_minimo":10,"saque_afiliado_maximo":5000},"pixel_meta_id":"","pixel_tiktok_id":"","pixel_kwai_id":"","popup":{"ativo":false,"imagem_url":"","frequencia":"sessao","icone":"","titulo":"","mensagem":"","btn_texto":"","btn_acao":"","btn_url":""}};</script>
+    <script>window.__BB_GAME_CONFIG__=null;</script>
+    <script defer src="js/public-config-boot.js"></script>
+    <script>
+      window.bbEntry = /^(?:\/bubbleblast)?\/(?:index\.html|login|cadastro)?\/?$/.test(location.pathname) || location.pathname === '/bubbleblast';
+      if (!window.bbEntry) {
+        var gameModule = document.createElement('script');
+        gameModule.type = 'module';
+        gameModule.src = 'js/index-jrhpc6Vb.js';
+        document.head.appendChild(gameModule);
+      }
+    </script>
+    <link rel="modulepreload" crossorigin="" href="js/rolldown-runtime-CbXtAM7H.js">
+    <link rel="modulepreload" crossorigin="" href="js/vendor-BW8unCxY.js">
+    <link rel="stylesheet" crossorigin="" href="css/index-DPX3B-wu.css">
+    <script>
+      (function () {
+        try {
+          var p = new URLSearchParams(location.search);
+          var r = p.get('ref') || p.get('code') || p.get('r') || p.get('indicacao') || p.get('refCode');
+          var partner = p.get('p') || p.get('partner') || p.get('partnerCode') || p.get('parceiro');
+          if (r) {
+            var cleanR = r.trim().toUpperCase();
+            sessionStorage.setItem('bb-ref', cleanR);
+            localStorage.setItem('bb-ref', cleanR);
+            sessionStorage.setItem('bb_ref_code', cleanR);
+            localStorage.setItem('bb_ref_code', cleanR);
+            sessionStorage.setItem('alliance_ref_code', cleanR);
+            localStorage.setItem('alliance_ref_code', cleanR);
+            sessionStorage.setItem('refCode', cleanR);
+            localStorage.setItem('refCode', cleanR);
+          }
+          if (partner) {
+            var cleanP = partner.trim().toUpperCase();
+            sessionStorage.setItem('bb-partner', cleanP);
+            localStorage.setItem('bb-partner', cleanP);
+            sessionStorage.setItem('bb_partner_code', cleanP);
+            localStorage.setItem('bb_partner_code', cleanP);
+            sessionStorage.setItem('partnerCode', cleanP);
+            localStorage.setItem('partnerCode', cleanP);
+          }
+          ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'src', 'sck'].forEach(function(param) {
+            var val = p.get(param);
+            if (val) {
+              sessionStorage.setItem('bb_' + param, val);
+              localStorage.setItem('bb_' + param, val);
+              sessionStorage.setItem(param, val);
+              localStorage.setItem(param, val);
+            }
+          });
+
+          // Cross-game tracking payload identical to other games
+          var trackingPayload = {
+            game: 'g_bubble_blast',
+            source: 'jogarbubble_domain',
+            timestamp: Date.now(),
+            url: window.location.href
+          };
+          sessionStorage.setItem('alliance_game_tracking_v2', JSON.stringify(trackingPayload));
+          localStorage.setItem('alliance_game_tracking_v2', JSON.stringify(trackingPayload));
+          localStorage.setItem('alliance_last_game', 'g_bubble_blast');
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      #bb-auth-modal-wrap {
+        position: fixed;
+        inset: 0;
+        z-index: 999999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(15, 8, 30, 0.88);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        padding: 16px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      .bb-auth-box {
+        width: 100%;
+        max-width: 400px;
+        background: #20133d;
+        border: 1px solid rgba(192, 132, 252, 0.25);
+        border-radius: 24px;
+        padding: 28px 24px;
+        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.65), 0 0 35px rgba(168, 85, 247, 0.2);
+        color: #ffffff;
+        box-sizing: border-box;
+      }
+      .bb-auth-header {
+        text-align: center;
+        margin-bottom: 20px;
+      }
+      .bb-auth-logo {
+        width: 130px;
+        height: auto;
+        margin: 0 auto 12px;
+        display: block;
+      }
+      .bb-auth-header h2 {
+        font-size: 22px;
+        font-weight: 800;
+        margin: 0 0 6px;
+        background: linear-gradient(135deg, #ffffff 0%, #d8b4fe 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      .bb-auth-header p {
+        font-size: 13px;
+        color: #c084fc;
+        margin: 0;
+        line-height: 1.4;
+      }
+      .bb-auth-tabs {
+        display: flex;
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        padding: 4px;
+        margin-bottom: 20px;
+      }
+      .bb-auth-tab {
+        flex: 1;
+        padding: 10px;
+        border: none;
+        background: transparent;
+        color: #d8b4fe;
+        font-size: 14px;
+        font-weight: 700;
+        border-radius: 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+      .bb-auth-tab.active {
+        background: #a855f7;
+        color: #ffffff;
+        box-shadow: 0 4px 12px rgba(168, 85, 247, 0.4);
+      }
+      .bb-auth-form {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .bb-input-group {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        text-align: left;
+      }
+      .bb-input-group label {
+        font-size: 12px;
+        font-weight: 700;
+        color: #e9d5ff;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .bb-input-group input {
+        width: 100%;
+        padding: 13px 16px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(192, 132, 252, 0.2);
+        border-radius: 12px;
+        color: #ffffff;
+        font-size: 15px;
+        outline: none;
+        box-sizing: border-box;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      }
+      .bb-input-group input:focus {
+        border-color: #c084fc;
+        box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.25);
+      }
+      .bb-input-group input::placeholder {
+        color: rgba(216, 180, 254, 0.45);
+      }
+      .bb-auth-btn {
+        width: 100%;
+        padding: 14px;
+        margin-top: 8px;
+        border: none;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #a855f7 0%, #7e22ce 100%);
+        color: #ffffff;
+        font-size: 16px;
+        font-weight: 800;
+        cursor: pointer;
+        box-shadow: 0 8px 20px rgba(168, 85, 247, 0.4);
+        transition: transform 0.15s ease, filter 0.15s ease;
+      }
+      .bb-auth-btn:hover {
+        filter: brightness(1.1);
+      }
+      .bb-auth-btn:active {
+        transform: scale(0.98);
+      }
+      .bb-auth-btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .bb-auth-error {
+        background: rgba(239, 68, 68, 0.18);
+        border: 1px solid rgba(239, 68, 68, 0.4);
+        color: #fca5a5;
+        padding: 10px 14px;
+        border-radius: 10px;
+        font-size: 13px;
+        display: none;
+        line-height: 1.4;
+      }
+      .bb-auth-footer {
+        margin-top: 16px;
+        font-size: 12px;
+        color: #a855f7;
+        text-align: center;
+      }
+    </style>
+  <link rel="stylesheet" href="css/bubble-entry.css?v=2">
+  </head>
+  <body>
+    <div id="root"></div>
+    <main id="bb-intro" class="bb-intro" hidden>
+      <div class="bb-intro-content">
+        <img class="bb-brand" src="images/logos/bubble-win.webp" alt="Bubble Win">
+        <div class="bb-intro-copy">
+          <p class="bb-kicker">BUBBLE WIN</p>
+          <h1>Estoure as<br>bolhas<span>.</span></h1>
+          <p>Entre na sua conta ou cadastre-se para começar.</p>
+        </div>
+        <div class="bb-entry-actions">
+          <button type="button" class="bb-auth-btn" id="bb-play">Jogar agora</button>
+          <button type="button" class="bb-secondary" id="bb-enter">Entrar</button>
+          <button type="button" class="bb-link" id="bb-signup">Criar conta</button>
+        </div>
+      </div>
+      <div class="bb-video-panel">
+        <video poster="images/video/intro-poster.webp" id="bb-intro-video" muted autoplay playsinline loop preload="none" aria-label="Apresentação do Bubble Win"></video>
+        <button type="button" class="bb-video-toggle" id="bb-video-toggle">Pausar vídeo</button>
+      </div>
+    </main>
+
+    <div id="bb-auth-modal-wrap" style="display: none;">
+      <section class="bb-auth-box" role="dialog" aria-modal="true" aria-labelledby="bb-auth-title">
+        <img class="bb-auth-logo" src="images/logos/bubble-win.webp" alt="Bubble Win">
+        <button type="button" id="bb-close" class="bb-link bb-back">← Voltar</button>
+        <div class="bb-auth-header">
+          
+          <h2 id="bb-auth-title">Acesse sua Conta</h2>
+          <p id="bb-auth-desc">Informe seu e-mail e senha para jogar e sacar via PIX.</p>
+        </div>
+
+        <div id="bb-auth-error" class="bb-auth-error" role="alert"></div>
+
+        <form id="bb-auth-form" class="bb-auth-form">
+          <div class="bb-input-group" id="bb-group-name" style="display: none;">
+            <label for="bb-input-name">Nome Completo</label>
+            <input type="text" id="bb-input-name" placeholder="Seu nome" autocomplete="name" maxlength="80">
+          </div>
+
+          <div class="bb-input-group">
+            <label for="bb-input-email" id="bb-contact-label">Telefone ou e-mail</label>
+            <input type="text" id="bb-input-email" placeholder="Telefone com DDD ou e-mail" autocomplete="username" required maxlength="120">
+          </div>
+
+          <div class="bb-input-group bb-password">
+            <label for="bb-input-password">Senha</label>
+            <input type="password" id="bb-input-password" placeholder="Senha" autocomplete="current-password" required maxlength="128">
+            <button type="button" id="bb-show-pass" aria-label="Mostrar senha" aria-pressed="false"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></button>
+          </div>
+
+          <button type="submit" class="bb-auth-btn" id="bb-auth-submit-btn">Entrar</button>
+        </form>
+
+        <div class="bb-auth-footer">
+          <span id="bb-auth-switch-label">Ainda não tem conta?</span>
+          <button type="button" class="bb-link" id="bb-auth-switch">Criar conta</button>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      (function() {
+        var modal = document.getElementById('bb-auth-modal-wrap');
+        var intro = document.getElementById('bb-intro');
+        var video = document.getElementById('bb-intro-video');
+        var videoToggle = document.getElementById('bb-video-toggle');
+        var switchBtn = document.getElementById('bb-auth-switch');
+        var switchLabel = document.getElementById('bb-auth-switch-label');
+        var previousFocus, resumeVideo;
+        var groupName = document.getElementById('bb-group-name');
+        var inputName = document.getElementById('bb-input-name');
+        var inputEmail = document.getElementById('bb-input-email');
+        var inputPass = document.getElementById('bb-input-password');
+        var reveal = document.getElementById('bb-show-pass');
+        function showPassword(show) {
+          inputPass.type = show ? 'text' : 'password';
+          reveal.setAttribute('aria-pressed', String(show));
+          reveal.setAttribute('aria-label', show ? 'Ocultar senha' : 'Mostrar senha');
+        }
+        reveal.addEventListener('click', function() { showPassword(inputPass.type === 'password'); });
+        var title = document.getElementById('bb-auth-title');
+        var desc = document.getElementById('bb-auth-desc');
+        var submitBtn = document.getElementById('bb-auth-submit-btn');
+        var errorEl = document.getElementById('bb-auth-error');
+        var form = document.getElementById('bb-auth-form');
+
+        var isRegister = false;
+
+        function setMode(reg) {
+          isRegister = reg;
+          switchBtn.textContent = reg ? 'Entrar' : 'Cadastre-se grátis';
+          switchLabel.textContent = reg ? 'Já tem conta?' : 'Ainda não tem conta?';
+          inputPass.autocomplete = reg ? 'new-password' : 'current-password';
+          inputPass.minLength = reg ? 6 : 0;
+          inputPass.value = '';
+          showPassword(false);
+          inputEmail.value = '';
+          inputEmail.type = reg ? 'tel' : 'text';
+          inputEmail.autocomplete = reg ? 'tel-national' : 'username';
+          inputEmail.placeholder = reg ? 'Telefone com DDD (ex: 11 99999-0000)' : 'Telefone com DDD ou e-mail';
+          document.getElementById('bb-contact-label').textContent = reg ? 'Telefone com DDD' : 'Telefone ou e-mail';
+          inputPass.placeholder = reg ? 'Senha (mín. 6 caracteres)' : 'Senha';
+          groupName.style.display = reg ? 'flex' : 'none';
+          if (reg) {
+            inputName.setAttribute('required', 'required');
+            title.textContent = 'Criar conta';
+            desc.textContent = 'Leva menos de 1 minuto. Jogue e saque via PIX.';
+            submitBtn.textContent = 'Criar conta grátis';
+          } else {
+            inputName.removeAttribute('required');
+            title.textContent = 'Bem-vindo de volta';
+            desc.textContent = 'Entre para continuar jogando e resgatando.';
+            submitBtn.textContent = 'Entrar';
+          }
+          errorEl.style.display = 'none';
+          errorEl.textContent = '';
+        }
+
+        switchBtn.addEventListener('click', function() {
+          if (!submitBtn.disabled) setMode(!isRegister);
+        });
+
+        function openAuth(reg) {
+          previousFocus = document.activeElement;
+          setMode(reg);
+          resumeVideo = !video.paused;
+          video.pause();
+          intro.inert = true;
+          document.getElementById('root').inert = true;
+          modal.style.display = 'flex';
+          title.tabIndex = -1;
+          title.focus();
+        }
+
+        function closeAuth() {
+          if (submitBtn.disabled) return;
+          modal.style.display = 'none';
+          intro.inert = false;
+          if (resumeVideo) startVideo();
+          document.getElementById('root').inert = false;
+          if (previousFocus && previousFocus !== document.body) previousFocus.focus();
+          else if (window.bbEntry) document.getElementById('bb-play').focus();
+        }
+
+        document.getElementById('bb-close').addEventListener('click', closeAuth);
+        modal.addEventListener('keydown', function(e) {
+          if (e.key === 'Escape') closeAuth();
+          if (e.key !== 'Tab') return;
+          var controls = Array.from(modal.querySelectorAll('button, input')).filter(function(el) {
+            return !el.disabled && el.getClientRects().length;
+          });
+          var first = controls[0], last = controls[controls.length - 1];
+          if ((e.shiftKey && (document.activeElement === first || document.activeElement === title)) ||
+              (!e.shiftKey && document.activeElement === last)) {
+            e.preventDefault();
+            (e.shiftKey ? last : first).focus();
+          }
+        });
+
+        function goToGame() {
+          var target = location.pathname.startsWith('/bubbleblast') ? '/bubbleblast/painel' : '/painel';
+          location.assign(target + location.search);
+        }
+
+        function startVideo() {
+          if (!video.src) video.src = 'images/video/vdlpf.mp4';
+          video.play().catch(function() {});
+        }
+        videoToggle.addEventListener('click', function() {
+          if (video.paused) startVideo();
+          else video.pause();
+        });
+        video.addEventListener('play', function() { videoToggle.textContent = 'Pausar vídeo'; });
+        video.addEventListener('pause', function() { videoToggle.textContent = 'Reproduzir vídeo'; });
+
+        function showError(msg) {
+          errorEl.textContent = msg;
+          errorEl.style.display = 'block';
+        }
+
+        function getStoredToken() {
+          return localStorage.getItem('bb_token') ||
+                 localStorage.getItem('bb_session') ||
+                 localStorage.getItem('pg_auth_token') ||
+                 localStorage.getItem('token') || '';
+        }
+
+        if (window.bbEntry) {
+          intro.hidden = false;
+          document.body.classList.add('bb-entry-page');
+          videoToggle.textContent = 'Reproduzir vídeo';
+          if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) startVideo();
+          document.getElementById('bb-enter').addEventListener('click', function() { openAuth(false); });
+          document.getElementById('bb-signup').addEventListener('click', function() { openAuth(true); });
+          var playBtn = document.getElementById('bb-play');
+          playBtn.addEventListener('click', async function() {
+            var token = getStoredToken();
+            if (!token) return openAuth(false);
+            playBtn.disabled = true;
+            try {
+              var res = await fetch('/api/auth/me', {
+                headers: { Authorization: 'Bearer ' + token, 'X-Game-Id': 'g_bubble_blast' },
+                signal: AbortSignal.timeout(6000)
+              });
+              if (res.ok && (await res.json()).user) return goToGame();
+              openAuth(false);
+              if (res.status >= 500) showError('O acesso está temporariamente indisponível. Tente novamente.');
+            } catch (_) {
+              openAuth(false);
+              showError('Não foi possível verificar a sessão. Tente novamente.');
+            } finally {
+              playBtn.disabled = false;
+            }
+          });
+          if (/\/(login|cadastro)\/?$/.test(location.pathname)) {
+            openAuth(/\/cadastro\/?$/.test(location.pathname));
+          }
+        }
+
+        form.addEventListener('submit', function(e) {
+          e.preventDefault();
+          errorEl.style.display = 'none';
+          var email = inputEmail.value.trim().toLowerCase();
+          var pass = inputPass.value;
+
+          if (!email || !pass) {
+            showError('Informe seu telefone ou e-mail e sua senha.');
+            return;
+          }
+
+          if (isRegister) {
+            var name = inputName.value.trim();
+            if (name.length < 2) {
+              showError('Informe seu nome completo.');
+              return;
+            }
+            if (pass.length < 6) {
+              showError('A senha deve ter pelo menos 6 caracteres.');
+              return;
+            }
+            var phone = email.replace(/[^0-9]/g, '');
+            if (!/^(?:\+?55)?[0-9]{10,11}$/.test(email.replace(/[ ()-]/g, ''))) {
+              showError('Informe um telefone válido com DDD.');
+              return;
+            }
+            if (phone.length > 11) phone = phone.slice(2);
+
+            var ref = localStorage.getItem('bb_ref_code') || localStorage.getItem('bb-ref') || localStorage.getItem('alliance_ref_code') || localStorage.getItem('refCode') || '';
+            var partner = localStorage.getItem('bb_partner_code') || localStorage.getItem('bb-partner') || localStorage.getItem('partnerCode') || '';
+
+            var utmParams = {};
+            ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'src', 'sck'].forEach(function(k) {
+              var v = localStorage.getItem('bb_' + k) || localStorage.getItem(k) || sessionStorage.getItem('bb_' + k) || sessionStorage.getItem(k);
+              if (v) utmParams[k] = v;
+            });
+
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Criando conta...';
+
+            fetch('/api/auth/register', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Game-Origin': 'g_bubble_blast',
+                'X-Game-Id': 'g_bubble_blast',
+                'X-Registered-Game': 'g_bubble_blast'
+              },
+              body: JSON.stringify(Object.assign({
+                name: name,
+                phone: phone,
+                password: pass,
+                refCode: ref,
+                partner: partner,
+                partnerCode: partner,
+                game: 'g_bubble_blast',
+                gameId: 'g_bubble_blast',
+                registeredGame: 'g_bubble_blast',
+                acquisitionGame: 'g_bubble_blast',
+                trackingGame: 'g_bubble_blast',
+                trackingSource: 'jogarbubble_domain'
+              }, utmParams))
+            }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+              .then(function(res) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Criar conta grátis';
+                if (!res.ok) {
+                  showError(res.data.error || res.data.message || 'Erro ao realizar cadastro.');
+                  return;
+                }
+                if (res.data.token) {
+                  localStorage.setItem('bb_token', res.data.token);
+                  localStorage.setItem('bb_session', res.data.token);
+                  localStorage.setItem('pg_auth_token', res.data.token);
+                  localStorage.setItem('paygateway_token', res.data.token);
+                  localStorage.setItem('token', res.data.token);
+                }
+                try {
+                  if (window.parent && window.parent !== window) {
+                    window.parent.postMessage({ source: 'bubble-blast-shell', event: 'auth', token: res.data.token, user: res.data.user }, '*');
+                  }
+                } catch(_) {}
+                goToGame();
+              }).catch(function(err) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Criar conta grátis';
+                showError('Erro de conexão ao cadastrar. Tente novamente.');
+              });
+          } else {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Entrando...';
+
+            fetch('/api/auth/login', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Game-Origin': 'g_bubble_blast',
+                'X-Game-Id': 'g_bubble_blast'
+              },
+              body: JSON.stringify({
+                login: email.includes('@') ? email : email.replace(/[^0-9]/g, '').replace(/^55(?=[0-9]{10,11}$)/, ''),
+                password: pass,
+                game: 'g_bubble_blast',
+                gameId: 'g_bubble_blast',
+                registeredGame: 'g_bubble_blast',
+                acquisitionGame: 'g_bubble_blast'
+              })
+            }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+              .then(function(res) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Entrar';
+                if (!res.ok) {
+                  showError(res.data.error || res.data.message || 'E-mail ou senha incorretos.');
+                  return;
+                }
+                if (res.data.token) {
+                  localStorage.setItem('bb_token', res.data.token);
+                  localStorage.setItem('bb_session', res.data.token);
+                  localStorage.setItem('pg_auth_token', res.data.token);
+                  localStorage.setItem('paygateway_token', res.data.token);
+                  localStorage.setItem('token', res.data.token);
+                }
+                try {
+                  if (window.parent && window.parent !== window) {
+                    window.parent.postMessage({ source: 'bubble-blast-shell', event: 'auth', token: res.data.token, user: res.data.user }, '*');
+                  }
+                } catch(_) {}
+                goToGame();
+              }).catch(function(err) {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Entrar';
+                showError('Erro de conexão ao entrar. Tente novamente.');
+              });
+          }
+        });
+
+        // Intercept clicks on landing page CTA buttons to open Auth
+        document.addEventListener('click', function(e) {
+          var target = e.target.closest('button, a');
+          if (!target || intro.contains(target) || modal.contains(target)) return;
+          var text = (target.textContent || '').trim().toLowerCase();
+          if (text.includes('jogar') || text.includes('conta') || text.includes('entrar') || text.includes('cadastr')) {
+            var token = getStoredToken();
+            if (!token) {
+              e.preventDefault();
+              e.stopPropagation();
+              openAuth(text.includes('cadastr') || text.includes('grátis') || text.includes('gratis'));
+            }
+          }
+        }, true);
+
+
+      })();
+    </script>
+  
+
+</body></html>

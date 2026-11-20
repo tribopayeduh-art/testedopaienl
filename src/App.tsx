@@ -1,0 +1,1198 @@
+import { readApiJson } from './lib/readApiJson';
+import {GameBrandContext} from './components/GameBrandContext';
+import {detectAppContext,type AppContext} from './lib/gameContext';
+import {CountMastersPlayerView} from './components/CountMastersPlayerView';
+import {InexLoader} from './components/InexLoader';
+import React, { lazy, Suspense, useState, useEffect, useRef } from 'react';
+import { User, Transaction, Game, AffiliateInfo } from './types';
+import { Header } from './components/Header';
+import { BottomNavigation, TabType } from './components/BottomNavigation';
+import { HomeView } from './components/HomeView';
+import { FinanceView } from './components/FinanceView';
+import { GamesView } from './components/GamesView';
+import { MoreView } from './components/MoreView';
+import { AffiliatesView } from './components/AffiliatesView';
+import { MembersAreaView } from './components/MembersAreaView';
+import { CampaignsView } from './components/CampaignsView';
+import { PartnerPanelView } from './components/partner/PartnerPanelView';
+import { PartnerRequestView } from './components/partner/PartnerRequestView';
+import { LoginView } from './components/LoginView';
+import { RegisterView } from './components/RegisterView';
+import { DepositModal } from './components/DepositModal';
+import { WithdrawModal } from './components/WithdrawModal';
+import { TermsModal } from './components/TermsModal';
+import { ProfileModal } from './components/ProfileModal';
+import { GatewaySettingsModal } from './components/GatewaySettingsModal';
+import { PixKeysModal } from './components/PixKeysModal';
+import { Toast, ToastType } from './components/Toast';
+import { trackDepositInitiated, trackDepositSuccess, trackRegistration } from './lib/tracking';
+import {
+  getTrackedGame,
+  getGameTrackingPayload,
+  setTrackedGame,
+  normalizeGameId,
+} from './lib/gameTracking';
+import {
+  registerServiceWorker,
+  subscribeToWebPush,
+  triggerSaleNotification,
+  triggerNewAffiliateNotification,
+  getNotificationState,
+  playSaleSound,
+} from './lib/pwaNotification';
+import { applyGameSEO } from './lib/seo';
+import { Loader2, Gamepad2, ShieldCheck, ExternalLink, Crown } from 'lucide-react';
+import logoImg from './components/logo.webp';
+import { GAME_ASSETS, publicAsset } from './config/gameAssets';
+
+const BlockPuzzleApp = lazy(() => import('./game/BlockPuzzleApp').then((module) => ({ default: module.BlockPuzzleApp })));
+const LazyScreen = () => <InexLoader fullScreen />;
+
+
+const gameTrackingId = (context: AppContext) => context === 'countmasters' ? 'g_count_masters' : context === 'gen-dino' ? 'g_gen_dino' : context === 'raspa-fortuna' ? 'g_raspa_fortuna' : context === 'subwaypay' ? 'g_subway_pay' : context === 'bubbleblast' ? 'g_bubble_blast' : context === 'blockwin' ? 'g_block_puzzle' : 'platform';
+
+const resolveAcquisitionGame = (context: AppContext): string => {
+  const searchParams = new URLSearchParams(window.location.search);
+  const rawParam = searchParams.get('game') || searchParams.get('site') || searchParams.get('g') || searchParams.get('gameId');
+  const normalized = normalizeGameId(rawParam);
+  if (normalized && normalized !== 'alliance_hub') return normalized;
+
+  if (context !== 'alliance-hub') {
+    return gameTrackingId(context);
+  }
+
+  // Strictly preserve iNEX context when in the hub/affiliate panel
+  return 'alliance-hub';
+};
+
+const DirectGameFrame: React.FC<{ context: 'gen-dino' | 'raspa-fortuna' | 'subwaypay' | 'bubbleblast' }> = ({ context }) => {
+  const [depositOpen, setDepositOpen] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: ToastType } | null>(null);
+
+  useEffect(() => {
+    const gid = gameTrackingId(context);
+    setTrackedGame(gid, `direct_frame_${context}`);
+    applyGameSEO(context);
+  }, [context]);
+
+  const showToast = (message: string, type: ToastType = 'info') => {
+    setToast({ message, type });
+  };
+
+  const [targetSrc] = useState<string>(() => {
+    const base =
+      context === 'gen-dino'
+        ? GAME_ASSETS.genDino.app
+        : context === 'subwaypay'
+          ? GAME_ASSETS.subwayPay.app
+          : context === 'bubbleblast'
+            ? GAME_ASSETS.bubbleBlast.app
+            : GAME_ASSETS.raspaFortuna.app;
+    const target = new URL(base, window.location.href);
+    const incoming = new URLSearchParams(window.location.search);
+    const ref = incoming.get('ref') || incoming.get('refCode') || incoming.get('r');
+    if (ref) target.searchParams.set('ref', ref.trim().toUpperCase());
+    target.searchParams.set('game', gameTrackingId(context));
+    target.searchParams.set('sourceDomain', window.location.hostname.toLowerCase());
+    target.searchParams.set('embedded', '1');
+    const token = typeof window !== 'undefined' ? (localStorage.getItem('pg_auth_token') || localStorage.getItem('paygateway_token') || localStorage.getItem('token') || '') : '';
+    if (token) target.searchParams.set('token', token);
+    return target.toString();
+  });
+
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+
+  const sendTokenToGame = () => {
+    try {
+      const t = localStorage.getItem('pg_auth_token') || localStorage.getItem('paygateway_token') || localStorage.getItem('token') || '';
+      if (t && iframeRef.current?.contentWindow) {
+        iframeRef.current.contentWindow.postMessage({
+          source: 'tribopay-parent',
+          event: 'session',
+          token: t,
+        }, '*');
+      }
+    } catch (_) {}
+  };
+
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (!event.data) return;
+      if (event.data.event === 'ready') {
+        sendTokenToGame();
+      }
+      if (event.data.event === 'auth' && event.data.token) {
+        try {
+          localStorage.setItem('pg_auth_token', event.data.token);
+          localStorage.setItem('paygateway_token', event.data.token);
+          localStorage.setItem('token', event.data.token);
+          if (event.data.user) {
+            localStorage.setItem('user', JSON.stringify(event.data.user));
+          }
+        } catch (_) {}
+      }
+      if (event.data.event === 'deposit' || event.data.action === 'deposit' || event.data.type === 'deposit') {
+        setDepositOpen(true);
+      }
+      if (event.data.event === 'toast' && event.data.message) {
+        showToast(String(event.data.message), event.data.type || 'info');
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [context]);
+
+  const handleConfirmDeposit = async (amount: number) => {
+    playSaleSound();
+    showToast(`Depósito de R$ ${amount.toFixed(2)} confirmado com sucesso!`, 'success');
+  };
+
+  return (
+    <>
+      {toast && (
+        <Toast
+          message={toast.message}
+          type={toast.type}
+          duration={3000}
+          onClose={() => setToast(null)}
+        />
+      )}
+      <iframe
+        ref={iframeRef}
+        src={targetSrc}
+        onLoad={sendTokenToGame}
+        title={context === 'gen-dino' ? 'GEN DINO' : context === 'subwaypay' ? 'Subway Pay' : context === 'bubbleblast' ? 'Bubble Blast' : 'Raspa Fortuna'}
+        className="fixed inset-0 h-[100dvh] w-full border-0 bg-black"
+        allow="autoplay; fullscreen; clipboard-write"
+      />
+      <DepositModal
+        isOpen={depositOpen}
+        onClose={() => setDepositOpen(false)}
+        onConfirmDeposit={handleConfirmDeposit}
+        loading={false}
+        gameId={gameTrackingId(context)}
+      />
+    </>
+  );
+};
+
+export default function App(){
+ const [neutral,setNeutral]=useState(()=>detectAppContext()!=='alliance-hub');
+ return <GameBrandContext.Provider value={neutral}><AppContent onGameModeChange={setNeutral}/></GameBrandContext.Provider>;
+}
+
+function AppContent({onGameModeChange}:{onGameModeChange:(value:boolean)=>void}) {
+  const [appContext, setAppContext] = useState<AppContext>(() => detectAppContext());
+  const isGameSite = appContext !== 'alliance-hub';
+  const [playingGame,setPlayingGame]=useState(false);
+  const gameVisible=isGameSite||playingGame;
+  useEffect(()=>{onGameModeChange(gameVisible);},[gameVisible,onGameModeChange]);
+
+  // Auth State
+  const [token, setToken] = useState<string | null>(() => {
+    if (typeof window === 'undefined') return null;
+    const urlParams = new URLSearchParams(window.location.search);
+    const fromUrl = urlParams.get('token') || urlParams.get('t') || urlParams.get('auth');
+    if (fromUrl) {
+      try {
+        localStorage.setItem('pg_auth_token', fromUrl);
+        localStorage.setItem('paygateway_token', fromUrl);
+        localStorage.setItem('token', fromUrl);
+      } catch (_) {}
+      return fromUrl;
+    }
+    return (
+      localStorage.getItem('pg_auth_token') ||
+      localStorage.getItem('paygateway_token') ||
+      localStorage.getItem('token') ||
+      sessionStorage.getItem('token') ||
+      sessionStorage.getItem('pg_auth_token') ||
+      null
+    );
+  });
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authView, setAuthView] = useState<'login' | 'register'>('login');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [initialRefCode, setInitialRefCode] = useState<string>('');
+
+  // Real-time tracking of known transactions for affiliate sale notifications
+  const knownTxIdsRef = useRef<Set<string> | null>(null);
+  const knownIndicationsCountRef = useRef<number | null>(null);
+  const knownCommissionIdsRef = useRef<Set<string> | null>(null);
+
+  // Main App State
+  const [activeTab, setActiveTab] = useState<TabType>('home');
+  const [subView, setSubView] = useState<'main' | 'affiliates' | 'members' | 'campaigns' | 'partner'>('main');
+  const [gamesResetKey, setGamesResetKey] = useState<number>(0);
+
+  // Data State
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [games, setGames] = useState<Game[]>([]);
+  const [affiliateInfo, setAffiliateInfo] = useState<AffiliateInfo | null>(null);
+
+  // Modals & Overlay State
+  const [partnerPanelOpen, setPartnerPanelOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    const path = window.location.pathname.toLowerCase();
+    const search = window.location.search.toLowerCase();
+    return (
+      path.startsWith('/parceiro') ||
+      path.startsWith('/partner') ||
+      search.includes('view=partner') ||
+      search.includes('tab=partner') ||
+      search.includes('parceiro')
+    );
+  });
+  const [depositOpen, setDepositOpen] = useState(false);
+  const [depositGameId, setDepositGameId] = useState('platform');
+  const [withdrawOpen, setWithdrawOpen] = useState(false);
+  const [termsOpen, setTermsOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [gatewaySettingsOpen, setGatewaySettingsOpen] = useState(false);
+  const [pixKeyModalOpen, setPixKeyModalOpen] = useState(false);
+  const [pixKeyModalInitialView, setPixKeyModalInitialView] = useState<'list' | 'add'>('add');
+
+  // Action Loading
+  const [actionLoading, setActionLoading] = useState(false);
+
+  // Toast State
+  const [toast, setToast] = useState<{ message: string; type: ToastType } | null>(null);
+
+  const showToast = (message: string, type: ToastType = 'info') => {
+    setToast({ message, type });
+  };
+
+  const isUserAdmin = (u: User | null | undefined): boolean => {
+    if (!u) return false;
+    return u.role === 'admin' || u.role === 'superadmin';
+  };
+
+  const isUserPartnerOrAdmin = (u: User | null | undefined): boolean => {
+    if (!u) return false;
+    return Boolean((u.isPartner && u.partnerApproved) || isUserAdmin(u));
+  };
+
+  const handleOpenAdmin = () => {
+    if (!user) {
+      showToast('Usuário bloqueado para essa ação. Faça login com uma conta administradora.', 'error');
+      return;
+    }
+    if (!isUserAdmin(user)) {
+      showToast('Usuário bloqueado para essa ação.', 'error');
+      return;
+    }
+    window.location.assign('/admin');
+  };
+
+  const handleOpenPartnerPanel = () => {
+    if (!user) {
+      showToast('Faça login com sua conta para acessar o Painel do Parceiro.', 'error');
+      setAuthView('login');
+      return;
+    }
+    if (!isUserPartnerOrAdmin(user)) {
+      showToast('Acesso restrito para Parceiros Oficiais e Administradores.', 'error');
+      setPartnerPanelOpen(false);
+      return;
+    }
+    setPartnerPanelOpen(true);
+    try {
+      if (!window.location.pathname.startsWith('/parceiro')) {
+        window.history.pushState({}, '', '/parceiros');
+      }
+    } catch (e) {}
+  };
+
+  const handleClosePartnerPanel = () => {
+    setPartnerPanelOpen(false);
+    try {
+      const url = new URL(window.location.href);
+      if (url.pathname.startsWith('/parceiro') || url.pathname.startsWith('/partner') || url.pathname.startsWith('/parceiros')) {
+        window.history.replaceState({}, '', '/');
+      }
+    } catch (e) {}
+  };
+
+  // 1. Initialize Service Worker & Detect Route / Referral URL Parameter on initial load
+  useEffect(() => {
+    registerServiceWorker();
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.ready.then((reg) => {
+        if ('Notification' in window && Notification.permission === 'granted') {
+          subscribeToWebPush(reg).catch(console.error);
+        }
+      }).catch(console.error);
+    }
+
+    const pathname = window.location.pathname.toLowerCase();
+    const hostname = window.location.hostname.toLowerCase();
+    const isPartnerContext =
+      hostname.includes('parceiro') ||
+      pathname.startsWith('/parceiro') ||
+      pathname.startsWith('/p/');
+
+    if (appContext !== 'alliance-hub') {
+      applyGameSEO(appContext);
+    } else {
+      const targetAcquisitionGame = resolveAcquisitionGame(appContext);
+      if (
+        targetAcquisitionGame &&
+        targetAcquisitionGame !== 'alliance-hub' &&
+        targetAcquisitionGame !== 'alliance_hub' &&
+        targetAcquisitionGame !== 'platform'
+      ) {
+        applyGameSEO(targetAcquisitionGame);
+      } else {
+        applyGameSEO(isPartnerContext ? 'partner' : 'alliance-hub');
+      }
+    }
+
+    const params = new URLSearchParams(window.location.search);
+
+    // Support clean short links: /p/:code, /parceiro/:code, /partner/:code, /r/:code
+    let pathCode: string | null = null;
+    const shortMatch = window.location.pathname.match(/^\/(?:p|parceiro|partner|r)\/([a-zA-Z0-9_-]+)/i);
+    if (shortMatch && shortMatch[1]) {
+      pathCode = shortMatch[1].toUpperCase().trim();
+    }
+
+    const partnerParam = params.get('p') || params.get('partner') || params.get('partnerCode');
+    const refParam = params.get('ref') || params.get('refCode') || params.get('r');
+    const isPartnerReferral = Boolean(
+      (pathCode && !window.location.pathname.startsWith('/r/')) ||
+      partnerParam ||
+      params.get('source') === 'partner'
+    );
+
+    const activeCode = pathCode || partnerParam || refParam;
+    
+    if (activeCode) {
+      const cleanRef = activeCode.toUpperCase().trim();
+      setInitialRefCode(cleanRef);
+      try {
+        localStorage.setItem('alliance_ref_code', cleanRef);
+        sessionStorage.setItem('alliance_ref_code', cleanRef);
+        if (isPartnerReferral) {
+          localStorage.setItem('alliance_partner_code', cleanRef);
+          sessionStorage.setItem('alliance_partner_code', cleanRef);
+          localStorage.setItem('alliance_partner_source', 'partner');
+        }
+        localStorage.setItem('alliance_origin_game', resolveAcquisitionGame(appContext));
+        localStorage.setItem('alliance_origin_domain', window.location.hostname.toLowerCase());
+      } catch (e) {}
+    } else {
+      try {
+        const stored = localStorage.getItem('alliance_ref_code') || sessionStorage.getItem('alliance_ref_code');
+        if (stored) {
+          setInitialRefCode(stored);
+        }
+      } catch (e) {}
+    }
+
+    const isPartnerDomain = window.location.hostname.toLowerCase().includes('parceiro');
+    const isPartnerPath = pathname === '/parceiro' || pathname === '/parceiros';
+    if ((isPartnerDomain && !pathCode && !partnerParam) || isPartnerPath) {
+      setActiveTab('more');
+      setSubView('partner');
+    }
+
+    if (pathname.includes('/cadastro') || pathname.includes('/register') || activeCode) {
+      setAuthView('register');
+    } else if (pathname.includes('/login')) {
+      setAuthView('login');
+    }
+
+    const handleNavEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ tab: TabType; subView?: 'main' | 'affiliates' | 'members' | 'campaigns' | 'partner' }>;
+      if (custom.detail?.tab) {
+        setActiveTab(custom.detail.tab);
+      }
+      if (custom.detail?.subView) {
+        setSubView(custom.detail.subView);
+      }
+    };
+    const handleWindowMsg = (e: MessageEvent) => {
+      if (!e.data) return;
+      if (e.data.type === 'navigate-tab' && e.data.tab) {
+        setActiveTab(e.data.tab);
+      }
+    };
+    window.addEventListener('app-navigate-tab', handleNavEvent);
+    window.addEventListener('message', handleWindowMsg);
+    return () => {
+      window.removeEventListener('app-navigate-tab', handleNavEvent);
+      window.removeEventListener('message', handleWindowMsg);
+    };
+  }, [appContext]);
+
+  // Ensure iNEX / Partner SEO remains strictly active when navigating panel tabs
+  useEffect(() => {
+    if (appContext === 'alliance-hub' && activeTab !== 'games') {
+      const isPartnerRoute =
+        window.location.hostname.toLowerCase().includes('parceiro') ||
+        window.location.pathname.startsWith('/parceiro') ||
+        window.location.pathname.startsWith('/p/') ||
+        (activeTab === 'more' && subView === 'partner');
+      applyGameSEO(isPartnerRoute ? 'partner' : 'alliance-hub');
+    }
+  }, [activeTab, subView, appContext]);
+
+  // 2. Fetch User Data on mount or token change
+  useEffect(() => {
+    const initAuth = async () => {
+      if (!token) {
+        setUser(null);
+        knownTxIdsRef.current = null;
+        knownIndicationsCountRef.current = null;
+        knownCommissionIdsRef.current = null;
+        setAuthLoading(false);
+
+
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (res.ok) {
+          const userData = await readApiJson(res);
+
+          setUser(userData);
+          if ('Notification' in window && Notification.permission === 'granted') {
+            navigator.serviceWorker.ready.then(subscribeToWebPush).catch(console.error);
+          }
+          fetchOverview(token);
+          fetchGames(token);
+          fetchAffiliateInfo(token);
+
+        } else {
+          // Invalid token
+          localStorage.removeItem('pg_auth_token');
+          localStorage.removeItem('paygateway_token');
+          localStorage.removeItem('token');
+          try {
+            sessionStorage.removeItem('token');
+            sessionStorage.removeItem('pg_auth_token');
+          } catch (_) {}
+          setToken(null);
+          setUser(null);
+          knownTxIdsRef.current = null;
+          knownCommissionIdsRef.current = null;
+        }
+      } catch (e) {
+        console.error('Auth error', e);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+
+    initAuth();
+  }, [token]);
+
+  // Real-time Polling Interval for instant balance, transactions and affiliate sales updates
+  useEffect(() => {
+    if (!token) {
+      knownTxIdsRef.current = null;
+      knownCommissionIdsRef.current = null;
+      return;
+    }
+
+    // Never poll platform affiliate/finance data if user is in a direct full-screen game context
+    if (appContext === 'gen-dino' || appContext === 'subwaypay' || appContext === 'bubbleblast' || appContext === 'raspa-fortuna') {
+      return;
+    }
+
+    let isMounted = true;
+    let inFlightOverview = false;
+    let inFlightAffiliate = false;
+
+    const poll = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (!isMounted) return;
+
+      if (!inFlightOverview) {
+        inFlightOverview = true;
+        fetchOverview(token).finally(() => { inFlightOverview = false; });
+      }
+
+      if (!inFlightAffiliate) {
+        inFlightAffiliate = true;
+        fetchAffiliateInfo(token).finally(() => { inFlightAffiliate = false; });
+      }
+    };
+
+    const pollInterval = setInterval(poll, 7000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(pollInterval);
+    };
+  }, [token, appContext]);
+
+  // Fetch Finance Data (with Real-Time Affiliate Sale Detection & PWA Notification)
+  const fetchOverview = async (authToken: string) => {
+    try {
+      const res = await fetch('/api/finance/overview', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        const data = await readApiJson(res);
+        const newTxs: Transaction[] = data.transactions || [];
+
+        if (knownTxIdsRef.current === null) {
+          // Initial population of transaction IDs
+          knownTxIdsRef.current = new Set(newTxs.map((t) => t.id));
+        } else {
+          // Check for new incoming sales, commissions or deposits
+          for (const tx of newTxs) {
+            if (!knownTxIdsRef.current.has(tx.id)) {
+              knownTxIdsRef.current.add(tx.id);
+
+              const isDepositOrSale =
+                tx.type === 'deposit' ||
+                tx.paymentMethod === 'Afiliados' ||
+                tx.description?.toLowerCase().includes('comissão') ||
+                tx.description?.toLowerCase().includes('indicação') ||
+                tx.description?.toLowerCase().includes('depósito') ||
+                tx.amount > 0;
+
+              if (isDepositOrSale) {
+                const formattedAmount = tx.amount.toLocaleString('pt-BR', {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                });
+
+                // Always play venda.mp3 sound instantly
+                playSaleSound();
+
+                // Trigger PWA background/foreground sale notification
+                triggerSaleNotification({
+                  amount: tx.amount,
+                  customTitle: 'Nova Venda na sua rede!',
+                  customSubtitle: `Comissão de R$ ${formattedAmount} adicionada ao saldo!`,
+                });
+              }
+            }
+          }
+        }
+
+        setUser((prev) => {
+          if (!prev) return null;
+          const nextMin = data.minWithdraw !== undefined ? data.minWithdraw : prev.minWithdraw;
+          const nextFee = data.withdrawFee !== undefined ? data.withdrawFee : prev.withdrawFee;
+          if (prev.balance === data.balance && prev.minWithdraw === nextMin && prev.withdrawFee === nextFee) {
+            return prev;
+          }
+          return {
+            ...prev,
+            balance: data.balance,
+            minWithdraw: nextMin,
+            withdrawFee: nextFee
+          };
+        });
+        setTransactions(newTxs);
+      }
+    } catch (_e) {
+      // Graceful catch: suppress transient fetch failures during page transitions
+    }
+  };
+
+  // Fetch Games List
+  const fetchGames = async (authToken: string) => {
+    try {
+      const res = await fetch('/api/games', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        const data = await readApiJson(res);
+        setGames(data);
+      }
+    } catch (_e) {
+      // Graceful catch
+    }
+  };
+
+  // Fetch Affiliate Info (with Real-Time New Registration Detection & PWA Notification)
+  const fetchAffiliateInfo = async (authToken: string) => {
+    try {
+      const res = await fetch('/api/affiliates/info', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (res.ok) {
+        const data = await readApiJson(res);
+        const currentCount = data.indicationsCount || 0;
+        const commissions = Array.isArray(data.commissions) ? data.commissions : [];
+
+        if (knownIndicationsCountRef.current === null) {
+          knownIndicationsCountRef.current = currentCount;
+        } else if (currentCount > knownIndicationsCountRef.current) {
+          knownIndicationsCountRef.current = currentCount;
+
+          const state = getNotificationState();
+          if (state.newAffiliateEnabled) {
+            triggerNewAffiliateNotification();
+          }
+        }
+
+        if (knownCommissionIdsRef.current === null) {
+          knownCommissionIdsRef.current = new Set(commissions.map((commission: any) => commission.id));
+        } else {
+          for (const commission of commissions) {
+            if (!knownCommissionIdsRef.current.has(commission.id)) {
+              knownCommissionIdsRef.current.add(commission.id);
+              playSaleSound();
+              triggerSaleNotification({
+                amount: Number(commission.amount || 0),
+                customTitle: 'Nova comissão recebida!',
+                customSubtitle: `${commission.buyerName || 'Um indicado'} gerou comissão em ${commission.gameName || 'sua rede'}.`,
+              });
+            }
+          }
+        }
+
+        setAffiliateInfo(data);
+      }
+    } catch (_e) {
+      // Graceful catch: suppress transient fetch failures
+    }
+  };
+
+  const refreshData = async () => {
+    if (token) {
+      fetchOverview(token);
+      fetchAffiliateInfo(token);
+      try {
+        const res = await fetch('/api/auth/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.ok) {
+          const userData = await readApiJson(res);
+          setUser(userData);
+        }
+      } catch {}
+    }
+  };
+  useEffect(() => { const handle = () => { void refreshData(); }; window.addEventListener('pis-io-transferred', handle); return () => window.removeEventListener('pis-io-transferred', handle); }, [user?.id, token]);
+
+
+  // Automatically refresh user authorization and partner status when accessing partner view
+  useEffect(() => {
+    if (subView === 'partner' && token) {
+      refreshData();
+    }
+  }, [subView, token]);
+
+  // AUTH ACTIONS
+  const handleLogin = async (email: string, pass: string) => {
+    setAuthError(null);
+    setActionLoading(true);
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password: pass, isGameSite, acquisitionGame: resolveAcquisitionGame(appContext) }),
+      });
+
+      const data = await readApiJson(res);
+      if (!res.ok) {
+        throw new Error(data.error || 'Falha ao efetuar login.');
+      }
+
+      localStorage.setItem('pg_auth_token', data.token);
+      localStorage.setItem('paygateway_token', data.token);
+      localStorage.setItem('token', data.token);
+      try {
+        sessionStorage.setItem('token', data.token);
+        sessionStorage.setItem('pg_auth_token', data.token);
+      } catch (_) {}
+      setToken(data.token);
+      setUser(data.user);
+      showToast('Bem-vindo de volta!', 'success');
+
+    } catch (err: any) {
+      setAuthError(err.message);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleRegister = async (data: {
+    name: string;
+    email: string;
+    phone: string;
+    password: string;
+    refCode?: string;
+  }) => {
+    setAuthError(null);
+    setActionLoading(true);
+    try {
+      const tracking = getGameTrackingPayload();
+      const resolvedGame = resolveAcquisitionGame(appContext) || tracking.registeredGame || 'g_block_puzzle';
+      const storedPartnerCode =
+        sessionStorage.getItem('alliance_partner_code') ||
+        localStorage.getItem('alliance_partner_code') ||
+        new URLSearchParams(window.location.search).get('p') ||
+        new URLSearchParams(window.location.search).get('partner') ||
+        undefined;
+
+      const res = await fetch('/api/auth/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Game-Origin': resolvedGame,
+          'X-Game-Id': resolvedGame
+        },
+        body: JSON.stringify({
+          ...data,
+          refCode: data.refCode || storedPartnerCode,
+          partnerCode: storedPartnerCode,
+          partner: storedPartnerCode,
+          p: storedPartnerCode,
+          isAffiliate: !isGameSite, // Registers as affiliate when on goalliancehub.com portal
+          acquisitionGame: resolvedGame,
+          registeredGame: resolvedGame,
+          game: resolvedGame,
+          gameId: resolvedGame,
+          trackingSource: tracking.trackingSource,
+          acquisitionDomain: window.location.hostname.toLowerCase(),
+        }),
+      });
+
+      const resData = await readApiJson(res);
+      if (!res.ok) {
+        throw new Error(resData.error || 'Falha ao cadastrar conta.');
+      }
+
+      localStorage.setItem('pg_auth_token', resData.token);
+      localStorage.setItem('paygateway_token', resData.token);
+      localStorage.setItem('token', resData.token);
+      try {
+        sessionStorage.setItem('token', resData.token);
+        sessionStorage.setItem('pg_auth_token', resData.token);
+      } catch (_) {}
+      setToken(resData.token);
+      setUser(resData.user);
+      showToast('Conta criada com sucesso!', 'success');
+
+      if (!isGameSite) {
+        setPixKeyModalInitialView('add');
+        setPixKeyModalOpen(true);
+      }
+    } catch (err: any) {
+      setAuthError(err.message);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  // Keep push subscription synchronized with authenticated user
+  useEffect(() => {
+    if (token && 'serviceWorker' in navigator && 'Notification' in window && Notification.permission === 'granted') {
+      navigator.serviceWorker.ready.then((reg) => {
+        subscribeToWebPush(reg).catch(console.error);
+      }).catch(console.error);
+    }
+  }, [token, user]);
+
+  const handleLogout = async () => {
+    if (token) {
+      try {
+        await fetch('/api/auth/logout', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch (e) {
+        console.error('Logout error', e);
+      }
+    }
+    localStorage.removeItem('pg_auth_token');
+    localStorage.removeItem('paygateway_token');
+    localStorage.removeItem('token');
+    try {
+      sessionStorage.removeItem('token');
+      sessionStorage.removeItem('pg_auth_token');
+    } catch (_) {}
+    setToken(null);
+    setUser(null);
+    knownTxIdsRef.current = null;
+    knownIndicationsCountRef.current = null;
+    knownCommissionIdsRef.current = null;
+    setActiveTab('home');
+    setSubView('main');
+    showToast('Sessão encerrada com sucesso.', 'info');
+  };
+
+  // FINANCIAL ACTIONS
+  const handleConfirmDeposit = async (amount: number) => {
+    if (!token) return;
+    setActionLoading(true);
+    try {
+      // Re-fetch user profile to sync updated balance
+      const meRes = await fetch('/api/auth/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (meRes.ok) {
+        const meData = await readApiJson(meRes);
+        if (meData.user) {
+          setUser(meData.user);
+        }
+      }
+
+      playSaleSound();
+      fetchOverview(token);
+      fetchAffiliateInfo(token);
+      showToast(`Depósito de R$ ${amount.toFixed(2)} aprovado!`, 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Erro ao atualizar dados.', 'error');
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleConfirmWithdraw = async (amount: number, pixKeyId: string) => {
+    if (!token) return;
+    setActionLoading(true);
+    try {
+      const res = await fetch('/api/withdrawals', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ amount, pixKeyId }),
+      });
+
+      const data = await readApiJson(res);
+      if (!res.ok) {
+        let msg = data.error || data.message || 'Erro ao processar saque.';
+        const lower = msg.toLowerCase();
+        if ((lower.includes('saldo insuficiente') && (lower.includes('dotfy') || lower.includes('gateway'))) || lower.includes('dotfy gateway')) {
+          msg = 'Os saques estão em manutenção temporária. Tente novamente em 30 minutos. Seu saldo na plataforma permanece intacto.';
+        }
+        throw new Error(msg);
+      }
+
+      if (typeof data.balance === 'number') {
+        setUser((prev) => (prev ? { ...prev, balance: data.balance } : null));
+      }
+      fetchOverview(token);
+      showToast(data.message || `Solicitação de saque de R$ ${amount.toFixed(2)} enviada com sucesso!`, 'success');
+    } catch (err: any) {
+      showToast(err.message || 'Erro ao realizar saque.', 'error');
+      throw err;
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  // Render Independent Game Site if explicitly in game site mode
+  if (appContext === 'blockwin') {
+    return (
+      <Suspense fallback={<LazyScreen />}>
+        <BlockPuzzleApp
+          onReturnToPortal={() => {
+            setAppContext('alliance-hub');
+            setActiveTab('home');
+          }}
+        />
+      </Suspense>
+    );
+  }
+
+  if (appContext === 'gen-dino' || appContext === 'raspa-fortuna' || appContext === 'subwaypay' || appContext === 'bubbleblast') {
+    return <DirectGameFrame context={appContext} />;
+  }
+
+  // Keep the brand animation visible while restoring the session.
+  if (authLoading) return <InexLoader fullScreen />;
+
+  // Render Unauthenticated Flow (Login / Register)
+  if (!user) {
+    return (
+      <div className="auth-app-background min-h-screen bg-zinc-900/5 flex flex-col items-center justify-center">
+        <div className="auth-app-shell w-full bg-white min-h-screen border border-zinc-200/80 shadow-2xl overflow-hidden relative">
+          {toast && (
+            <Toast
+              message={toast.message}
+              type={toast.type}
+              duration={3000}
+              onClose={() => setToast(null)}
+            />
+          )}
+
+          {authView === 'login' ? (
+            <LoginView
+              onLogin={handleLogin}
+              onNavigateToRegister={() => setAuthView('register')}
+              onForgotPassword={() =>
+                showToast('Instruções de recuperação foram enviadas.', 'info')
+              }
+              loading={actionLoading}
+              error={authError}
+            />
+          ) : (
+            <RegisterView
+              onRegister={handleRegister}
+              onNavigateToLogin={() => setAuthView('login')}
+              onOpenTerms={() => setTermsOpen(true)}
+              loading={actionLoading}
+              error={authError}
+              initialRefCode={initialRefCode}
+            />
+          )}
+
+          <TermsModal isOpen={termsOpen} onClose={() => setTermsOpen(false)} />
+        </div>
+      </div>
+    );
+  }
+
+  // Render Authenticated Mobile Container
+  return (
+    <div className="min-h-screen bg-[#f8f9fa] flex items-center justify-center p-0 sm:px-1.5 lg:px-2 sm:py-1 lg:py-1.5">
+      {/* Responsive Shell Frame: edge-to-edge mobile and expansive fluid layout for tablet & desktop */}
+      <div className="alliance-app-shell w-full max-w-full lg:max-w-[99.2vw] 2xl:max-w-[2400px] bg-white min-h-screen sm:min-h-[820px] border-x-0 sm:border sm:border-zinc-200/90 shadow-2xl relative overflow-hidden flex flex-col justify-between transition-[max-width,border-radius] duration-300 sm:rounded-2xl lg:rounded-[22px]">
+        {/* Toast */}
+        {toast && (
+          <Toast message={toast.message} type={toast.type} duration={3000} onClose={() => setToast(null)} />
+        )}
+
+        {/* Header */}
+        {!gameVisible && <Header
+          user={{ ...user, balance: user.balance + Number(affiliateInfo?.affiliateBalance || 0) }}
+          onProfileClick={() => setProfileOpen(true)}
+          onOpenSettings={() => setGatewaySettingsOpen(true)}
+          onOpenAdmin={handleOpenAdmin}
+        />}
+
+        {/* Scrollable Main Content Area */}
+        <main className="alliance-main-content flex-1 overflow-y-auto no-scrollbar">
+          <div key={`${activeTab}-${subView}`} className="alliance-section-transition">
+          {appContext==='countmasters'&&<CountMastersPlayerView user={user} onBack={()=>{setAppContext('alliance-hub');setActiveTab('games');}} onBalanceChange={balance=>setUser(prev=>prev?{...prev,balance}:prev)} onDeposit={()=>{setDepositGameId('g_count_masters');setDepositOpen(true);}}/>}
+          {appContext!=='countmasters' && activeTab === 'home' && (
+            <HomeView
+              user={user}
+              transactions={transactions}
+              affiliateInfo={affiliateInfo}
+              onDeposit={() => { setDepositGameId('platform'); setDepositOpen(true); }}
+              onWithdraw={() => setWithdrawOpen(true)}
+              onNavigateToFinance={() => setActiveTab('finance')}
+            />
+          )}
+
+          {appContext!=='countmasters' && activeTab === 'finance' && (
+            <FinanceView
+              user={user}
+              transactions={transactions}
+              affiliateInfo={affiliateInfo}
+              onDeposit={() => { setDepositGameId('platform'); setDepositOpen(true); }}
+              onWithdraw={() => setWithdrawOpen(true)}
+              onRefresh={refreshData}
+              onShowToast={showToast}
+            />
+          )}
+
+          {appContext!=='countmasters' && activeTab === 'games' && (
+            <GamesView
+              key={gamesResetKey}
+              onPlayingChange={setPlayingGame}
+              games={games}
+              user={user}
+              affiliateInfo={affiliateInfo}
+              onShowToast={showToast}
+              onDeposit={(gameId) => { setDepositGameId(gameId || 'platform'); setDepositOpen(true); }}
+              onWithdraw={() => setWithdrawOpen(true)}
+              onPlayGame={(betAmount) => {
+                showToast(`Partida iniciada com entrada de R$ ${betAmount.toFixed(2)}!`, 'success');
+                setAppContext('blockwin');
+              }}
+              onBalanceChange={(balance) => {
+                setUser((current) => {
+                  if (!current || current.balance === balance) return current;
+                  return { ...current, balance };
+                });
+              }}
+              onOpenReferral={() => {
+                setActiveTab('more');
+                setSubView('affiliates');
+              }}
+              onOpenProfile={() => setProfileOpen(true)}
+            />
+          )}
+
+          {appContext!=='countmasters' && activeTab === 'more' && (
+            <>
+              {subView === 'campaigns' ? (
+                <CampaignsView
+                  onBack={() => setSubView('main')}
+                  onShowToast={showToast}
+                />
+              ) : subView === 'affiliates' ? (
+                <AffiliatesView
+                  affiliateInfo={affiliateInfo}
+                  currentUser={user}
+                  onBack={() => setSubView('main')}
+                  onCopySuccess={() => showToast('Link de indicação copiado!', 'success')}
+                  onShowToast={showToast}
+                  onOpenSettings={() => setGatewaySettingsOpen(true)}
+                  onOpenPartnerPanel={isUserPartnerOrAdmin(user) ? handleOpenPartnerPanel : undefined}
+                  onRefresh={() => {
+                    if (token) fetchAffiliateInfo(token);
+                  }}
+                />
+              ) : subView === 'partner' ? (
+                // Automatically redirect to fullscreen Partner Panel
+                <div className="p-8 text-center text-zinc-500 max-w-md mx-auto space-y-3">
+                  <div className="w-10 h-10 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto animate-pulse">
+                    <Crown className="w-5 h-5 text-amber-500 fill-amber-500" />
+                  </div>
+                  <p className="font-bold text-zinc-800 text-sm">Abrindo Painel do Parceiro Oficial...</p>
+                  <p className="text-xs text-zinc-400">O painel foi expandido para tela cheia independente.</p>
+                  <button
+                    type="button"
+                    onClick={handleOpenPartnerPanel}
+                    className="px-4 py-2 bg-emerald-600 text-white text-xs font-bold rounded-xl shadow-xs"
+                  >
+                    Acessar Tela Cheia
+                  </button>
+                </div>
+              ) : subView === 'members' ? (
+                <MembersAreaView onBack={() => setSubView('main')} />
+              ) : (
+                <MoreView
+                  user={user}
+                  onOpenProfile={() => setProfileOpen(true)}
+                  onOpenAffiliates={() => {
+                    setSubView('affiliates');
+                    if (token) fetchAffiliateInfo(token);
+                  }}
+                  onOpenPartnerPanel={isUserPartnerOrAdmin(user) ? handleOpenPartnerPanel : undefined}
+                  onOpenMembers={() => setSubView('members')}
+                  onOpenCampaigns={() => setSubView('campaigns')}
+                  onOpenSettings={() => setGatewaySettingsOpen(true)}
+                  onOpenPixKeys={() => {
+                    setPixKeyModalInitialView('list');
+                    setPixKeyModalOpen(true);
+                  }}
+                  onOpenTerms={() => setTermsOpen(true)}
+                  onOpenPrivacy={() => setTermsOpen(true)}
+                  onLogout={handleLogout}
+                  onOpenAdmin={handleOpenAdmin}
+                />
+              )}
+            </>
+          )}
+          </div>
+        </main>
+
+        {/* Bottom Navigation */}
+        {!gameVisible && !partnerPanelOpen && subView !== 'partner' && <BottomNavigation
+          activeTab={activeTab}
+          desktopExpanded={true}
+          onChangeTab={(tab) => {
+            if(appContext==='countmasters')setAppContext('alliance-hub');
+            if (tab === 'games') {
+              setGamesResetKey((prev) => prev + 1);
+            }
+            setActiveTab(tab);
+            setSubView('main');
+          }}
+        />}
+
+        {/* Interactive Modals */}
+        <DepositModal
+          isOpen={depositOpen}
+          onClose={() => setDepositOpen(false)}
+          onConfirmDeposit={handleConfirmDeposit}
+          loading={actionLoading}
+          gameId={depositGameId}
+        />
+
+        <WithdrawModal
+          isOpen={withdrawOpen}
+          onClose={() => setWithdrawOpen(false)}
+          onConfirmWithdraw={handleConfirmWithdraw}
+          userBalance={user?.balance ?? 0}
+          affiliateBalance={Number(affiliateInfo?.affiliateBalance || 0)}
+          minWithdraw={user?.minWithdraw}
+          withdrawFee={user?.withdrawFee}
+          loading={actionLoading}
+          token={token}
+          userPixKey={user?.pixKey}
+          userPixKeys={user?.pixKeys}
+          onOpenAddPixKey={() => {
+            setPixKeyModalInitialView('add');
+            setPixKeyModalOpen(true);
+          }}
+        />
+
+        <ProfileModal
+          user={user}
+          isOpen={profileOpen}
+          onClose={() => setProfileOpen(false)}
+          currentGameId={gameTrackingId(appContext)}
+          onShowToast={showToast}
+        />
+
+        <TermsModal isOpen={termsOpen} onClose={() => setTermsOpen(false)} />
+
+        <GatewaySettingsModal
+          isOpen={gatewaySettingsOpen}
+          onClose={() => setGatewaySettingsOpen(false)}
+          onShowToast={showToast}
+        />
+
+        <PixKeysModal
+          isOpen={pixKeyModalOpen}
+          onClose={() => setPixKeyModalOpen(false)}
+          token={token}
+          userName={user?.name}
+          initialView={pixKeyModalInitialView}
+          onSuccess={(msg, pixKeyData) => {
+            showToast(msg, 'success');
+            if (user && pixKeyData) {
+              setUser({ ...user, pixKey: pixKeyData });
+            }
+          }}
+        />
+
+        {/* Fullscreen Independent Partner Panel (Like Admin Panel) */}
+        {partnerPanelOpen && user && (
+          isUserPartnerOrAdmin(user) ? (
+            <PartnerPanelView
+              user={user}
+              token={token}
+              onBackToHub={handleClosePartnerPanel}
+              onShowToast={showToast}
+            />
+          ) : (
+            <div className="fixed inset-0 z-[70] bg-[#F8F9FA] flex flex-col items-center justify-center p-6 text-center select-none font-sans">
+              <div className="max-w-md w-full p-8 rounded-3xl bg-white border border-zinc-200/80 shadow-lg space-y-4">
+                <div className="w-12 h-12 rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mx-auto">
+                  <ShieldCheck className="w-6 h-6" />
+                </div>
+                <div>
+                  <h2 className="font-bold text-zinc-900 text-lg">Acesso Restrito ao Painel de Parceiros</h2>
+                  <p className="text-xs text-zinc-500 mt-1.5 leading-relaxed">
+                    Esta área é exclusiva para Parceiros Oficiais homologados e Administradores da plataforma.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleClosePartnerPanel}
+                  className="w-full py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                >
+                  Voltar ao Hub
+                </button>
+              </div>
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}

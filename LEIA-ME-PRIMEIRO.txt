@@ -1,0 +1,21 @@
+iNEX — Admin e parceiros: versão mobile
+
+Esta versão está preparada para o repositório tribopayeduh-art/platazinha.
+Consulte MOBILE-PAINEIS.md para os ajustes móveis.
+O visual geral está documentado em DESIGN-ADMIN-PARCEIROS.md.
+A central de notificações continua documentada em NOTIFICACOES-ADMIN.md.
+
+1. Extraia o ZIP em uma pasta permanente.
+2. Substitua os arquivos da pasta do repositório por estes arquivos.
+3. Envie o commit ao GitHub e publique esse commit na Vercel.
+4. Confirme em Settings > Git se a Vercel está ligada ao repositório correto.
+5. No admin, abra Configurações > Notificações.
+
+O ZIP não inclui .env.local nem credenciais privadas. Mantenha as variáveis
+Production já cadastradas na Vercel. Para testar localmente, copie seu
+.env.local da versão anterior para a pasta onde está package.json.
+
+Validação local: npm ci, npm run lint, npm run build.
+Desenvolvimento local: npm run dev (porta padrão 3000).
+
+Campanhas não foram disparadas a usuários durante os testes.

@@ -1,0 +1,6 @@
+{
+  "name": "Alliance Hub | iGAMING PAINEL",
+  "description": "Painel oficial de afiliados e gateway iGaming Alliance Hub com PIX instantâneo, comissões automáticas de até 80% RevShare e métricas em tempo real.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

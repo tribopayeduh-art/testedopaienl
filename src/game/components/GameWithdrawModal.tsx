@@ -1,0 +1,401 @@
+import { readApiJson } from '../../lib/readApiJson';
+import {InexLoader} from '../../components/InexLoader';
+import React, { useState, useEffect } from 'react';
+import { X, AlertCircle, Loader2, ArrowUpRight, KeyRound, RotateCcw, CheckCircle2, Plus } from 'lucide-react';
+
+interface PixKeyItem {
+  id: string;
+  type: string;
+  key: string;
+  name: string;
+  status?: string;
+}
+
+interface GameWithdrawModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirmWithdraw: (amount: number, pixKey: string) => Promise<void>;
+  userBalance: number;
+  minWithdraw?: number;
+  loading: boolean;
+  token?: string | null;
+  userPixKey?: any;
+  userPixKeys?: any[];
+}
+
+export const GameWithdrawModal: React.FC<GameWithdrawModalProps> = ({
+  isOpen,
+  onClose,
+  onConfirmWithdraw,
+  userBalance,
+  minWithdraw = 100,
+  loading,
+  token,
+  userPixKey,
+  userPixKeys,
+}) => {
+  const [amount, setAmount] = useState<string>('');
+  const [pixKey, setPixKey] = useState<string>('');
+  const [cpf, setCpf] = useState<string>('');
+  const [error, setError] = useState<string | null>(null);
+
+  const [pixKeys, setPixKeys] = useState<PixKeyItem[]>([]);
+  const [selectedPixKeyId, setSelectedPixKeyId] = useState<string>('');
+  const [loadingKeys, setLoadingKeys] = useState<boolean>(false);
+  const [useCustomKey, setUseCustomKey] = useState<boolean>(false);
+
+  // Seed keys from user profile props
+  useEffect(() => {
+    if (userPixKeys && Array.isArray(userPixKeys) && userPixKeys.length > 0) {
+      setPixKeys(userPixKeys);
+      if (!selectedPixKeyId) {
+        setSelectedPixKeyId(userPixKeys[0].id || userPixKeys[0].key);
+        setPixKey(userPixKeys[0].key);
+        if (userPixKeys[0].type === 'CPF') setCpf(userPixKeys[0].key.replace(/\D/g, ''));
+      }
+    } else if (userPixKey && userPixKey.key) {
+      setPixKeys([userPixKey]);
+      if (!selectedPixKeyId) {
+        setSelectedPixKeyId(userPixKey.id || userPixKey.key);
+        setPixKey(userPixKey.key);
+        if (userPixKey.type === 'CPF') setCpf(userPixKey.key.replace(/\D/g, ''));
+      }
+    }
+  }, [userPixKey, userPixKeys]);
+
+  const fetchPixKeys = async () => {
+    const authToken = token || localStorage.getItem('pg_auth_token') || localStorage.getItem('paygateway_token') || localStorage.getItem('token');
+    if (!authToken) return;
+    setLoadingKeys(true);
+    try {
+      const res = await fetch('/api/pix-keys', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      const data = await readApiJson(res);
+      if (res.ok && Array.isArray(data.pixKeys)) {
+        setPixKeys(data.pixKeys);
+        if (data.pixKeys.length > 0) {
+          const first = data.pixKeys[0];
+          setSelectedPixKeyId(first.id || first.key);
+          setPixKey(first.key);
+          if (first.type === 'CPF') {
+            setCpf(first.key.replace(/\D/g, ''));
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Erro ao carregar chaves PIX no jogo:', err);
+    } finally {
+      setLoadingKeys(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      setError(null);
+      setAmount('');
+      setUseCustomKey(false);
+      fetchPixKeys();
+    }
+  }, [isOpen]);
+
+  // Listen for PIX key update events across the app
+  useEffect(() => {
+    const handleKeysSync = () => {
+      fetchPixKeys();
+    };
+    window.addEventListener('pix_keys_updated', handleKeysSync);
+    window.addEventListener('focus', handleKeysSync);
+    return () => {
+      window.removeEventListener('pix_keys_updated', handleKeysSync);
+      window.removeEventListener('focus', handleKeysSync);
+    };
+  }, []);
+
+  if (!isOpen) return null;
+
+  const handleSelectKey = (item: PixKeyItem) => {
+    setSelectedPixKeyId(item.id || item.key);
+    setPixKey(item.key);
+    setUseCustomKey(false);
+    if (item.type === 'CPF') {
+      setCpf(item.key.replace(/\D/g, ''));
+    }
+  };
+
+  const handleSelectAllBalance = () => {
+    if (userBalance > 0) {
+      setAmount(userBalance.toFixed(2));
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+
+    const val = parseFloat(amount.replace(',', '.'));
+    const limit = minWithdraw ?? 100;
+    if (isNaN(val) || val < limit) {
+      setError(`O valor mínimo para saque é de R$ ${limit.toFixed(2).replace('.', ',')}.`);
+      return;
+    }
+
+    if (val > userBalance) {
+      setError('Saldo insuficiente para realizar este saque.');
+      return;
+    }
+
+    const keyToUse = pixKey.trim();
+    if (!keyToUse) {
+      setError('Por favor, selecione ou informe a chave PIX.');
+      return;
+    }
+
+    if (!cpf.trim()) {
+      setError('Por favor, informe o CPF do titular.');
+      return;
+    }
+
+    try {
+      await onConfirmWithdraw(val, keyToUse);
+      onClose();
+    } catch (err: any) {
+      setError(err?.message || 'Falha ao processar solicitação de saque.');
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/85 backdrop-blur-md animate-in fade-in duration-300"
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-md bg-[#070D1E] border border-[#1A284D] rounded-t-[32px] sm:rounded-[32px] p-4 sm:p-5 shadow-2xl text-white space-y-4 max-h-[95vh] overflow-y-auto no-scrollbar transform transition-all animate-in slide-in-from-bottom duration-300 select-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* MODAL HEADER */}
+        <div className="flex items-center justify-between pb-2 border-b border-[#182955]">
+          <div className="flex items-center gap-2">
+            <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+              <ArrowUpRight className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-black font-mono uppercase tracking-wider text-white">
+                Solicitar Saque
+              </h3>
+              <p className="text-[11px] text-slate-400 font-mono">
+                Receba via PIX instantâneo
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-8 h-8 rounded-full bg-[#14234C] hover:bg-[#1A2D62] text-slate-300 hover:text-white flex items-center justify-center transition-all cursor-pointer border border-cyan-500/30"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Error Alert */}
+        {error && (
+          <div className="p-3 bg-rose-950/50 border border-rose-500/50 text-rose-300 rounded-2xl text-xs font-mono font-bold flex items-center gap-2 animate-in fade-in">
+            <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-3">
+          {/* SALDO DISPONÍVEL */}
+          <div className="bg-[#0B1428] border border-[#182955] rounded-2xl p-3.5 flex items-center justify-between shadow-inner">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-[#00E676]/20 border border-[#00E676]/40 flex items-center justify-center text-[#00E676] font-black font-mono text-sm shrink-0">
+                R$
+              </div>
+              <div>
+                <span className="text-[10px] sm:text-xs font-bold font-mono text-slate-400 uppercase tracking-wider block">
+                  Saldo Disponível
+                </span>
+                <span className="text-lg sm:text-xl font-black font-mono text-white tracking-tight">
+                  R$ {userBalance.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleSelectAllBalance}
+              className="text-[10px] font-bold font-mono text-cyan-300 bg-[#14234C] hover:bg-cyan-500 hover:text-black border border-cyan-500/40 px-3 py-1.5 rounded-xl transition-all cursor-pointer"
+            >
+              Tudo
+            </button>
+          </div>
+
+          {/* INPUT 1: Valor (Mínimo R$ 30,00) */}
+          <div className="bg-[#0B1428] border border-[#182955] focus-within:border-emerald-500 rounded-2xl flex items-center px-4 py-3 gap-3 transition-colors">
+            <span className="font-mono font-black text-slate-300 text-sm sm:text-base border-r border-[#182955] pr-3 shrink-0 select-none">
+              R$
+            </span>
+            <input
+              type="number"
+              min={minWithdraw ?? 100}
+              step="any"
+              required
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder={`Mínimo R$ ${(minWithdraw ?? 100).toFixed(2).replace('.', ',')}`}
+              className="w-full bg-transparent text-white font-mono font-bold text-sm sm:text-base placeholder:text-slate-500 outline-none"
+            />
+          </div>
+
+          {/* CHAVES PIX SALVAS */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-bold font-mono text-slate-300 flex items-center gap-1.5 uppercase tracking-wide">
+                <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Chaves PIX Cadastradas</span>
+              </label>
+              <button
+                type="button"
+                onClick={fetchPixKeys}
+                title="Recarregar chaves salvas"
+                className="text-[11px] font-mono text-cyan-400 hover:text-cyan-300 flex items-center gap-1 py-0.5 px-2 rounded-lg bg-[#14234C]/60 hover:bg-[#14234C] transition-all cursor-pointer"
+              >
+                <RotateCcw className={`w-3 h-3 ${loadingKeys ? 'animate-spin text-cyan-300' : ''}`} />
+                <span>Atualizar</span>
+              </button>
+            </div>
+
+            {loadingKeys && pixKeys.length === 0 ? (
+              <div className="p-3 text-center bg-[#0B1428] rounded-xl border border-[#182955] flex items-center justify-center gap-2">
+                <InexLoader compact />
+                <span className="text-xs font-mono text-slate-400">Carregando chaves salvas...</span>
+              </div>
+            ) : pixKeys.length > 0 && !useCustomKey ? (
+              <div className="space-y-1.5 max-h-[160px] overflow-y-auto pr-1">
+                {pixKeys.map((item) => {
+                  const keyId = item.id || item.key;
+                  const isSelected = selectedPixKeyId === keyId && !useCustomKey;
+                  return (
+                    <div
+                      key={keyId}
+                      onClick={() => handleSelectKey(item)}
+                      className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between ${
+                        isSelected
+                          ? 'bg-[#14234C] border-emerald-500 shadow-sm ring-1 ring-emerald-500/50'
+                          : 'bg-[#0B1428] border-[#182955] hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div
+                          className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 ${
+                            isSelected ? 'border-emerald-400 bg-emerald-500' : 'border-slate-500'
+                          }`}
+                        >
+                          {isSelected && <div className="w-1.5 h-1.5 bg-black rounded-full" />}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-black font-mono text-white truncate">{item.name}</span>
+                            <span className="text-[9px] font-mono font-bold px-1.5 py-0.2 bg-[#1A284D] text-emerald-400 rounded border border-emerald-500/20">
+                              {item.type}
+                            </span>
+                          </div>
+                          <p className="text-[11px] font-mono text-slate-300 truncate">{item.key}</p>
+                        </div>
+                      </div>
+
+                      <div className="shrink-0 pl-2">
+                        <span className="text-[9px] font-mono font-bold text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                          Pronta
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUseCustomKey(true);
+                    setSelectedPixKeyId('');
+                    setPixKey('');
+                  }}
+                  className="text-[11px] font-mono text-slate-400 hover:text-white underline pt-1 block cursor-pointer"
+                >
+                  + Digitar outra chave PIX
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {pixKeys.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUseCustomKey(false);
+                      if (pixKeys.length > 0) {
+                        handleSelectKey(pixKeys[0]);
+                      }
+                    }}
+                    className="text-[11px] font-mono text-cyan-400 hover:text-cyan-300 underline block cursor-pointer"
+                  >
+                    ← Voltar para chaves salvas ({pixKeys.length})
+                  </button>
+                )}
+
+                {/* INPUT 2: Chave PIX Manual */}
+                <div className="bg-[#0B1428] border border-[#182955] focus-within:border-emerald-500 rounded-2xl flex items-center px-4 py-3 gap-3 transition-colors">
+                  <span className="font-mono font-black text-slate-300 text-xs sm:text-sm border-r border-[#182955] pr-3 shrink-0 select-none">
+                    PIX
+                  </span>
+                  <input
+                    type="text"
+                    required
+                    value={pixKey}
+                    onChange={(e) => setPixKey(e.target.value)}
+                    placeholder="Chave PIX (CPF, e-mail, telefone ou aleatória)"
+                    className="w-full bg-transparent text-white font-mono font-medium text-xs sm:text-sm placeholder:text-slate-500 outline-none"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* INPUT 3: CPF do Titular */}
+          <div className="bg-[#0B1428] border border-[#182955] focus-within:border-emerald-500 rounded-2xl flex items-center px-4 py-3 gap-3 transition-colors">
+            <span className="font-mono font-black text-slate-300 text-xs sm:text-sm border-r border-[#182955] pr-3 shrink-0 select-none">
+              CPF
+            </span>
+            <input
+              type="text"
+              required
+              value={cpf}
+              onChange={(e) => setCpf(e.target.value)}
+              placeholder="CPF do titular (somente números)"
+              className="w-full bg-transparent text-white font-mono font-medium text-xs sm:text-sm placeholder:text-slate-500 outline-none"
+            />
+          </div>
+
+          {/* NOTICE BOX */}
+          <div className="bg-[#1A180B] border border-[#423812] rounded-2xl p-3 sm:p-3.5 text-amber-300 text-xs font-mono font-medium leading-relaxed">
+            Saques processados em até 24h úteis. Sem taxa de saque no momento.
+          </div>
+
+          {/* SUBMIT BUTTON */}
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full py-3.5 sm:py-4 bg-[#00E676] hover:bg-[#00C853] active:scale-98 text-[#031C0B] font-black text-sm sm:text-base rounded-2xl sm:rounded-3xl shadow-xl shadow-[#00E676]/20 transition-all flex items-center justify-center gap-2 cursor-pointer uppercase tracking-wider font-mono disabled:opacity-50"
+          >
+            {loading ? (
+              <InexLoader compact />
+            ) : (
+              <span>Solicitar Saque</span>
+            )}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};

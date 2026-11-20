@@ -1,0 +1,22 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.jwt-secret.local
+.system_secrets.vault
+*.vault
+bun.lock
+bun.lockb
+
+# Generated frontend staged only during Vercel build
+public/index.html
+public/admin.html
+public/assets/app-*
+public/assets/admin-*
+public/assets/workspaces-*
+public/assets/vendor-*
+public/assets/BlockPuzzleApp-*

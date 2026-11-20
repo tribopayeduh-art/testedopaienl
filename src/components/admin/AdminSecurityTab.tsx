@@ -1,0 +1,27 @@
+import { readApiJson } from '../../lib/readApiJson';
+import {useAdminChangeRefresh} from '../../lib/adminRealtime';
+import React,{useCallback,useEffect,useState} from 'react';
+import {Database,RefreshCw,ArrowUpRight,ShieldCheck} from 'lucide-react';
+interface Props {token?:string|null;onOpenMigrationModal?:()=>void}
+export const AdminSecurityTab:React.FC<Props>=({token,onOpenMigrationModal})=>{
+ const [connection,setConnection]=useState<{provider:string;connected:boolean|null;message:string}|null>(null);
+ const [integrity,setIntegrity]=useState<any>(null);
+ const [events,setEvents]=useState<Array<{id:string;event:string;timestamp:string;actorId?:string}>>([]);
+ const [error,setError]=useState('');const [busy,setBusy]=useState(false);const [observed,setObserved]=useState('');
+ const load=useCallback(async(signal?:AbortSignal)=>{
+  setBusy(true);setError('');
+  const headers={Authorization:`Bearer ${token||''}`};
+  const results=await Promise.allSettled([
+   fetch('/api/admin/system/integrity',{headers,signal}).then(async r=>{const data=await readApiJson(r);if(!r.ok)throw new Error(data.error||'Falha na auditoria.');setIntegrity(data);}),
+   fetch('/api/admin/system/connection',{headers,signal}).then(async r=>{const data=await readApiJson(r);setConnection(data);if(!r.ok)throw new Error(data.message||'Falha ao verificar banco.');}),
+   fetch('/api/admin/security/events',{headers,signal}).then(async r=>{const data=await readApiJson(r);if(!r.ok)throw new Error(data.error||'Falha ao consultar registros.');setEvents(data.events||[]);setObserved(data.observedAt||'');})
+  ]);
+  if(signal?.aborted)return;
+  const failures=results.filter((r):r is PromiseRejectedResult=>r.status==='rejected');
+  if(failures.length)setError(failures.map(r=>r.reason?.message||'Serviço indisponível.').join(' '));
+  setBusy(false);
+ },[token]);
+ useAdminChangeRefresh(()=>void load(),['admin_operation_notes','settings']);
+ useEffect(()=>{const c=new AbortController();void load(c.signal);return()=>c.abort();},[load]);
+ return <div className="space-y-5"><section className="adm-surface p-5 sm:p-6"><header className="adm-section-header"><div><h3 className="flex items-center gap-2"><Database size={17}/> Banco e integridade</h3><p>Verificações reais de persistência e registros administrativos</p></div><button disabled={busy} className="inex-admin-refresh rounded-lg p-2 text-xs flex items-center gap-2" onClick={()=>void load()}><RefreshCw size={14} className={busy?'animate-spin':''}/>{busy?'Verificando':'Verificar'}</button></header>{error&&<p role="alert" className="mt-4 p-3 rounded-xl bg-red-50 text-red-700 text-xs">{error}</p>}<dl className="grid sm:grid-cols-3 gap-6 py-6"><div><dt className="text-xs text-slate-400">Provedor ativo</dt><dd className="text-base mt-2 font-medium">{connection?.provider||'Aguardando verificação'}</dd></div><div><dt className="text-xs text-slate-400">Persistência</dt><dd className="text-base mt-2 font-medium">{connection?.connected===true?'Disponível':connection?.connected===false?'Indisponível':'Ainda não verificada'}</dd></div><div><dt className="text-xs text-slate-400">Última consulta dos registros</dt><dd className="text-sm mt-2">{observed?new Date(observed).toLocaleString('pt-BR'):'—'}</dd></div></dl><p className="text-xs text-slate-500 leading-relaxed">{connection?.message||'Nenhum resultado de conexão foi recebido.'}</p></section>{integrity&&<section className="adm-surface p-5 sm:p-6"><header className="adm-section-header"><div><h3>Vínculos e carteiras</h3><p>Auditoria sem alterar saldos ou excluir histórico</p></div></header><dl className="grid sm:grid-cols-3 gap-6 py-5">{[['Carteiras negativas',integrity.negativePlayerWallets+integrity.negativeAffiliateWallets],['Afiliados sem conta atual',integrity.affiliatesWithoutCurrentUser],['Apostas sem conta atual',integrity.betsWithoutCurrentUser]].map(([label,value])=><div key={label}><dt className="text-xs text-slate-400">{label}</dt><dd className="text-xl mt-2 font-medium">{value}</dd></div>)}</dl>{integrity.betsWithoutCurrentUser>0&&<><p className="text-xs text-amber-700 bg-amber-50 p-3 rounded-xl">Há registros históricos que precisam de revisão de vínculo. Os valores e o histórico foram preservados.</p><div className="overflow-x-auto mt-4"><table className="w-full text-xs text-left"><thead><tr><th>Registro</th><th>Jogo</th><th>Entrada</th><th>Estado</th></tr></thead><tbody>{(integrity.orphanExamples||[]).map((r:any)=><tr key={r.id}><td>{r.id}</td><td>{r.gameId}</td><td>R$ {Number(r.amount||0).toFixed(2)}</td><td>{r.status}</td></tr>)}</tbody></table></div></>}</section>}<section className="adm-surface p-5 sm:p-6"><header className="adm-section-header"><div><h3 className="flex items-center gap-2"><ShieldCheck size={16}/> Registros do sistema</h3><p>Até 300 eventos persistidos; sem mensagens de demonstração</p></div></header><div className="overflow-x-auto mt-5"><table className="w-full text-left"><thead><tr><th>Evento</th><th>Operador</th><th>Data</th></tr></thead><tbody>{events.map(e=><tr key={e.id}><td>{e.event}</td><td>{e.actorId||'Sistema'}</td><td className="whitespace-nowrap">{new Date(e.timestamp).toLocaleString('pt-BR')}</td></tr>)}</tbody></table>{!events.length&&<p className="adm-empty">{busy?'Consultando registros…':error?'Registros indisponíveis. Tente novamente.':'Nenhum evento disponível.'}</p>}</div></section>{onOpenMigrationModal&&<button className="adm-text-button" onClick={onOpenMigrationModal}>Exportar cópia do banco <ArrowUpRight size={14}/></button>}</div>;
+};

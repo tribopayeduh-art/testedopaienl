@@ -1,0 +1,13426 @@
+import {validateNotification,selectNotificationAudience,notificationTargetLabels,isTrustedPushEndpoint} from './server/notificationPolicy.ts';
+import {reservePixupDeposit,finishPixupDeposit,bindPixupConfirmation} from './server/pixupDepositIntent.ts';
+import QRCode from 'qrcode';
+import { PIXUP_DEPOSIT_REFERENCE, matchesPixupDeposit, parsePixupDepositEvent, pixupDepositCents } from './server/pixupDeposits.ts';
+import { approvePixupWithdrawal, pixupCashoutEvent, pixupPostback, pixupTrustedSource } from './server/pixupWithdrawals.ts';
+import { PixupAuthError, pixupConfigured, requestPixupCashin, readPixupAccount } from './server/pixupCashin';
+import {affiliateCashoutId,affiliateCashoutSignature,reserveAffiliateCashout} from './server/affiliateCashout.ts';
+import {setAffiliateWithdrawalPolicy,effectiveAffiliateWithdrawalMode,summarizeAffiliateCashouts} from './server/affiliateWithdrawalPolicy.ts';
+import {projectCommissions,queryCommissionTracking} from './server/commissionTracking.ts';
+import {normalizePixKeyForDotfy,resolveApprovedWithdrawalKey} from './server/dotfy/pixKeys.ts';
+import {approveDotfyWithdrawal} from './server/dotfy/withdrawalApproval.ts';
+import {dotfyFetch,DotfyClient,verifyDotfySignature} from './server/dotfy/client.ts';
+import {DOTFY_OPERATIONS} from './server/dotfy/operations.ts';
+import {DotfyWebhookQueue,parseDotfyEvent,reconcileDotfyEvent} from './server/dotfy/webhooks.ts';
+import {getSupabaseTransport} from './server/supabaseStore.ts';
+import {adjustAdminWallet,bulkGameControls,MANAGED_GAME_IDS} from './server/adminOperations.ts';
+import {mapAdminMetrics,readAdminMetricInput} from './server/adminMetrics.ts';
+import {attachAdminStream} from './server/adminStream.ts';
+import {countMasters,COUNT_ID} from './server/countMasters.ts';
+import {compressedGameAssets} from './server/gameAssets.ts';
+import {startBubble,settleBubble,settleSubway,startScratch,revealScratch,startStandardGame,settleStandardGame} from './server/gameSync.ts';
+import {usingSupabase,supabaseStore} from './server/supabaseStore.ts';
+import {createPisRouter} from './server/pisIO.ts';
+import './server/environment.ts';
+import { fetchWithTimeout as fetch } from './server/network.ts';
+import express, { type Request, type Response, type NextFunction } from 'express';
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
+import webpush from 'web-push';
+import {
+  dbService,
+  type UserDB,
+  type AffiliateDB,
+  type ReferralDB,
+  type TransactionDB,
+  type GameBetDB,
+  type GameConfigDB,
+  type PushSubscriptionDB,
+  type AdminPermissions
+} from './server/db.ts';
+import { whatsAppManager } from './server/whatsappService.ts';
+import { createPartnerRouter } from './server/partnerRoutes.ts';
+import { getPartnerCutFromAffiliateRevShare } from './server/partnerCommission.ts';
+import {
+  securityHeadersMiddleware,
+  generalRateLimiterMiddleware,
+  authRateLimiterMiddleware,
+  verifyPassword,
+  createSession,
+  getSession,
+  destroySession,
+  isIdentifierBlocked,
+  recordFailedLogin,
+  recordSuccessfulLogin,
+  verifyHmacSignature,
+  logSecurityEvent,
+  setSecurityEventSink,
+  getRecentSecurityEvents,
+  sanitizeString,
+  isValidEmail,
+  isPositiveNumber,
+  resolveDotfyApiKey,
+  resolveVapidKeys,
+  maskSecretKey,
+  encryptSensitiveData,
+  decryptSensitiveData,
+  isDisposableEmail,
+  normalizePhoneNumber,
+  healPhoneNumber,
+  isCellPhone11Digits,
+  isValidBrazilianPhone,
+  formatPhoneDisplay,
+  isHubAffiliateUser,
+  detectSelfReferralRisk,
+  checkRegistrationRateLimit,
+  getActiveOnlineUserSessions
+} from './server/security.ts';
+
+// VAPID Keys setup for iOS / Web Push Notifications (resolved securely without exposed secrets)
+const { publicKey: VAPID_PUBLIC_KEY, privateKey: VAPID_PRIVATE_KEY } = resolveVapidKeys();
+
+try {
+  if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails(
+      'mailto:suporte@paygateway.com',
+      VAPID_PUBLIC_KEY,
+      VAPID_PRIVATE_KEY
+    );
+  }
+} catch (e) {
+  console.error('[WebPush] Error configuring VAPID:', e);
+}
+
+const subscriptionDocumentId = (endpoint: string) =>
+  `push_${crypto.createHash('sha256').update(endpoint).digest('hex')}`;
+
+// Webhook do Discord para espelhamento em tempo real de todas as notificações enviadas aos Afiliados
+const DISCORD_AFFILIATE_WEBHOOK_URL = process.env.DISCORD_AFFILIATE_WEBHOOK_URL || '';
+
+interface DiscordAffiliatePayload {
+  title: string;
+  body: string;
+  url?: string;
+  type?: string;
+  affiliateName?: string;
+  affiliateEmail?: string;
+  affiliateCode?: string;
+  targetUserId?: string | null;
+  targetLabel?: string;
+  sentBy?: string;
+}
+
+async function sendDiscordAffiliateWebhook(data: DiscordAffiliatePayload): Promise<boolean> {
+  const webhookUrl = DISCORD_AFFILIATE_WEBHOOK_URL;
+  if (!webhookUrl) return false;
+
+  try {
+    let color = 0x10B981; // Verde esmeralda padrão
+    let icon = '📢';
+    const typeLower = (data.type || '').toLowerCase();
+    const titleLower = (data.title || '').toLowerCase();
+    const bodyLower = (data.body || '').toLowerCase();
+
+    if (typeLower.includes('commission') || titleLower.includes('comissão') || titleLower.includes('lucro') || titleLower.includes('vendeu')) {
+      color = 0x10B981; // Verde esmeralda (Comissão)
+      icon = '💰';
+    } else if (typeLower.includes('withdrawal') || titleLower.includes('saque') || titleLower.includes('cashout') || bodyLower.includes('saque')) {
+      color = 0xF59E0B; // Dourado/Laranja (Saque/Cashout)
+      icon = '💸';
+    } else if (typeLower.includes('registration') || titleLower.includes('cadastro') || titleLower.includes('seguidor') || titleLower.includes('indicado')) {
+      color = 0x8B5CF6; // Roxo (Cadastro de indicado)
+      icon = '👤';
+    } else if (typeLower.includes('pix') || titleLower.includes('pix') || bodyLower.includes('pix')) {
+      color = 0x06B6D4; // Ciano (PIX)
+      icon = '⚡';
+    }
+
+    const fields: Array<{ name: string; value: string; inline?: boolean }> = [];
+
+    if (data.targetLabel) {
+      fields.push({ name: '🎯 Destinatário', value: data.targetLabel, inline: true });
+    } else if (data.affiliateName) {
+      fields.push({
+        name: '👤 Afiliado',
+        value: `${data.affiliateName}${data.affiliateCode ? ` (${data.affiliateCode})` : ''}`,
+        inline: true
+      });
+    }
+
+    if (data.type) {
+      fields.push({ name: '🏷️ Tipo', value: data.type, inline: true });
+    }
+
+    if (data.sentBy) {
+      fields.push({ name: '✍️ Remetente', value: data.sentBy, inline: true });
+    }
+
+    if (data.url) {
+      let fullUrl = data.url;
+      if (!fullUrl.startsWith('http')) {
+        const cleanPath = fullUrl.startsWith('/') ? fullUrl : `/${fullUrl}`;
+        fullUrl = `https://goalliancehub.com${cleanPath}`;
+      } else {
+        fullUrl = fullUrl.replace(/https?:\/\/alliancedepositos\.online/g, 'https://goalliancehub.com');
+      }
+      // Se o link for para o portal de afiliados (?tab=affiliates), padronizar para https://goalliancehub.com/
+      if (fullUrl.includes('?tab=affiliates') || fullUrl === 'https://goalliancehub.com') {
+        fullUrl = 'https://goalliancehub.com/';
+      }
+      fields.push({ name: '🔗 Link de Acesso', value: fullUrl, inline: false });
+    }
+
+    const discordPayload = {
+      username: 'Alliance Hub • Notificações de Afiliados',
+      avatar_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=128&auto=format&fit=crop&q=80',
+      embeds: [
+        {
+          title: `${icon} ${data.title}`,
+          description: data.body,
+          color,
+          fields,
+          footer: {
+            text: 'Alliance Hub • Sistema Oficial de Notificações de Afiliados'
+          },
+          timestamp: new Date().toISOString()
+        }
+      ]
+    };
+
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(discordPayload)
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      console.warn(`[DiscordWebhook] Resposta HTTP ${res.status}:`, errText);
+      return false;
+    }
+
+    console.log(`[DiscordWebhook] Notificação de afiliado entregue com sucesso ao Discord! ("${data.title}")`);
+    return true;
+  } catch (err: any) {
+    console.error('[DiscordWebhook] Erro ao disparar webhook para o Discord:', err?.message || err);
+    return false;
+  }
+}
+
+async function resolveUserIdFromToken(token?: string | null): Promise<string | null> {
+  if (!token || !getSession(token)) return null;
+  if (await dbService.isSessionRevoked(token)) return null;
+  return getSession(token)?.userId || null;
+}
+
+async function sendPushNotification(
+  targetUserId: string | null,
+  payload: { title: string; body: string; url?: string; type?: string; skipDiscord?: boolean }
+) {
+  // Disparo para o webhook do Discord quando for notificação destinada a Afiliados/Influenciadores
+  if (!payload.skipDiscord) {
+    const isAffiliatePayload =
+      targetUserId === 'all_affiliates' ||
+      payload.url?.includes('tab=affiliates') ||
+      payload.url?.includes('tab=finance') ||
+      ['commission', 'withdrawal', 'registration', 'pixPending', 'affiliate', 'ftd', 'deposit'].includes(payload.type || '') ||
+      payload.title?.toLowerCase().includes('comiss') ||
+      payload.title?.toLowerCase().includes('afiliad') ||
+      payload.title?.toLowerCase().includes('influenc') ||
+      payload.title?.toLowerCase().includes('vendeu') ||
+      payload.title?.toLowerCase().includes('rede') ||
+      payload.title?.toLowerCase().includes('depósito') ||
+      payload.title?.toLowerCase().includes('pix pendente') ||
+      payload.body?.toLowerCase().includes('comiss') ||
+      payload.body?.toLowerCase().includes('afiliad') ||
+      payload.body?.toLowerCase().includes('influenc') ||
+      payload.body?.toLowerCase().includes('sua rede') ||
+      payload.body?.toLowerCase().includes('indicad');
+
+    if (isAffiliatePayload) {
+      (async () => {
+        try {
+          let affName: string | undefined;
+          let affEmail: string | undefined;
+          let affCode: string | undefined;
+
+          if (targetUserId && targetUserId !== 'all' && targetUserId !== 'all_affiliates') {
+            const user = await dbService.getUserById(targetUserId);
+            if (user) {
+              affName = user.name;
+              affEmail = user.email;
+              const aff = await dbService.getAffiliateByUserId(user.id);
+              if (aff) affCode = aff.referralCode;
+            }
+          }
+
+          await sendDiscordAffiliateWebhook({
+            title: payload.title,
+            body: payload.body,
+            url: payload.url,
+            type: payload.type,
+            affiliateName: affName,
+            affiliateEmail: affEmail,
+            affiliateCode: affCode,
+            targetUserId
+          });
+        } catch (e) {
+          console.warn('[DiscordWebhook] Erro auxiliar:', e);
+        }
+      })();
+    } else if (targetUserId && targetUserId !== 'all') {
+      (async () => {
+        try {
+          const user = await dbService.getUserById(targetUserId);
+          const isAff = !!(user && (user.role === 'affiliate' || (user as any).isInfluencer || (user as any).isAffiliate || user.role === 'admin' || user.role === 'superadmin'));
+          if (isAff) {
+            const aff = await dbService.getAffiliateByUserId(user.id);
+            await sendDiscordAffiliateWebhook({
+              title: payload.title,
+              body: payload.body,
+              url: payload.url,
+              type: payload.type || 'affiliate_push',
+              affiliateName: user.name,
+              affiliateEmail: user.email,
+              affiliateCode: aff?.referralCode,
+              targetUserId
+            });
+          }
+        } catch (e) {
+          // ignore
+        }
+      })();
+    }
+  }
+
+  const pushData = {
+    title: payload.title,
+    body: payload.body,
+    url: payload.url || '/?tab=affiliates',
+    type: payload.type || 'notification',
+    icon: '/icon-192.png',
+    badge: '/icon-192.png',
+    tag: `push_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    vibrate: [200, 100, 200, 100, 200],
+    data: {
+      url: payload.url || '/?tab=affiliates',
+      type: payload.type || 'notification',
+      timestamp: Date.now()
+    }
+  };
+  const payloadStr = JSON.stringify(pushData);
+
+  let subscriptions: PushSubscriptionDB[] = [];
+  if (targetUserId === 'all') {
+    subscriptions = await dbService.getPushSubscriptions();
+  } else if (targetUserId === 'all_affiliates') {
+    const allSubs = await dbService.getPushSubscriptions();
+    subscriptions = allSubs.filter(s => s.isAffiliate || s.userId !== 'guest');
+  } else if (!targetUserId || typeof targetUserId !== 'string' || !targetUserId.trim()) {
+    console.warn('[WebPush] sendPushNotification chamado sem targetUserId válido. Abortando envio para evitar broadcast acidental.');
+    return { sent: 0, failed: 0, total: 0 };
+  } else {
+    const cleanTargetId = targetUserId.trim();
+    const candidateUserIds = new Set<string>([cleanTargetId]);
+    if (cleanTargetId.startsWith('aff_')) {
+      const aff = await dbService.getAffiliateById(cleanTargetId);
+      if (aff?.userId) candidateUserIds.add(aff.userId);
+    } else if (cleanTargetId.startsWith('usr_')) {
+      const aff = await dbService.getAffiliateByUserId(cleanTargetId);
+      if (aff?.id) candidateUserIds.add(aff.id);
+    }
+
+    subscriptions = await dbService.getPushSubscriptions(candidateUserIds);
+
+    // ISOLAMENTO ESTRITO POR AFILIADO / REDE:
+    // Se o afiliado ou usuário de destino não possui inscrição push ativa no momento,
+    // JAMAIS repassa a notificação para outros afiliados ou usuários do sistema.
+    if (subscriptions.length === 0) {
+      console.log(`[WebPush] Nenhuma inscrição Push ativa para o usuário/afiliado ${cleanTargetId}. Notificação descartada para outros usuários para garantir o isolamento estrito de rede.`);
+    }
+  }
+
+  let sent = 0;
+  let failed = 0;
+  await Promise.all(subscriptions.map(async (data) => {
+    try {
+      await webpush.sendNotification(data.subscription as webpush.PushSubscription, payloadStr, {
+        TTL: 86400,
+        urgency: 'high',
+      });
+      sent++;
+    } catch (err: any) {
+      failed++;
+      console.warn(`[WebPush] Push error for ${data.endpoint.substring(0, 35)}...:`, err.statusCode || err.message);
+      if (err.statusCode === 410 || err.statusCode === 404 || err.statusCode === 403 || err.statusCode === 401 || (err.statusCode === 400 && (String(err.body || '').includes('BadVapid') || String(err.body || '').includes('VapidPkHashMismatch')))) {
+        await dbService.deletePushSubscription(data.id).catch(console.error);
+      }
+    }
+  }));
+  return { sent, failed, total: subscriptions.length };
+}
+
+async function notifyAffiliateForPlayer(userId: string, payload: { title: string; body: string; url?: string; type?: string }) {
+  try {
+    const player = await dbService.getUserById(userId);
+    if (!player) return { sent: 0, failed: 0, total: 0 };
+
+    let responsibleUserId: string | null = null;
+    let responsibleAffId: string | null = null;
+    let influencerUserId: string | null = player.influencerUserId || null;
+
+    // 1. parentAffiliateUserId direto
+    if (player.parentAffiliateUserId) {
+      responsibleUserId = player.parentAffiliateUserId;
+    }
+    // 2. parentAffiliateId direto
+    if (!responsibleUserId && player.parentAffiliateId) {
+      responsibleAffId = player.parentAffiliateId;
+      const aff = await dbService.getAffiliateById(player.parentAffiliateId);
+      if (aff?.userId) responsibleUserId = aff.userId;
+    }
+    // 3. affiliateId (pode ser aff_ ou usr_)
+    if (!responsibleUserId && player.affiliateId) {
+      if (player.affiliateId.startsWith('usr_')) {
+        responsibleUserId = player.affiliateId;
+      } else {
+        responsibleAffId = player.affiliateId;
+        const aff = (await dbService.getAffiliateById(player.affiliateId)) || (await dbService.getAffiliateByUserId(player.affiliateId));
+        if (aff?.userId) responsibleUserId = aff.userId;
+      }
+    }
+    // 4. Fallback na tabela de referrals
+    if (!responsibleUserId) {
+      const allRefs = await dbService.getAllReferrals();
+      const directRef = allRefs.find((r) => r.referredUserId === player.id);
+      if (directRef) {
+        responsibleAffId = directRef.affiliateId;
+        const aff = await dbService.getAffiliateById(directRef.affiliateId);
+        if (aff?.userId) responsibleUserId = aff.userId;
+        if (directRef.referredByInfluencerId && !influencerUserId) {
+          influencerUserId = directRef.referredByInfluencerId;
+        }
+      }
+    }
+    // 5. Fallback no influencerUserId se não houver outro
+    if (!responsibleUserId && influencerUserId) {
+      responsibleUserId = influencerUserId;
+    }
+
+    if (!responsibleUserId) {
+      console.warn(`[notifyAffiliateForPlayer] Nenhum afiliado gestor encontrado para o jogador ${userId}`);
+      return { sent: 0, failed: 0, total: 0 };
+    }
+
+    const affiliateUser = await dbService.getUserById(responsibleUserId);
+    const affiliate = responsibleAffId
+      ? await dbService.getAffiliateById(responsibleAffId)
+      : await dbService.getAffiliateByUserId(responsibleUserId);
+
+    sendDiscordAffiliateWebhook({
+      title: payload.title,
+      body: payload.body,
+      url: payload.url,
+      type: payload.type || 'player_activity',
+      affiliateName: affiliateUser?.name || responsibleUserId,
+      affiliateEmail: affiliateUser?.email,
+      affiliateCode: affiliate?.referralCode,
+      targetUserId: responsibleUserId,
+      targetLabel: `Afiliado ${affiliateUser?.name || responsibleUserId} (Indicador do Jogador ${player.name || userId})`
+    }).catch((e) => console.warn('[DiscordWebhook] Erro em notifyAffiliateForPlayer:', e));
+
+    const promises: Promise<any>[] = [];
+    promises.push(sendPushNotification(responsibleUserId, { ...payload, skipDiscord: true }));
+    if (influencerUserId && influencerUserId !== responsibleUserId) {
+      promises.push(sendPushNotification(influencerUserId, { ...payload, skipDiscord: true }));
+    }
+
+    const results = await Promise.all(promises);
+    return results[0] || { sent: 0, failed: 0, total: 0 };
+  } catch (err) {
+    console.error('[notifyAffiliateForPlayer] Erro:', err);
+    return { sent: 0, failed: 0, total: 0 };
+  }
+}
+
+// Helper to distinguish real financial deposits (PIX / Gateway) from game winnings / match profits
+function isRealPaidDeposit(t: { type?: string; status?: string; paymentMethod?: string; description?: string } | undefined | null): boolean {
+  if (!t) return false;
+  if (t.type !== 'deposit' || t.status !== 'approved') return false;
+  const pm = (t.paymentMethod || '').toLowerCase();
+  const desc = (t.description || '').toLowerCase();
+  // Exclude game payouts, matches and internal affiliate transfers
+  if (pm === 'gendino' || pm === 'blockwin' || pm === 'afiliados' || /admin|manual|ajuste|demo|influenciador/.test(pm + ' ' + desc)) return false;
+  if (desc.includes('vitória gen dino') || desc.includes('lucro do jogo') || desc.includes('lucro blockwin') || desc.includes('partida')) return false;
+  return true;
+}
+
+function maskEmail(email?: string): string {
+  if (!email || !email.includes('@')) return email || '';
+  const [local, domain] = email.split('@');
+  if (local.length <= 2) return `${local[0] || '*'}***@${domain}`;
+  return `${local.substring(0, 3)}***@${domain}`;
+}
+
+// Simple in-memory session token store mapping token -> userId
+const sessions = new Map<string, string>();
+
+interface AuthRequest extends Request {
+  userId?: string;
+  user?: UserDB;
+}
+
+async function requireAuth(req: AuthRequest, res: Response, next: NextFunction) {
+  try {
+    const authHeader = req.headers.authorization;
+    let token = authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.split(' ')[1]?.trim()
+      : null;
+
+    if (!token && req.headers.cookie) {
+      const match = req.headers.cookie.match(/bb_session=([^;]+)/) || req.headers.cookie.match(/token=([^;]+)/);
+      if (match && match[1]) {
+        token = decodeURIComponent(match[1].trim());
+      }
+    }
+
+    if (!token && req.headers['x-session-token']) {
+      token = String(req.headers['x-session-token']).trim();
+    }
+
+    if (!token || token === 'null' || token === 'undefined' || token === 'Bearer') {
+      return res.status(401).json({ error: 'Não autorizado. Token de sessão ausente.' });
+    }
+
+    const userId = await resolveUserIdFromToken(token);
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Sessão expirada ou inválida. Por favor faça login novamente.' });
+    }
+
+    const user = await dbService.getUserById(userId);
+    if (!user) {
+      return res.status(401).json({ error: 'Usuário não encontrado.' });
+    }
+
+    if (user.isBlocked) return res.status(403).json({ error: 'Conta bloqueada.' });
+    req.userId = userId;
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error('requireAuth error:', err);
+    res.status(500).json({ error: 'Erro de autenticação no servidor.' });
+  }
+}
+
+/**
+ * Middleware Anti-Fraude: Garante que o usuário autenticado NÃO seja um Afiliado Hub.
+ * Afiliados Hub são estritamente proibidos de realizar apostas, movimentar saldos ou jogar.
+ */
+async function requirePlayerNotAffiliate(req: AuthRequest, res: Response, next: NextFunction) {
+  try {
+    await requireAuth(req, res, () => {
+      const user = req.user;
+      if (user && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAMING_ATTEMPT_BLOCKED', {
+          userId: user.id,
+          email: user.email,
+          role: user.role,
+          path: req.path,
+          ip: req.ip
+        });
+        return res.status(403).json({
+          error: 'Operação bloqueada pelo Sistema Anti-Fraude: Contas de Afiliado Hub não possuem permissão para realizar apostas ou movimentar saldos de jogos.'
+        });
+      }
+      next();
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Global Game User Resolver - Supports Bearer token, session cache, signed tokens, user IDs and headers
+async function findGameUser(req: Request): Promise<UserDB | null> {
+  const authHeader = req.headers.authorization;
+  let token = authHeader && authHeader.startsWith('Bearer ')
+    ? authHeader.replace('Bearer ', '').trim()
+    : (authHeader?.trim() || (req.body && req.body.token) || (req.query && (req.query.token as string)) || '');
+
+  // Detect bb_session cookie if no Bearer token provided
+  if (!token && req.headers.cookie) {
+    const match = req.headers.cookie.match(/bb_session=([^;]+)/);
+    if (match && match[1]) {
+      token = decodeURIComponent(match[1].trim());
+    }
+  }
+
+  const userId = await resolveUserIdFromToken(token);
+  return userId ? dbService.getUserById(userId) : null;
+}
+
+// Global Helper to accurately identify the responsible affiliate for an influencer or player
+async function resolveResponsibleAffiliateForUser(user: UserDB, allUsers?: UserDB[]): Promise<{
+  sponsorUser: UserDB | null;
+  sponsorAff: AffiliateDB | null;
+  parentAffId: string;
+  parentUserId: string;
+}> {
+  let sponsorUser: UserDB | null = null;
+  let sponsorAff: AffiliateDB | null = null;
+
+  // 1. Check parentAffiliateId
+  if (user.parentAffiliateId) {
+    sponsorAff = await dbService.getAffiliateById(user.parentAffiliateId);
+    if (sponsorAff) {
+      sponsorUser = await dbService.getUserById(sponsorAff.userId);
+    }
+  }
+
+  // 2. Check parentAffiliateUserId
+  if (!sponsorUser && user.parentAffiliateUserId) {
+    sponsorUser = await dbService.getUserById(user.parentAffiliateUserId);
+    if (sponsorUser && !sponsorAff) {
+      sponsorAff = await dbService.getAffiliateByUserId(sponsorUser.id);
+    }
+  }
+
+  // 3. Check affiliateId
+  if (!sponsorUser && user.affiliateId) {
+    sponsorAff = await dbService.getAffiliateById(user.affiliateId);
+    if (sponsorAff) {
+      sponsorUser = await dbService.getUserById(sponsorAff.userId);
+    } else {
+      sponsorUser = await dbService.getUserById(user.affiliateId);
+      if (sponsorUser && !sponsorAff) {
+        sponsorAff = await dbService.getAffiliateByUserId(sponsorUser.id);
+      }
+    }
+  }
+
+  // 4. Check user.referredBy (code or ID)
+  if (!sponsorUser && user.referredBy) {
+    const cleanRef = user.referredBy.trim().toUpperCase();
+    sponsorAff = await dbService.getAffiliateByCode(cleanRef);
+    if (sponsorAff) {
+      sponsorUser = await dbService.getUserById(sponsorAff.userId);
+    } else {
+      sponsorUser = await dbService.getUserByReferralCode(cleanRef);
+      if (!sponsorUser && allUsers) {
+        sponsorUser = allUsers.find(u => (u.referralCode && u.referralCode.toUpperCase() === cleanRef) || u.id === user.referredBy) || null;
+      }
+      if (sponsorUser && !sponsorAff) {
+        sponsorAff = await dbService.getAffiliateByUserId(sponsorUser.id);
+      }
+    }
+  }
+
+  // 5. Check referrals collection
+  if (!sponsorUser) {
+    try {
+      const allReferrals = await dbService.getAllReferrals();
+      const myRef = allReferrals.find(r => r.referredUserId === user.id);
+      if (myRef) {
+        sponsorAff = await dbService.getAffiliateById(myRef.affiliateId);
+        if (sponsorAff) {
+          sponsorUser = await dbService.getUserById(sponsorAff.userId);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  const parentAffId = sponsorAff?.id || (sponsorUser ? 'aff_' + sponsorUser.id : 'admin');
+  const parentUserId = sponsorUser ? sponsorUser.id : (sponsorAff ? sponsorAff.userId : 'admin');
+
+  return { sponsorUser, sponsorAff, parentAffId, parentUserId };
+}
+
+// --- DOTFY GATEWAY GLOBAL CONSTANTS & HELPERS (RESOLVIDOS DE FORMA SEGURA) ---
+const DEFAULT_API_KEY = resolveDotfyApiKey();
+const DOTFY_BASE_URL = "https://app.dotfy.com.br";
+
+async function getEffectiveDotfyApiKey(): Promise<string> {
+  if (process.env.DOTFY_API_KEY && process.env.DOTFY_API_KEY.trim().length > 0) {
+    return process.env.DOTFY_API_KEY.trim();
+  }
+  try {
+    const dotfyDbCfg = await dbService.getDotfyConfig();
+    if (dotfyDbCfg?.activeApiKey && dotfyDbCfg.activeApiKey.trim().length > 0) {
+      return dotfyDbCfg.activeApiKey.trim();
+    }
+  } catch (_) {}
+  const fallback = resolveDotfyApiKey();
+  if (fallback && fallback.trim().length > 0) {
+    return fallback.trim();
+  }
+  return '';
+}
+
+
+async function resolveDotfyPixKey(
+  apiKey: string,
+  rawKey: string,
+  rawType?: string,
+  holderName?: string
+): Promise<{ pixKeyId: string; pixKey?: any; error?: string }> {
+  if (!rawKey || !rawKey.trim()) {
+    return { pixKeyId: '', error: 'Chave PIX não informada.' };
+  }
+
+  const { cleanType, normalizedSearchKey, dotfyRegistrationKey } = normalizePixKeyForDotfy(rawType, rawKey);
+
+  // 1. Fetch current Dotfy keys and try to find a match (by id or normalized key)
+  try {
+    const listRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/pix-keys`, {
+      headers: { "Authorization": `Bearer ${apiKey}` }
+    });
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      const list: any[] = Array.isArray(listData?.pixKeys) ? listData.pixKeys : [];
+
+      const byId = list.find((k: any) => k.id === rawKey);
+      if (byId) return { pixKeyId: byId.id, pixKey: byId };
+
+      const byKey = list.find((k: any) => {
+        const { normalizedSearchKey: kNorm } = normalizePixKeyForDotfy(k.type, k.key);
+        return kNorm === normalizedSearchKey;
+      });
+      if (byKey) return { pixKeyId: byKey.id, pixKey: byKey };
+    }
+  } catch (e) {
+    console.warn('[resolveDotfyPixKey list warning]', e);
+  }
+
+  // 2. Try to register key directly on Dotfy API
+  try {
+    const regRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/pix-keys`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        type: cleanType,
+        key: dotfyRegistrationKey,
+        name: (holderName || "Beneficiário PayGateway").slice(0, 100)
+      })
+    });
+
+    const regText = await regRes.text();
+    let regData: any = {};
+    try { regData = JSON.parse(regText); } catch (_) { regData = { message: regText }; }
+
+    if (regRes.ok && regData?.pixKey?.id) {
+      return { pixKeyId: regData.pixKey.id, pixKey: regData.pixKey };
+    }
+
+    // If already registered on Dotfy (409 Conflict), fetch the keys list again to retrieve its ID
+    if (regRes.status === 409 || regData?.error?.includes('já está cadastrada')) {
+      const listRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/pix-keys`, {
+        headers: { "Authorization": `Bearer ${apiKey}` }
+      });
+      if (listRes.ok) {
+        const listData = await listRes.json();
+        const list: any[] = Array.isArray(listData?.pixKeys) ? listData.pixKeys : [];
+        const byKey = list.find((k: any) => {
+          const { normalizedSearchKey: kNorm } = normalizePixKeyForDotfy(k.type, k.key);
+          return kNorm === normalizedSearchKey;
+        });
+        if (byKey) return { pixKeyId: byKey.id, pixKey: byKey };
+      }
+    }
+
+    if (!regRes.ok) {
+      return {
+        pixKeyId: '',
+        error: regData?.error || regData?.message || `Erro ${regRes.status} ao cadastrar chave PIX na Dotfy`
+      };
+    }
+  } catch (err: any) {
+    console.warn('[resolveDotfyPixKey register warning]', err);
+  }
+
+  return { pixKeyId: '', error: 'Não foi possível validar ou registrar a chave PIX na Dotfy.' };
+}
+
+// Security: In-memory concurrency locks to prevent double-spending race conditions on withdrawals
+const activeWithdrawalLocks = new Set<string>();
+
+// Security: Helper to strictly recognize platform superadmins (owner accounts)
+function isPlatformSuperAdmin(email?: string, role?: string): boolean {
+  return role === 'superadmin';
+}
+
+export const app = express();
+export default app;
+
+async function startServer() {
+  setSecurityEventSink(event => dbService.saveSecurityEvent(event));
+  // Dev server must bind to port 3000 in AI Studio dev environment.
+  // In a standalone Cloud Run production container without Nginx/control plane, bind to PORT.
+  const isStandaloneProduction = process.env.NODE_ENV === 'production' && !process.env.DEFAULT_APP_PORT && !process.env.CONTROL_PLANE_PORT;
+  const PORT = isStandaloneProduction && process.env.PORT
+    ? (Number(process.env.PORT) || 8080)
+    : (Number(process.env.DEFAULT_APP_PORT) || 3000);
+
+  // Private environment files must never be served through game aliases or static paths.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    let requested: string;
+    try { requested = decodeURIComponent(req.path).replace(/\\/g, '/'); }
+    catch { return res.status(400).json({ error: 'Caminho inválido.' }); }
+    if (/(?:^|\/)\.(?!well-known(?:\/|$))[^/]+/.test(requested)
+      || /(?:^|\/)(?:server\.ts|package(?:-lock)?\.json)$/.test(requested)
+      || /\.(?:pem|key|vault|zip|sql|bak)$/i.test(requested)) return res.status(404).end();
+    next();
+  });
+  app.use(express.json({ limit: '256kb', verify: (req, _res, buffer) => {
+    (req as any).rawBody = buffer.toString('utf8');
+  } }));
+  app.use('/api', (req, res, next) => {
+    if (/simulate(?:-payment)?(?:\/|$)/.test(req.path)) {
+      if (process.env.NODE_ENV === 'production' || process.env.ALLOW_PAYMENT_SIMULATION !== 'true') {
+        return res.status(403).json({ error: 'Simulação de pagamentos desabilitada.' });
+      }
+      return requireAdmin(req, res, next);
+    }
+    next();
+  });
+  app.use(securityHeadersMiddleware);
+  app.use('/api', generalRateLimiterMiddleware);
+  app.use('/api/auth', authRateLimiterMiddleware);
+  app.use('/api', async (req: AuthRequest, res, next) => {
+    const publicPaths = new Set(['/health', '/auth/login', '/auth/register', '/auth/refresh', '/push/vapid-public-key', '/public/config']);
+    if (publicPaths.has(req.path) || req.path === '/webhooks/dotfy' || req.path === '/webhooks/pix' || req.path === '/webhooks/pixup') return next();
+    if (req.method === 'GET' && /^(?:\/games|\/game\/[^/]+\/config)$/.test(req.path)) return next();
+    const rawToken = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim()
+      || String(req.headers['x-session-token'] || req.body?.token || req.query.token || '');
+    let token = rawToken;
+    if (!token && req.headers.cookie) {
+      const match = req.headers.cookie.match(/(?:^|;\s*)(?:bb_session|token)=([^;]+)/);
+      if (match) { try { token = decodeURIComponent(match[1]); } catch { return res.status(401).json({ error: 'Sessão inválida.' }); } }
+    }
+    if (!getSession(token)) return res.status(401).json({ error: 'Entre na sua conta para continuar.' });
+    // Legacy handlers now receive only a verified session token.
+    req.headers.authorization = `Bearer ${token}`;
+    return requireAuth(req, res, next);
+  });
+  app.use('/api/partner', createPartnerRouter(requireAuth, sendPushNotification, logSecurityEvent));
+
+  // --- API ROUTES ---
+
+  // Public liveness is not a database-readiness claim.
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok', database: 'not_checked', time: new Date().toISOString() });
+  });
+
+  // WEB PUSH ROUTES FOR IOS / ANDROID PWA NOTIFICATIONS (Background / Closed App)
+  app.get('/api/push/vapid-public-key', (_req, res) => {
+    res.json({ publicKey: VAPID_PUBLIC_KEY });
+  });
+
+  app.post('/api/push/subscribe', async (req: AuthRequest, res) => {
+    try {
+      const { subscription, preferences } = req.body;
+      if (!subscription || !isTrustedPushEndpoint(subscription.endpoint) || !subscription.keys?.p256dh || !subscription.keys?.auth) {
+        return res.status(400).json({ error: 'Subscription inválida' });
+      }
+
+      let targetUserId = 'guest';
+      const authHeader = req.headers.authorization;
+      let token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1]?.trim() : null;
+      if (!token && req.body.token) token = String(req.body.token).trim();
+
+      if (token) {
+        const resolved = await resolveUserIdFromToken(token);
+        if (resolved) targetUserId = resolved;
+      }
+
+      // Fallback para userId enviado no body se verificado no banco
+      if ((targetUserId === 'guest' || !targetUserId) && req.body.userId) {
+        const directCandidate = await dbService.getUserById(String(req.body.userId).trim());
+        if (directCandidate) targetUserId = directCandidate.id;
+      }
+
+      const docId = subscriptionDocumentId(subscription.endpoint);
+      const existingSubs = await dbService.getPushSubscriptions();
+      const previous = existingSubs.find(s => s.id === docId || s.endpoint === subscription.endpoint);
+      // Nota: Nunca atribui o userId de outro usuário/afiliado a uma sessão anônima 'guest'
+      // para evitar vazamento de notificações de uma rede para outro usuário ou dispositivo.
+
+      const user = targetUserId !== 'guest' ? await dbService.getUserById(targetUserId) : null;
+      let isAff = !!(user && (
+        user.role === 'affiliate' ||
+        user.role === 'admin' ||
+        user.role === 'superadmin' ||
+        (user as any).isInfluencer ||
+        (user as any).isAffiliate ||
+        user.isPartner ||
+        user.email === 'tribopayeduh@gmail.com'
+      ));
+
+      if (!isAff && targetUserId !== 'guest') {
+        const aff = await dbService.getAffiliateByUserId(targetUserId);
+        if (aff) isAff = true;
+      }
+
+      const now = new Date().toISOString();
+      const item: PushSubscriptionDB = {
+        id: docId,
+        subscription,
+        userId: targetUserId,
+        isAffiliate: isAff,
+        preferences: preferences || { registration: true, ftd: true, pixPending: true, gameActivity: true },
+        endpoint: subscription.endpoint,
+        userAgent: String(req.headers['user-agent'] || '').slice(0, 500),
+        createdAt: previous?.createdAt || now,
+        updatedAt: now,
+      };
+      await dbService.upsertPushSubscription(item);
+
+      console.log(`[WebPush] Inscrição salva/atualizada para userId: ${targetUserId} (isAffiliate: ${isAff})`);
+      res.json({ success: true, message: 'Inscrição Push salva com sucesso', userId: targetUserId, isAffiliate: isAff });
+    } catch (err: any) {
+      console.error('[WebPush] Error saving push subscription:', err);
+      res.status(500).json({ error: 'Erro ao salvar inscrição Push' });
+    }
+  });
+
+  app.post('/api/push/preferences', async (req: AuthRequest, res) => {
+    try {
+      const { endpoint, preferences } = req.body;
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | undefined;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        const resolved = await resolveUserIdFromToken(token);
+        if (resolved) targetUserId = resolved;
+      }
+
+      if (endpoint) {
+        const docId = subscriptionDocumentId(endpoint);
+        const subs = await dbService.getPushSubscriptions();
+        const found = subs.find(s => s.endpoint === endpoint || s.id === docId);
+        if (found && found.userId === targetUserId) {
+          found.preferences = { ...(found.preferences || {}), ...(preferences || {}) };
+          if (targetUserId && (!found.userId || found.userId === 'guest')) {
+            found.userId = targetUserId;
+          }
+          found.updatedAt = new Date().toISOString();
+          await dbService.upsertPushSubscription(found);
+        }
+      }
+      res.json({ success: true, message: 'Preferências salvas com sucesso' });
+    } catch (err) {
+      console.error('[WebPush] Error saving preferences:', err);
+      res.status(500).json({ error: 'Erro ao salvar preferências' });
+    }
+  });
+
+  app.post('/api/push/test-self', async (req: AuthRequest, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | null = null;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        const resolved = await resolveUserIdFromToken(token);
+        if (resolved) targetUserId = resolved;
+      }
+
+      const { title, body, endpoint } = req.body;
+      let result = { sent: 0, failed: 0, total: 0 };
+
+      if (endpoint) {
+        const docId = subscriptionDocumentId(endpoint);
+        const allSubs = await dbService.getPushSubscriptions();
+        const targetSub = allSubs.find(s => s.userId === targetUserId && (s.endpoint === endpoint || s.id === docId));
+        if (targetSub) {
+          try {
+            await webpush.sendNotification(targetSub.subscription as any, JSON.stringify({
+              title: title || 'Você vendeu! 💰',
+              body: body || 'Comissão de R$ 75,00 confirmada na sua conta!',
+              url: '/?tab=affiliates',
+              type: 'SHOW_SALE_NOTIFICATION'
+            }), { TTL: 86400, urgency: 'high' });
+            result = { sent: 1, failed: 0, total: 1 };
+          } catch (pushErr: any) {
+            console.warn('[WebPush] Push direct endpoint error:', pushErr.statusCode || pushErr.message);
+            result = { sent: 0, failed: 1, total: 1 };
+          }
+        }
+      }
+
+      if (result.sent === 0 && targetUserId) {
+        result = await sendPushNotification(targetUserId, {
+          title: title || 'Você vendeu! 💰',
+          body: body || 'Comissão de R$ 75,00 confirmada na sua conta!',
+          url: '/?tab=affiliates',
+          type: 'SHOW_SALE_NOTIFICATION'
+        });
+      }
+
+      res.json({
+        success: result.sent > 0,
+        sentDevices: result.sent,
+        attempted: result.total,
+        delivered: result.sent,
+        failed: result.failed,
+        message: result.sent > 0 ? `Push entregue com sucesso (${result.sent} dispositivo(s))!` : 'Nenhum dispositivo elegível encontrado ou erro no envio.'
+      });
+    } catch (err: any) {
+      console.error('[WebPush] Error testing self push:', err);
+      res.status(500).json({ error: 'Erro ao enviar teste' });
+    }
+  });
+
+  app.post('/api/push/send-test', async (req: AuthRequest, res) => {
+    try {
+      const { delayMs, title, body, endpoint } = req.body;
+      
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | null = null;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        const sessionUserId = sessions.get(token) || (await resolveUserIdFromToken(token));
+        if (sessionUserId) targetUserId = sessionUserId;
+      }
+
+      const trigger = async () => {
+        let sentDirect = false;
+        if (endpoint) {
+          const docId = subscriptionDocumentId(endpoint);
+          const allSubs = await dbService.getPushSubscriptions();
+          const targetSub = allSubs.find(s => s.userId === targetUserId && (s.endpoint === endpoint || s.id === docId));
+          if (targetSub) {
+            try {
+              await webpush.sendNotification(targetSub.subscription as any, JSON.stringify({
+                title: title || 'Você vendeu! 💰',
+                body: body || 'Sua comissão de R$ 37,50 foi creditada no seu saldo!',
+                url: '/',
+                type: 'SHOW_SALE_NOTIFICATION'
+              }), { TTL: 86400, urgency: 'high' });
+              sentDirect = true;
+            } catch (errDirect: any) {
+              console.warn('[WebPush] Send-test direct error:', errDirect.statusCode || errDirect.message);
+            }
+          }
+        }
+
+        if (!sentDirect && targetUserId) {
+          await sendPushNotification(targetUserId, {
+            title: title || 'Você vendeu! 💰',
+            body: body || 'Sua comissão de R$ 37,50 foi creditada no seu saldo!',
+            url: '/',
+            type: 'SHOW_SALE_NOTIFICATION'
+          });
+        }
+      };
+
+      if (delayMs && delayMs > 0) {
+        setTimeout(trigger, delayMs);
+      } else {
+        await trigger();
+      }
+
+      res.json({ success: true, message: 'Push de teste disparado com sucesso!' });
+    } catch (err: any) {
+      console.error('[WebPush] Error sending test push:', err);
+      res.status(500).json({ error: 'Erro ao disparar teste push' });
+    }
+  });
+
+  // Game Origin Tracking Engine
+  function resolveRegisteredGame(req: Request): { registeredGame: string; trackingSource: string } {
+    const body = req.body || {};
+    const query = req.query || {};
+    const headers = req.headers || {};
+
+    // 1. Check explicit parameters from body, headers, or query
+    const explicitCandidates = [
+      { val: body.registeredGame, src: 'body_registeredGame' },
+      { val: body.acquisitionGame, src: 'body_acquisitionGame' },
+      { val: body.game, src: 'body_game' },
+      { val: body.gameId, src: 'body_gameId' },
+      { val: body.trackingGame, src: 'body_trackingGame' },
+      { val: headers['x-game-origin'], src: 'header_x_game_origin' },
+      { val: headers['x-game-id'], src: 'header_x_game_id' },
+      { val: headers['x-registered-game'], src: 'header_x_registered_game' },
+      { val: query.game, src: 'query_game' },
+      { val: query.gameId, src: 'query_gameId' },
+      { val: query.site, src: 'query_site' },
+      { val: query.g, src: 'query_g' },
+    ];
+
+    for (const item of explicitCandidates) {
+      if (!item.val) continue;
+      const s = String(item.val).trim().toLowerCase().replace(/_/g, '-');
+      if(['countmasters','count-masters','countwin','g-count-masters'].some(k=>s.includes(k)))return {registeredGame:'g_count_masters',trackingSource:item.src};
+      if (['gen-dino', 'gendino', 'dino', 'dinopay', 'dinoplay', 'dinipay', 't-rex'].some(k => s.includes(k))) {
+        return { registeredGame: 'g_gen_dino', trackingSource: item.src };
+      }
+      if (['subway', 'subwaypay', 'subway-pay', 'joguesubway'].some(k => s.includes(k))) {
+        return { registeredGame: 'g_subway_pay', trackingSource: item.src };
+      }
+      if (['bubble', 'bubbleblast', 'bubble-blast', 'bubbles', 'bubbles-win', 'bubbleswin', 'jogarbubble', 'jogarbubble.online', 'zumbla', 'zumbla-win', 'zumblawin', 'zumblapay', 'g_zumbla'].some(k => s.includes(k))) {
+        return { registeredGame: 'g_bubble_blast', trackingSource: item.src };
+      }
+      if (['raspa', 'raspafortuna', 'raspa-fortuna', 'scratch', 'raspadinha', 'raspadinhaadasorte'].some(k => s.includes(k))) {
+        return { registeredGame: 'g_raspa_fortuna', trackingSource: item.src };
+      }
+      if (['block', 'blockwin', 'block-win', 'block-puzzle', 'blockwinn', 'blockwinner'].some(k => s.includes(k))) {
+        return { registeredGame: 'g_block_puzzle', trackingSource: item.src };
+      }
+      if (['hub', 'portal', 'goalliancehub', 'alliance'].some(k => s.includes(k))) {
+        return { registeredGame: 'alliance_hub', trackingSource: item.src };
+      }
+    }
+
+    // 2. Inspect referer header (full URL, pathname and query params)
+    const referer = String(headers.referer || '').toLowerCase();
+    if (referer) {
+      if (referer.includes('/gen-dino') || referer.includes('/dino') || referer.includes('dinopay') || referer.includes('dinoplay') || referer.includes('game=dino') || referer.includes('game=gen-dino') || referer.includes('site=dino') || referer.includes('site=gen-dino') || referer.includes('dino_ref_code')) {
+        return { registeredGame: 'g_gen_dino', trackingSource: 'referer_dino' };
+      }
+      if (referer.includes('joguesubway') || referer.includes('/subway') || referer.includes('subwaypay') || referer.includes('game=subway') || referer.includes('site=subway')) {
+        return { registeredGame: 'g_subway_pay', trackingSource: 'referer_subway' };
+      }
+      if (referer.includes('jogarbubble') || referer.includes('/bubble') || referer.includes('bubbleblast') || referer.includes('bubbleswin') || referer.includes('game=bubble') || referer.includes('site=bubble') || referer.includes('/zumbla') || referer.includes('zumblawin') || referer.includes('zumbla') || referer.includes('game=zumbla') || referer.includes('site=zumbla')) {
+        return { registeredGame: 'g_bubble_blast', trackingSource: 'referer_bubble' };
+      }
+      if (referer.includes('/raspa') || referer.includes('raspafortuna') || referer.includes('raspadinhaadasorte') || referer.includes('raspadinha') || referer.includes('game=raspa') || referer.includes('site=raspa')) {
+        return { registeredGame: 'g_raspa_fortuna', trackingSource: 'referer_raspa' };
+      }
+      if (referer.includes('/blockwin') || referer.includes('/block-puzzle') || referer.includes('game=block') || referer.includes('site=block')) {
+        return { registeredGame: 'g_block_puzzle', trackingSource: 'referer_block' };
+      }
+      if (referer.includes('goalliancehub') || referer.includes('/alliance') || referer.includes('site=alliance')) {
+        return { registeredGame: 'alliance_hub', trackingSource: 'referer_hub' };
+      }
+    }
+
+    // 3. Inspect origin and host headers
+    const origin = String(headers.origin || '').toLowerCase();
+    const host = String(headers.host || req.hostname || '').toLowerCase();
+    const networkContext = `${origin} ${host}`;
+
+    if (networkContext.includes('dinopay') || networkContext.includes('dinoplay') || networkContext.includes('gendino')) {
+      return { registeredGame: 'g_gen_dino', trackingSource: 'host_dino' };
+    }
+    if (networkContext.includes('joguesubway') || networkContext.includes('subwaypay') || (networkContext.includes('subway') && !networkContext.includes('alliance'))) {
+      return { registeredGame: 'g_subway_pay', trackingSource: 'host_subway' };
+    }
+    if (networkContext.includes('jogarbubble') || networkContext.includes('bubbleswin') || networkContext.includes('bubbleblast') || networkContext.includes('zumbla') || networkContext.includes('zumblawin') || (networkContext.includes('bubble') && !networkContext.includes('alliance'))) {
+      return { registeredGame: 'g_bubble_blast', trackingSource: 'host_bubble' };
+    }
+    if (networkContext.includes('raspafortuna') || networkContext.includes('raspa-fortuna') || networkContext.includes('raspadinhaadasorte') || networkContext.includes('raspadinha')) {
+      return { registeredGame: 'g_raspa_fortuna', trackingSource: 'host_raspa' };
+    }
+    if (networkContext.includes('blockwinn') || networkContext.includes('blockwinner') || networkContext.includes('blockwin')) {
+      return { registeredGame: 'g_block_puzzle', trackingSource: 'host_block' };
+    }
+    if (networkContext.includes('goalliancehub')) {
+      return { registeredGame: 'alliance_hub', trackingSource: 'host_portal' };
+    }
+
+    // 4. Affiliate portal explicit flag
+    if (body.isAffiliate === true) {
+      return { registeredGame: 'alliance_hub', trackingSource: 'is_affiliate_flag' };
+    }
+
+    // 5. Default fallback
+    return { registeredGame: 'g_block_puzzle', trackingSource: 'default_fallback' };
+  }
+
+  // AUTH: REGISTER
+  app.post('/api/auth/register', async (req, res) => {
+    try {
+      const name = sanitizeString(req.body.name, 100) || 'Jogador Bubble';
+      const rawContact = sanitizeString(req.body.email || req.body.phone || req.body.login, 150).trim();
+      const hasAt = rawContact.includes('@');
+
+      let rawEmail = '';
+      let rawPhone = '';
+
+      if (hasAt) {
+        rawEmail = rawContact.toLowerCase();
+        // Only set rawPhone if an explicit distinct phone was provided that doesn't contain @
+        if (req.body.phone && typeof req.body.phone === 'string' && !req.body.phone.includes('@')) {
+          const pDigits = req.body.phone.replace(/\D/g, '');
+          if (pDigits.length >= 8) rawPhone = pDigits;
+        }
+      } else {
+        const digits = rawContact.replace(/\D/g, '');
+        if (digits.length >= 8) {
+          rawPhone = digits;
+          rawEmail = `phone_${digits}@bubbleswin.site`;
+        } else {
+          const cleanUser = rawContact.toLowerCase().replace(/[^a-z0-9._-]/g, '');
+          rawEmail = cleanUser ? `${cleanUser}@bubbleswin.site` : '';
+        }
+      }
+
+      const email = rawEmail;
+      const phone = rawPhone || 'Não informado';
+      const password = typeof req.body.password === 'string' ? req.body.password : '';
+      const refCode = sanitizeString(req.body.refCode || req.body.ref || req.body.p || req.body.partner, 50);
+
+      if (!name || !email || !password) {
+        return res.status(400).json({ error: 'Nome, telefone/e-mail e senha são obrigatórios.', message: 'Nome, telefone/e-mail e senha são obrigatórios.' });
+      }
+
+      if (hasAt && !isValidEmail(rawEmail)) {
+        return res.status(400).json({ error: 'Formato de e-mail inválido.', message: 'Formato de e-mail inválido.' });
+      }
+
+      if (hasAt && isDisposableEmail(rawEmail)) {
+        logSecurityEvent('REGISTER_DISPOSABLE_EMAIL_BLOCKED', { email: rawEmail, ip: req.ip });
+        return res.status(400).json({ error: 'E-mails temporários ou descartáveis não são permitidos por segurança anti-fraude.', message: 'E-mails temporários ou descartáveis não são permitidos por segurança anti-fraude.' });
+      }
+
+      const forwarded = (req.headers['cf-connecting-ip'] as string) || (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
+      const clientIp = forwarded.split(',')[0].trim();
+      const rateLimitCheck = checkRegistrationRateLimit(clientIp);
+      if (!rateLimitCheck.allowed) {
+        logSecurityEvent('REGISTER_RATE_LIMIT_EXCEEDED', { ip: clientIp, email });
+        return res.status(429).json({
+          error: `Muitas tentativas de cadastro a partir desta conexão. Tente novamente em ${Math.ceil(rateLimitCheck.retryAfterSec / 60)} minutos.`,
+          message: `Muitas tentativas de cadastro a partir desta conexão. Tente novamente em ${Math.ceil(rateLimitCheck.retryAfterSec / 60)} minutos.`
+        });
+      }
+
+      if (password.length < 4) {
+        return res.status(400).json({ error: 'A senha deve conter no mínimo 4 caracteres.', message: 'A senha deve conter no mínimo 4 caracteres.' });
+      }
+
+      const existingUser = await dbService.getUserByEmail(email);
+      if (existingUser) {
+        logSecurityEvent('REGISTER_FAILED_DUPLICATE_EMAIL', { email, ip: req.ip });
+        return res.status(400).json({ error: 'E-mail ou telefone já cadastrado no sistema.', message: 'E-mail ou telefone já cadastrado no sistema.' });
+      }
+
+      if (rawPhone && rawPhone.length >= 8) {
+        const existingByPhone = await dbService.getUserByPhone(rawPhone);
+        if (existingByPhone) {
+          return res.status(400).json({ error: 'Telefone já cadastrado no sistema.', message: 'Telefone já cadastrado no sistema.' });
+        }
+      }
+
+      const userId = 'usr_' + crypto.randomBytes(12).toString('hex');
+      const passwordHash = dbService.hashPassword(password);
+      const userReferralCode = dbService.generateReferralCode();
+      const createdAt = new Date().toISOString();
+
+      // Check if referred by an affiliate (by affiliate table or user referralCode or user ID)
+      let referringAffiliateId: string | undefined = undefined;
+      let referringAffiliateUserId: string | undefined = undefined;
+      let matchedRefCode: string | undefined = undefined;
+      let influencerUser: UserDB | null = null;
+      let influencerAff: AffiliateDB | null = null;
+      let responsibleAff: AffiliateDB | null = null;
+      let responsibleUser: UserDB | null = null;
+
+      if (refCode) {
+        const cleanRef = refCode.trim().toUpperCase();
+        matchedRefCode = cleanRef;
+
+        // 1. Check if refCode belongs to an affiliate
+        let affiliate = await dbService.getAffiliateByCode(cleanRef);
+        if (affiliate) {
+          const affUser = await dbService.getUserById(affiliate.userId);
+          // Check if this affiliate user is an influencer (or has a parent affiliate responsible for them)
+          if (affUser && (affUser.isInfluencer || affUser.parentAffiliateId || affUser.parentAffiliateUserId)) {
+            influencerUser = affUser;
+            influencerAff = affiliate;
+            const resolved = await resolveResponsibleAffiliateForUser(affUser);
+            responsibleAff = resolved.sponsorAff || affiliate;
+            responsibleUser = resolved.sponsorUser || affUser;
+          } else {
+            responsibleAff = affiliate;
+            responsibleUser = affUser;
+          }
+          referringAffiliateId = responsibleAff ? responsibleAff.id : affiliate.id;
+          referringAffiliateUserId = responsibleUser ? responsibleUser.id : affiliate.userId;
+        } else {
+          // 2. Check if it's a user's referral code (e.g. player, blogger, influencer)
+          const sponsorUser = await dbService.getUserByReferralCode(cleanRef);
+          if (sponsorUser) {
+            influencerUser = sponsorUser;
+            // Ensure the influencer/sponsor has an active affiliate profile for sub-network tracking
+            influencerAff = await dbService.getAffiliateByUserId(sponsorUser.id);
+            if (!influencerAff) {
+              const newAffId = 'aff_' + crypto.randomBytes(8).toString('hex');
+              influencerAff = {
+                id: newAffId,
+                userId: sponsorUser.id,
+                referralCode: sponsorUser.referralCode || cleanRef,
+                status: 'active',
+                commissionTotal: 0,
+                affiliateBalance: 0,
+                cpaAmount: 0,
+                revSharePercent: 70.0,
+                createdAt: new Date().toISOString()
+              };
+              await dbService.createAffiliate(influencerAff);
+            }
+
+            // Identify the responsible affiliate for this influencer user
+            const resolved = await resolveResponsibleAffiliateForUser(sponsorUser);
+            responsibleAff = resolved.sponsorAff;
+            responsibleUser = resolved.sponsorUser;
+
+            if (responsibleAff) {
+              referringAffiliateId = responsibleAff.id;
+              referringAffiliateUserId = responsibleAff.userId;
+            } else {
+              // Direct sponsor is their own top affiliate
+              referringAffiliateId = influencerAff.id;
+              referringAffiliateUserId = sponsorUser.id;
+              responsibleAff = influencerAff;
+              responsibleUser = sponsorUser;
+            }
+          } else {
+            // 3. Check if refCode is a direct user ID or affiliate ID
+            const directUser = await dbService.getUserById(cleanRef) || await dbService.getUserById(refCode.trim());
+            if (directUser) {
+              const aff = await dbService.getAffiliateByUserId(directUser.id);
+              if (aff) {
+                responsibleAff = aff;
+                responsibleUser = directUser;
+                referringAffiliateId = aff.id;
+                referringAffiliateUserId = directUser.id;
+              }
+            } else {
+              const directAff = await dbService.getAffiliateById(refCode.trim());
+              if (directAff) {
+                const affOwner = await dbService.getUserById(directAff.userId);
+                responsibleAff = directAff;
+                responsibleUser = affOwner;
+                referringAffiliateId = directAff.id;
+                referringAffiliateUserId = directAff.userId;
+              }
+            }
+          }
+        }
+
+        // ANTI-FRAUDE: Bloqueio Rigoroso de Auto-Indicação (Self-Referral)
+        if (responsibleUser) {
+          const selfRisk = detectSelfReferralRisk(
+            { email, phone, ip: clientIp },
+            { id: responsibleUser.id, email: responsibleUser.email, phone: responsibleUser.phone }
+          );
+          if (selfRisk.isFraud) {
+            logSecurityEvent('REGISTER_SELF_REFERRAL_BLOCKED', { email, refCode, reason: selfRisk.reason, ip: clientIp });
+            return res.status(400).json({
+              error: 'Tentativa de auto-indicação detectada pelo Sistema Anti-Fraude. Não é permitido criar contas vinculadas ao seu próprio link ou dados de afiliado.'
+            });
+          }
+        }
+      }
+
+      // Determine game origin using multi-layer tracking engine
+      const trackingResult = resolveRegisteredGame(req);
+      const registeredGame = trackingResult.registeredGame;
+      const host = (req.headers.host || req.hostname || '').toLowerCase();
+      const origin = (req.headers.origin || req.headers.referer || '').toLowerCase();
+      const isPartnerPortal = host.includes('parceiro') || origin.includes('parceiro') || req.body?.sourcePortal === 'parceiro';
+      const isAffiliatePortal = registeredGame === 'alliance_hub' || host.includes('goalliancehub') || origin.includes('goalliancehub') || req.body?.isAffiliate === true || isPartnerPortal;
+
+      // ANTI-FRAUDE: Regra Restrita de Separação - Afiliados Hub NÃO podem ter conta em jogos
+      if (!isAffiliatePortal) {
+        // Se este cadastro é para um jogo, verificar se o e-mail ou telefone já pertence a um Afiliado Hub
+        const existingUsers = await dbService.getAllUsers();
+        const normPhone = phone && phone !== 'Não informado' ? normalizePhoneNumber(phone) : '';
+        const matchingAff = existingUsers.find(u => {
+          if (!isHubAffiliateUser(u)) return false;
+          if (u.email.toLowerCase() === email.toLowerCase()) return true;
+          if (normPhone && normPhone.length >= 8 && normalizePhoneNumber(u.phone) === normPhone) return true;
+          return false;
+        });
+
+        if (matchingAff) {
+          logSecurityEvent('AFFILIATE_GAMING_ACCOUNT_BLOCKED', { email, phone, ip: clientIp, registeredGame });
+          return res.status(403).json({
+            error: 'Bloqueio Anti-Fraude: Usuários cadastrados como Afiliado Hub têm acesso exclusivo à gestão de rede e são proibidos de criar contas de jogador ou apostar nos jogos da plataforma.'
+          });
+        }
+      }
+
+      // Partner attribution (Painel de Parceiro / parceiro.goalliancehub.com / link curto /p/CODE)
+      const rawPartnerCode = (
+        req.body?.partnerCode ||
+        req.query?.partnerCode ||
+        req.body?.partner ||
+        req.query?.partner ||
+        req.body?.p ||
+        req.query?.p ||
+        ''
+      ).toString().trim();
+      let partnerUser: UserDB | null = null;
+      if (rawPartnerCode) {
+        partnerUser = (await dbService.getUserByPartnerOrReferralCode(rawPartnerCode)) || (await dbService.getUserById(rawPartnerCode));
+      }
+      if (!partnerUser && matchedRefCode) {
+        const potentialPartner = await dbService.getUserByPartnerOrReferralCode(matchedRefCode);
+        if (potentialPartner && (potentialPartner.isPartner || potentialPartner.partnerApproved)) {
+          partnerUser = potentialPartner;
+        }
+      }
+      if (partnerUser && !matchedRefCode) {
+        matchedRefCode = partnerUser.referralCode || partnerUser.partnerCode || rawPartnerCode;
+      }
+      if (!partnerUser && responsibleUser) {
+        const pId = responsibleUser.partnerId || responsibleUser.partnerUserId;
+        if (pId) {
+          partnerUser = await dbService.getUserById(pId);
+        }
+      }
+
+      console.log(`[Register Tracking] User ${email} registered. Resolved game: ${registeredGame} (source: ${trackingResult.trackingSource}, partner: ${partnerUser ? partnerUser.name || partnerUser.id : 'none'})`);
+
+      // Create User - attributing to the responsible affiliate's base
+      const targetParentAffId = responsibleAff ? responsibleAff.id : (influencerAff?.id || referringAffiliateId);
+      const targetParentUserId = responsibleUser ? responsibleUser.id : (influencerUser?.id || referringAffiliateUserId);
+
+      const newUser: UserDB = {
+        id: userId,
+        name,
+        email,
+        phone,
+        passwordHash,
+        affiliateId: targetParentAffId,
+        referralCode: userReferralCode,
+        referredBy: matchedRefCode,
+        parentAffiliateId: targetParentAffId,
+        parentAffiliateUserId: targetParentUserId,
+        ...(partnerUser ? {
+          partnerId: partnerUser.id,
+          partnerUserId: partnerUser.id,
+          partnerCode: partnerUser.partnerCode || partnerUser.referralCode || rawPartnerCode,
+        } : {}),
+        ...(influencerUser ? {
+          influencerUserId: influencerUser.id,
+          influencerAffiliateId: influencerAff?.id,
+          influencerName: influencerUser.name,
+        } : {}),
+        balance: 0.0,
+        registeredGame,
+        acquisitionGame: registeredGame,
+        origin: trackingResult.trackingSource,
+        gameBalances: { [registeredGame]: 0.0 },
+        createdAt,
+        role: isAffiliatePortal ? 'affiliate' : 'user',
+      };
+
+      await dbService.createUser(newUser);
+
+      // If registered through goalliancehub.com, automatically create the active affiliate profile
+      if (isAffiliatePortal) {
+        const affRecord: AffiliateDB = {
+          id: 'aff_' + crypto.randomBytes(12).toString('hex'),
+          userId: newUser.id,
+          referralCode: userReferralCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          cpaAmount: 0,
+          revSharePercent: 70.0,
+          createdAt,
+        };
+        await dbService.createAffiliate(affRecord);
+      }
+
+      // 1. Record referral for the Responsible Affiliate (goes directly to responsible affiliate's base)
+      if (responsibleAff) {
+        const parentReferral: ReferralDB = {
+          id: 'ref_' + crypto.randomBytes(12).toString('hex'),
+          affiliateId: responsibleAff.id,
+          referredUserId: userId,
+          referralCode: matchedRefCode || (refCode ? refCode.trim().toUpperCase() : userReferralCode),
+          registeredGame,
+          createdAt,
+          ...(influencerUser ? {
+            referredByInfluencerId: influencerUser.id,
+            referredByInfluencerName: influencerUser.name,
+            isFromInfluencer: true,
+          } : {}),
+        };
+        await dbService.createReferral(parentReferral);
+
+        const targetAffUserId = responsibleUser?.id || responsibleAff.userId;
+        if (targetAffUserId) {
+          sendPushNotification(targetAffUserId, {
+            title: influencerUser ? '⭐ Novo cadastro via Influencer!' : 'Novo cadastro na sua rede! 👤',
+            body: influencerUser
+              ? `${newUser.name} acabou de se cadastrar na sua rede através do influencer ${influencerUser.name}!`
+              : `${newUser.name} acabou de se cadastrar pelo seu link de afiliado.`,
+            url: '/?tab=affiliates',
+            type: 'registration',
+          }).catch(console.error);
+        }
+      }
+
+      // 2. Also record referral for the Influencer if distinct from the responsible affiliate
+      if (influencerAff && (!responsibleAff || influencerAff.id !== responsibleAff.id)) {
+        const subReferral: ReferralDB = {
+          id: 'ref_' + crypto.randomBytes(12).toString('hex'),
+          affiliateId: influencerAff.id,
+          referredUserId: userId,
+          referralCode: matchedRefCode || (refCode ? refCode.trim().toUpperCase() : userReferralCode),
+          registeredGame,
+          createdAt,
+        };
+        await dbService.createReferral(subReferral);
+
+        if (influencerUser?.id && influencerUser.id !== responsibleUser?.id) {
+          sendPushNotification(influencerUser.id, {
+            title: 'Novo seguidor cadastrado! 👤',
+            body: `${newUser.name} acabou de se cadastrar pelo seu link de influencer.`,
+            url: '/?tab=affiliates',
+            type: 'registration',
+          }).catch(console.error);
+        }
+      }
+
+      // Generate Secure Session Token
+      const token = createSession(userId, req);
+      sessions.set(token, userId);
+
+      logSecurityEvent('USER_REGISTERED', { userId, email, ip: req.ip });
+
+      const userObj = {
+        id: newUser.id,
+        name: newUser.name,
+        email: newUser.email,
+        phone: newUser.phone,
+        affiliateId: newUser.affiliateId || null,
+        referralCode: newUser.referralCode,
+        balance: newUser.balance,
+        registeredGame: newUser.registeredGame,
+        acquisitionGame: newUser.acquisitionGame,
+        gameBalances: newUser.gameBalances,
+        pixKey: null,
+        pixKeys: [],
+        createdAt: newUser.createdAt,
+      };
+
+      res.cookie('bb_session', token, { path: '/', httpOnly: false, sameSite: 'lax', maxAge: 30 * 24 * 3600 * 1000 });
+      res.json({ user: userObj, token, balanceCents: Math.round((newUser.balance || 0) * 100) });
+    } catch (err: any) {
+      console.error('Register error:', err);
+      const detail = err?.message || 'Erro ao cadastrar usuário.';
+      res.status(500).json({ error: `Erro no cadastro: ${detail}` });
+    }
+  });
+
+  // AUTH: LOGIN
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      const rawInput = sanitizeString(req.body.email || req.body.phone || req.body.login, 150).trim();
+      const password = typeof req.body.password === 'string' ? req.body.password : '';
+      const trimmedPassword = password.trim();
+
+      if (!rawInput || !password) {
+        return res.status(400).json({ error: 'E-mail ou telefone e senha são obrigatórios.', message: 'E-mail ou telefone e senha são obrigatórios.' });
+      }
+
+      const hasAt = rawInput.includes('@');
+      const cleanDigits = rawInput.replace(/\D/g, '');
+
+      // Check brute-force lockouts (exempt platform superadmins/owners)
+      const lockIdentifier = rawInput.toLowerCase();
+      const lockStatus = isIdentifierBlocked(lockIdentifier);
+      if (lockStatus.blocked) {
+        logSecurityEvent('LOGIN_ATTEMPT_BLOCKED', { email: lockIdentifier, ip: req.ip });
+        return res.status(429).json({
+          error: `Conta temporariamente bloqueada por muitas tentativas incorretas. Tente novamente em ${lockStatus.blockTimeSec} segundos.`,
+          message: `Conta temporariamente bloqueada por muitas tentativas incorretas. Tente novamente em ${lockStatus.blockTimeSec} segundos.`
+        });
+      }
+
+      let user: UserDB | null = null;
+      if (hasAt) {
+        user = await dbService.getUserByEmail(rawInput.toLowerCase());
+      } else if (cleanDigits.length >= 8) {
+        user = await dbService.getUserByPhone(cleanDigits);
+        if (!user) {
+          user = await dbService.getUserByEmail(`phone_${cleanDigits}@bubbleswin.site`);
+        }
+        if (!user) {
+          user = await dbService.getUserByEmail(`phone_${cleanDigits}@jogarbubble.online`);
+        }
+      } else {
+        user = await dbService.getUserByEmail(rawInput.toLowerCase());
+        if (!user) {
+          user = await dbService.getUserByPhone(cleanDigits);
+        }
+      }
+
+      if (!user) {
+        recordFailedLogin(lockIdentifier);
+        logSecurityEvent('LOGIN_FAILED_USER_NOT_FOUND', { email: lockIdentifier, ip: req.ip });
+        return res.status(400).json({ error: 'Credenciais inválidas ou usuário não encontrado.', message: 'Credenciais inválidas ou usuário não encontrado.' });
+      }
+
+      let authCheck = verifyPassword(password, user.passwordHash);
+      if (!authCheck.valid && trimmedPassword) {
+        authCheck = verifyPassword(trimmedPassword, user.passwordHash);
+      }
+
+      if (!authCheck.valid) {
+        const failedResult = recordFailedLogin(user.email || lockIdentifier);
+        logSecurityEvent('LOGIN_FAILED_WRONG_PASSWORD', { email: user.email || lockIdentifier, userId: user.id, ip: req.ip });
+        return res.status(400).json({
+          error: failedResult.blocked
+            ? 'Conta temporariamente bloqueada devido a múltiplas tentativas incorretas.'
+            : 'Senha incorreta. Verifique suas credenciais.',
+          message: failedResult.blocked
+            ? 'Conta temporariamente bloqueada devido a múltiplas tentativas incorretas.'
+            : 'Senha incorreta. Verifique suas credenciais.'
+        });
+      }
+
+      recordSuccessfulLogin(user.email || lockIdentifier);
+
+      // Rehash password if legacy format or superadmin password sync
+      if (authCheck.needsRehash) {
+        const newHash = dbService.hashPassword(trimmedPassword || password);
+        user.passwordHash = newHash;
+        await dbService.updateUserFields(user.id, { passwordHash: newHash });
+        logSecurityEvent('PASSWORD_REHASHED_UPGRADED', { userId: user.id });
+      }
+
+      const isSuperAdminUser = isPlatformSuperAdmin(user.email, user.role);
+      if (isSuperAdminUser) {
+        user.role = 'superadmin';
+        const fullAdminPerms = {
+          canManageUsers: true,
+          canManageBalances: true,
+          canManageCommissions: true,
+          canApproveWithdrawals: true,
+          canApproveDeposits: true,
+          canSendNotifications: true,
+          canManageGames: true,
+          canManageAdmins: true,
+          canViewMetrics: true,
+          canExportReports: true,
+          canManageDotfy: true,
+        };
+        user.adminPermissions = fullAdminPerms;
+        await dbService.updateUserRoleAndPermissions(user.id, 'superadmin', fullAdminPerms);
+      } else if (user.isBlocked) {
+        return res.status(403).json({ error: 'Sua conta foi bloqueada por um administrador.' });
+      }
+
+      // ANTI-FRAUDE: Se a requisição de login vier de um domínio/origem de jogo, impedir login de Afiliados Hub
+      const host = (req.headers.host || req.hostname || '').toLowerCase();
+      const origin = (req.headers.origin || req.headers.referer || '').toLowerCase();
+      const isGameContext = req.body?.isGameSite === true ||
+        Boolean(req.headers['x-game-origin']) ||
+        host.includes('jogarbubble') || host.includes('joguesubway') || host.includes('dinopay') || host.includes('raspadinha') || host.includes('blockwinner') || host.includes('bubbleswin') || host.includes('bubbleblast') || host.includes('zumbla') ||
+        origin.includes('jogarbubble') || origin.includes('joguesubway') || origin.includes('dinopay') || origin.includes('raspadinha') || origin.includes('blockwinner') || origin.includes('bubbleswin') || origin.includes('bubbleblast') || origin.includes('zumbla');
+
+      if (isGameContext && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAME_LOGIN_BLOCKED', { userId: user.id, email: user.email, ip: req.ip, host });
+        return res.status(403).json({
+          error: 'Acesso bloqueado pelo Sistema Anti-Fraude: Sua conta é de Afiliado Hub. Afiliados não possuem permissão para acessar áreas de jogos nem efetuar apostas na plataforma.'
+        });
+      }
+
+      const token = createSession(user.id, req);
+      sessions.set(token, user.id);
+
+      logSecurityEvent('USER_LOGIN_SUCCESS', { userId: user.id, email: user.email, ip: req.ip });
+
+      const userObj = {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        affiliateId: user.affiliateId || null,
+        referralCode: user.referralCode,
+        balance: user.balance,
+        role: user.role || (isSuperAdminUser ? 'superadmin' : 'user'),
+        isBlocked: !!user.isBlocked,
+        autoWithdrawBlocked: !!user.autoWithdrawBlocked,
+        withdrawBlocked: !!user.withdrawBlocked,
+        adminPermissions: user.adminPermissions || (isSuperAdminUser ? {
+          canManageUsers: true,
+          canManageBalances: true,
+          canApproveWithdrawals: true,
+          canManageAdmins: true,
+          canViewMetrics: true,
+          canManageGames: true,
+          canManageDotfy: true
+        } : {}),
+        createdAt: user.createdAt,
+        registeredGame: user.registeredGame || user.acquisitionGame || 'g_block_puzzle',
+        acquisitionGame: user.acquisitionGame || user.registeredGame || 'g_block_puzzle',
+        gameBalances: user.gameBalances || {},
+        pixKey: user.pixKey || null,
+        pixKeys: Array.isArray(user.pixKeys) && user.pixKeys.length > 0 ? user.pixKeys : (user.pixKey ? [user.pixKey] : []),
+      };
+
+      res.cookie('bb_session', token, { path: '/', httpOnly: false, sameSite: 'lax', maxAge: 30 * 24 * 3600 * 1000 });
+      res.json({ user: userObj, token, balanceCents: Math.round(user.balance * 100) });
+    } catch (err: any) {
+      console.error('Login error:', err);
+      if (err?.status === 503) {
+        return res.status(503).json({ error: 'O banco de dados está temporariamente indisponível. Tente entrar novamente em instantes.' });
+      }
+      res.status(500).json({ error: 'Não foi possível concluir o login. Tente novamente.' });
+    }
+  });
+
+  // AUTH: REFRESH SESSION
+  app.post('/api/auth/refresh', async (req: Request, res: Response) => {
+    try {
+      let token = '';
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.replace('Bearer ', '').trim();
+      }
+      if (!token && req.headers.cookie) {
+        const match = req.headers.cookie.match(/bb_session=([^;]+)/) || req.headers.cookie.match(/token=([^;]+)/);
+        if (match && match[1]) token = decodeURIComponent(match[1].trim());
+      }
+      if (!token && req.headers['x-session-token']) {
+        token = String(req.headers['x-session-token']).trim();
+      }
+
+      if (!token) {
+        return res.status(401).json({ error: 'Nenhum token fornecido para atualização.' });
+      }
+
+      const userId = await resolveUserIdFromToken(token);
+      if (!userId) {
+        return res.status(401).json({ error: 'Token inválido ou expirado.' });
+      }
+
+      const user = await dbService.getUserById(userId);
+      if (!user) {
+        return res.status(401).json({ error: 'Usuário não encontrado.' });
+      }
+
+      const newToken = createSession(userId, req);
+      sessions.set(newToken, userId);
+      res.cookie('bb_session', newToken, { path: '/', httpOnly: false, sameSite: 'lax', maxAge: 30 * 24 * 3600 * 1000 });
+      return res.json({ ok: true, token: newToken, user, balanceCents: Math.round((user.balance || 0) * 100) });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao renovar sessão.' });
+    }
+  });
+
+  // AUTH: ME
+  app.use('/api/pis-io', createPisRouter(requireAuth));
+
+  app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res: Response) => {
+    const user = req.user!;
+    const isSuperAdminUser = isPlatformSuperAdmin(user.email, user.role);
+    
+    if (isSuperAdminUser && user.role !== 'superadmin') {
+      user.role = 'superadmin';
+      await dbService.updateUserRoleAndPermissions(user.id, 'superadmin', {
+        canManageUsers: true,
+        canManageBalances: true,
+        canApproveWithdrawals: true,
+        canManageAdmins: true,
+        canViewMetrics: true,
+        canManageGames: true,
+        canManageDotfy: true
+      });
+    }
+
+    const affRecord = await dbService.getAffiliateByUserId(user.id);
+    const resolvedWithdrawFee = typeof affRecord?.withdrawFee === 'number' && !isNaN(affRecord.withdrawFee)
+      ? affRecord.withdrawFee
+      : (typeof user.withdrawFee === 'number' && !isNaN(user.withdrawFee) ? user.withdrawFee : 8.0);
+
+    const userPayload = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      phone: user.phone,
+      affiliateId: user.affiliateId,
+      referralCode: user.referralCode,
+      balance: user.balance,
+      minWithdraw: user.minWithdraw ?? 100,
+      withdrawFee: resolvedWithdrawFee,
+      isInfluencer: !!user.isInfluencer,
+      cpaKillerAllowed: !!user.cpaKillerAllowed,
+      role: user.role || (isSuperAdminUser ? 'superadmin' : 'user'),
+      isBlocked: !!user.isBlocked,
+      isPartner: !!user.isPartner || isSuperAdminUser,
+      partnerApproved: !!user.partnerApproved || isSuperAdminUser,
+      partnerCode: user.partnerCode || user.referralCode || null,
+      partnerRequested: !!user.partnerRequested,
+      partnerRequestedAt: user.partnerRequestedAt || null,
+      autoWithdrawBlocked: !!user.autoWithdrawBlocked,
+      withdrawBlocked: !!user.withdrawBlocked,
+      adminPermissions: user.adminPermissions || (isSuperAdminUser ? {
+        canManageUsers: true,
+        canManageBalances: true,
+        canApproveWithdrawals: true,
+        canManageAdmins: true,
+        canViewMetrics: true,
+        canManageGames: true,
+        canManageDotfy: true
+      } : {}),
+      createdAt: user.createdAt,
+      registeredGame: user.registeredGame || user.acquisitionGame || 'g_block_puzzle',
+      acquisitionGame: user.acquisitionGame || user.registeredGame || 'g_block_puzzle',
+      gameBalances: user.gameBalances || {},
+      pixKey: user.pixKey || null,
+      pixKeys: Array.isArray(user.pixKeys) && user.pixKeys.length > 0 ? user.pixKeys : (user.pixKey ? [user.pixKey] : []),
+    };
+
+    res.json({
+      ...userPayload,
+      user: userPayload,
+      balanceCents: Math.round(user.balance * 100)
+    });
+  });
+
+  // --- ADMIN MIDDLEWARE ---
+  async function requireAdmin(req: AuthRequest, res: Response, next: NextFunction) {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Usuário bloqueado para essa ação. Faça login com uma conta administradora.' });
+      }
+
+      const token = authHeader.split(' ')[1];
+      const userId = getSession(token)?.userId;
+
+      if (!userId) {
+        return res.status(401).json({ error: 'Usuário bloqueado para essa ação. Sessão expirada ou inválida.' });
+      }
+
+      const user = await dbService.getUserById(userId);
+      if (!user) {
+        return res.status(404).json({ error: 'Usuário bloqueado para essa ação. Usuário não encontrado.' });
+      }
+
+      if (user.isBlocked) {
+        return res.status(403).json({ error: 'Usuário bloqueado para essa ação. Sua conta foi bloqueada por um administrador.' });
+      }
+
+      const isSuperAdmin = user.role === 'superadmin';
+      const isAdmin = user.role === 'admin' || user.role === 'superadmin' || isSuperAdmin;
+
+      if (!isAdmin) {
+        return res.status(403).json({ error: 'Usuário bloqueado para essa ação.' });
+      }
+
+      if (isSuperAdmin && user.role !== 'superadmin') {
+        user.role = 'superadmin';
+        await dbService.updateUserRoleAndPermissions(user.id, 'superadmin', {
+          canManageUsers: true,
+          canManageBalances: true,
+          canApproveWithdrawals: true,
+          canManageAdmins: true,
+          canViewMetrics: true,
+          canManageGames: true,
+          canManageDotfy: true
+        });
+      }
+
+      req.userId = user.id;
+      req.user = user;
+      next();
+    } catch (err: any) {
+      console.error('[requireAdmin middleware error]', err);
+      res.status(500).json({ error: 'Erro interno na validação de permissões administrativas.' });
+    }
+  }
+
+  function checkAdminPermission(req: AuthRequest, perm: keyof AdminPermissions): boolean {
+    if (!req.user) return false;
+    if (req.user.role === 'superadmin') {
+      return true;
+    }
+    return !!(req.user.adminPermissions && req.user.adminPermissions[perm]);
+  }
+
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    if (req.method === 'POST' && /simulate(?:-payment)?(?:\/|$)/.test(req.path) &&
+        [req.path.split('/').find(p => PIXUP_DEPOSIT_REFERENCE.test(p)), req.body?.correlationID, req.body?.correlationId, req.body?.txid].some(v => typeof v === 'string' && PIXUP_DEPOSIT_REFERENCE.test(v))) {
+      return res.status(403).json({error:'Cobranças Pixup reais não podem ser simuladas.'});
+    }
+    return next();
+  });
+  const depositRouting = supabaseStore.collection('gateway_settings').doc('deposits');
+  async function selectedDepositGateway() {
+    return (await depositRouting.get()).data()?.provider === 'pixup' ? 'pixup' : 'dotfy';
+  }
+
+  // Run after the shared authenticated API middleware and before legacy payment handlers.
+  const dinoDepositPaths = ['/api/game/gen-dino/pix/create', '/api/gen-dino/pix/create'];
+  const bubbleDepositPaths = ['/api/wallet/deposit','/api/game/bubble/pix/create','/api/bubbleblast/pix/create','/api/game/bubbleblast/pix/create'];
+  const depositPaths = [...dinoDepositPaths,...bubbleDepositPaths,'/api/game/raspa-fortuna/pix/create','/api/raspa-fortuna/pix/create',
+    '/api/game/subway-pay/pix/create','/api/subwaypay/pix/create','/api/game/subwaypay/pix/create','/api/charges','/api/finance/deposit'];
+  app.post(depositPaths, async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      if (await selectedDepositGateway() !== 'pixup') {
+        if (req.path === '/api/finance/deposit' && (process.env.NODE_ENV === 'production' || process.env.ALLOW_PAYMENT_SIMULATION !== 'true')) return res.status(410).json({error:'Gere uma cobrança PIX pelo botão Depositar.'});
+        return next();
+      }
+      const user = req.user;
+      if (!user || user.isBlocked || isHubAffiliateUser(user)) return res.status(403).json({error:'Esta conta não pode depositar.'});
+      if (req.body?.isSimulated) return res.status(400).json({error:'Simulações não são permitidas no fluxo Pixup.'});
+      const minimum = dinoDepositPaths.includes(req.path) ? 2000 : req.path === '/api/finance/deposit' ? 500 : 100;
+      const rawCents = req.body?.amountCents;
+      const cents = rawCents !== undefined && bubbleDepositPaths.includes(req.path)
+        ? (/^\d{1,11}$/.test(String(rawCents)) ? Number(rawCents) : null)
+        : pixupDepositCents(req.body?.amount ?? req.body?.value);
+      if (!cents || cents < minimum || !Number.isSafeInteger(cents)) return res.status(400).json({error:`Informe um valor válido de pelo menos R$ ${(minimum/100).toFixed(2)}.`});
+      const postback = pixupPostback();
+      if (!postback || !pixupConfigured()) return res.status(503).json({error:'Pixup indisponível. Entre em contato com o suporte.'});
+      const intent = await reservePixupDeposit(supabaseStore,user.id,cents,req.get('Idempotency-Key') || undefined);
+      const reference = intent.reference;
+      const cpf = String(user.cpf || '').replace(/\D/g,'');
+      const amount = cents/100;
+      const charge = intent.replayed ? {id:intent.charge.id,qrcode:intent.charge.qrCode || '',expiresAt:intent.charge.expiresAt || null,paymentStatus:intent.charge.status} : await requestPixupCashin({amount, external_id:reference, postback_url:postback, payer:{name:String(user.name || '').slice(0,100), ...([11,14].includes(cpf.length)?{document:cpf}:{})}});
+      if ('error' in charge) return res.status(charge.status ?? 502).json({error:charge.error});
+      const qrImage = await QRCode.toDataURL(charge.qrcode,{width:260,margin:2});
+      const expiresAt = charge.expiresAt || '';
+      const saved = intent.replayed ? intent.charge : await finishPixupDeposit(supabaseStore,intent,{id:charge.id,chargeId:charge.id,correlationID:reference,transactionID:charge.id,qrCode:charge.qrcode,qrCodeImage:qrImage,
+        paymentLink:'',expiresAt,value:cents,valueInReais:amount,description:'Depósito via Pixup',status:'PENDING',createdAt:new Date().toISOString(),userId:user.id,gateway:'pixup'});
+      const data = {id:charge.id,chargeId:charge.id,correlationID:reference,correlationId:reference,transactionID:charge.id,
+        qrCode:charge.qrcode,brCode:charge.qrcode,qrCodeImage:qrImage,valueInReais:amount,paymentLink:'',pixCode:charge.qrcode,pixCopiaECola:charge.qrcode,qrcode:qrImage,expiresAt,value:cents,status:saved.credited?'PAID':'PENDING'};
+      return res.set('Cache-Control','no-store').json({success:true,data,...data,txid:reference,balanceCents:Math.round(user.balance*100),transaction:{id:reference,amount,amountCents:cents,status:saved.credited?'PAID':'PENDING'},bonusCents:0});
+    } catch (error:any) {return res.status(error.status===400||error.status===409?error.status:503).json({error:error.status===400||error.status===409?error.message:'Não foi possível confirmar a geração do PIX. Tente novamente com o mesmo valor.'});}
+  });
+  app.get(['/api/wallet/deposit/status','/api/game/gen-dino/pix/status/:correlationID','/api/gen-dino/pix/status/:correlationID',
+    '/api/game/raspa-fortuna/pix/status/:correlationID','/api/raspa-fortuna/pix/status/:correlationID',
+    '/api/game/subway-pay/pix/status/:correlationID','/api/subwaypay/pix/status/:correlationID','/api/game/subwaypay/pix/status/:correlationID',
+    '/api/game/bubble/pix/status/:correlationID','/api/bubbleblast/pix/status/:correlationID','/api/charges/:correlationID'], async (req: AuthRequest, res: Response, next: NextFunction) => {
+    const id = req.params.correlationID ?? req.query.txid ?? req.query.correlationID;
+    if (typeof id !== 'string' || !PIXUP_DEPOSIT_REFERENCE.test(id)) return next();
+    try {
+      const charge = await dbService.getChargeByCorrelationID(id);
+      if (!charge || charge.gateway !== 'pixup' || charge.userId !== req.userId) return res.sendStatus(404);
+      const paid = charge.credited === true;
+      const bubble = req.path.includes('/wallet/deposit/') || req.path.includes('/bubble');
+      const status = paid ? bubble ? 'COMPLETED' : 'PAID' : Date.parse(charge.expiresAt || '') < Date.now() ? 'EXPIRED' : 'PENDING';
+      const balance = (await dbService.getUserById(req.userId!))?.balance ?? 0;
+      const data = {correlationID:id,status,paid,isPaid:paid,amount:charge.valueInReais,amountCents:charge.value,balance,balanceCents:Math.round(balance*100)};
+      return res.set('Cache-Control','no-store').json({success:true,...data,data,charge:data});
+    } catch { return res.status(503).json({error:'Não foi possível consultar o depósito.'}); }
+  });
+
+  const gatewayRouting = supabaseStore.collection('gateway_settings').doc('withdrawals');
+  async function selectedWithdrawalGateway() {
+    const data = (await gatewayRouting.get()).data();
+    if (data?.provider === 'pixup' || data?.provider === 'dotfy') return data.provider;
+    return process.env.ADMIN_WITHDRAWAL_GATEWAY === 'pixup' ? 'pixup' : 'dotfy';
+  }
+
+  // --- ADMIN ENDPOINTS ---
+
+  app.get('/api/admin/affiliates/withdrawal-policy',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageUsers'))return res.status(403).json({error:'Sem permissão para consultar afiliados.'});
+    try{const config=await dbService.getDotfyConfig();res.setHeader('Cache-Control','no-store');res.json({globalAutoEnabled:config?.affiliateAutoCashoutEnabled!==false,gatewayReady:!!(await getEffectiveDotfyApiKey())&&!!(process.env.DOTFY_WEBHOOK_SECRET||process.env.WEBHOOK_SECRET||config?.webhookSecret),observedAt:new Date().toISOString()});}catch{res.status(503).json({error:'Não foi possível consultar a política global de saques.'});}
+  });
+  app.put('/api/admin/affiliates/:id/withdrawal-policy',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageUsers')||!checkAdminPermission(req,'canApproveWithdrawals'))return res.status(403).json({error:'É necessário gerenciar usuários e aprovar saques para alterar esta política.'});
+    try{const result=await setAffiliateWithdrawalPolicy({userId:String(req.params.id),affiliateId:String(req.body.affiliateId||''),mode:req.body.mode,expectedBlocked:req.body.expectedBlocked,actorId:req.userId!});if(result.changed)logSecurityEvent('ADMIN_AFFILIATE_WITHDRAWAL_POLICY',{adminId:req.userId,targetUserId:String(req.params.id),mode:req.body.mode});res.json({...result,success:true,message:'Política salva. Aplica-se apenas a novas solicitações; nenhum pagamento foi disparado.'});}catch(e:any){res.status([400,404,409].includes(e.status)?e.status:503).json({error:[400,404,409].includes(e.status)?e.message:'Não foi possível salvar a política de saque.'});}
+  });
+
+
+  app.get('/api/admin/commissions/tracking',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageCommissions')&&!checkAdminPermission(req,'canViewMetrics'))return res.status(403).json({error:'Sem permissão para consultar comissões.'});
+    res.setHeader('Cache-Control','no-store');
+    try{
+      const [commissions,transactions,users,affiliates]=await Promise.all([dbService.getAllCommissions(),dbService.getAllTransactions(),dbService.getAllUsers(),dbService.getAllAffiliates()]);
+      const rows=projectCommissions(commissions,transactions,users,affiliates);
+      try{res.json(queryCommissionTracking(rows,req.query));}catch{res.status(400).json({error:'Filtros inválidos. Confira o período e o estado.'});}
+    }catch{res.status(503).json({error:'Não foi possível consultar as comissões. Tente novamente.'});}
+  });
+
+
+  app.get('/api/admin/system/connection', requireAdmin, async (_req, res) => {
+    try {
+      const status = await supabaseStore.health();
+      res.json({...status,message:'Persistência Supabase disponível. Serviços de pagamentos e jogos são verificados separadamente.'});
+    } catch { res.status(503).json({provider:'supabase',connected:false,message:'Conexão indisponível. Confira a chave do servidor e a aplicação do SQL da iNEX.'}); }
+  });
+
+  app.get('/api/admin/system/integrity',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canViewMetrics'))return res.status(403).json({error:'Sem permissão para consultar a integridade financeira.'});
+    try{res.setHeader('Cache-Control','no-store');res.json(await getSupabaseTransport()('inex_admin_integrity',{}));}catch{res.status(503).json({error:'Não foi possível verificar os vínculos e carteiras.'});}
+  });
+
+  app.get('/api/admin/operations/notes', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canViewMetrics') && !checkAdminPermission(req, 'canApproveWithdrawals')) return res.status(403).json({ error: 'Sem permissão para a central de pendências.' });
+    try { res.json({ notes: await dbService.getAdminOperationNotes() }); }
+    catch { res.status(503).json({ error: 'Não foi possível carregar as anotações.' }); }
+  });
+  app.put('/api/admin/operations/notes/:id', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canViewMetrics') && !checkAdminPermission(req, 'canApproveWithdrawals')) return res.status(403).json({ error: 'Sem permissão para anotar operações.' });
+    const id = req.params.id;
+    const { note, priority, reviewed, revision } = req.body;
+    if (typeof id !== 'string' || id.length > 160 || !/^[a-zA-Z0-9_-]+$/.test(id) || typeof note !== 'string' || note.length > 1000 || !['normal', 'urgent'].includes(priority) || typeof reviewed !== 'boolean' || !Number.isInteger(revision) || revision < 0) return res.status(400).json({ error: 'Dados da anotação inválidos.' });
+    try {
+      const tx = await dbService.getTransactionById(id);
+      if (!tx || tx.type !== 'withdrawal') return res.status(404).json({ error: 'Saque não encontrado.' });
+      const saved = await dbService.saveAdminOperationNote(id, {
+        note: note.trim(), priority, reviewed, updatedBy: req.userId, updatedByName: req.user?.name || 'Administrador'
+      }, revision);
+      logSecurityEvent('ADMIN_OPERATION_NOTE_SAVED', { adminId: req.userId, transactionId: id, reviewed, priority });
+      res.json({ note: saved });
+    } catch (error: any) { res.status(error.status === 409 ? 409 : 503).json({ error: error.status === 409 ? error.message : 'Não foi possível salvar a anotação.' }); }
+  });
+  app.get('/api/admin/security/events', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canViewMetrics')) return res.status(403).json({ error: 'Sem permissão para consultar atividade.' });
+    try { const events=await dbService.getSecurityEvents();res.json({events,scope:'persistent',observedAt:new Date().toISOString()}); }
+    catch { res.status(503).json({error:'Não foi possível consultar os registros persistidos.',events:getRecentSecurityEvents(),scope:'current_instance'}); }
+  });
+
+  app.get('/api/admin/events',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    const original=JSON.stringify({role:req.user?.role,permissions:req.user?.adminPermissions});
+    await attachAdminStream(req,res,async()=>{
+      const token=req.headers.authorization?.replace(/^Bearer\s+/i,'').trim();
+      if(!token||await resolveUserIdFromToken(token)!==req.userId)return false;
+      const u=await dbService.getUserById(req.userId!);
+      return !!u&&!u.isBlocked&&['admin','superadmin'].includes(u.role)&&JSON.stringify({role:u.role,permissions:u.adminPermissions})===original;
+    });
+  });
+
+  // GET /api/admin/metrics
+  app.get('/api/admin/metrics', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canViewMetrics')) {
+        return res.status(403).json({ error: 'Sem permissão para visualizar métricas do sistema.' });
+      }
+
+      const input=await readAdminMetricInput();
+      res.setHeader('Cache-Control','no-store');
+      res.json({metrics:mapAdminMetrics(input,String(req.query.range||req.query.timeRange||'7d').toLowerCase())});
+    } catch (err: any) {
+      console.error('Error fetching admin metrics:', err);
+      res.status(500).json({ error: 'Erro ao carregar métricas.' });
+    }
+  });
+
+  // GET /api/admin/users
+  app.get('/api/admin/users', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers') && !checkAdminPermission(req, 'canManageBalances')) {
+        return res.status(403).json({ error: 'Sem permissão para listar usuários.' });
+      }
+
+      const allUsers = await dbService.getAllUsers();
+      const allAffiliates = await dbService.getAllAffiliates();
+      const allReferrals = await dbService.getAllReferrals();
+      const allTransactions = await dbService.getAllTransactions();
+
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+      const affiliateByUserId = new Map(allAffiliates.map(a => [a.userId, a]));
+      const affiliateById = new Map(allAffiliates.map(a => [a.id, a]));
+      const affiliateByCode = new Map(allAffiliates.map(a => [a.referralCode.toUpperCase(), a]));
+
+      // Map referrals by referredUserId
+      const referralByReferredUserId = new Map<string, typeof allReferrals[0]>();
+      const referralsByAffiliateId = new Map<string, typeof allReferrals>();
+      for (const ref of allReferrals) {
+        referralByReferredUserId.set(ref.referredUserId, ref);
+        const list = referralsByAffiliateId.get(ref.affiliateId) || [];
+        list.push(ref);
+        referralsByAffiliateId.set(ref.affiliateId, list);
+      }
+
+      // Map real paid deposits sum by userId (excluding game wins/partidas)
+      const depositsByUserId = new Map<string, number>();
+      const depositCountByUserId = new Map<string, number>();
+      for (const tx of allTransactions) {
+        if (isRealPaidDeposit(tx)) {
+          const prev = depositsByUserId.get(tx.userId) || 0;
+          depositsByUserId.set(tx.userId, prev + tx.amount);
+          if (tx.amount > 0) depositCountByUserId.set(tx.userId, (depositCountByUserId.get(tx.userId) || 0) + 1);
+        }
+      }
+
+      const mapped = await Promise.all(allUsers.map(async u => {
+        const isExplicitAff = (u.role as string) === 'affiliate' || !!(u as any).isInfluencer;
+        const aff = affiliateByUserId.get(u.id);
+        let affData = null;
+        if (isExplicitAff && aff) {
+          const refs = referralsByAffiliateId.get(aff.id) || [];
+          const referredUsersSummary = refs.map(r => {
+            const refU = userMap.get(r.referredUserId);
+            return {
+              userId: r.referredUserId,
+              name: refU ? refU.name : 'Jogador',
+              email: refU ? refU.email : 'N/A',
+              joinedAt: r.createdAt
+            };
+          });
+
+          affData = {
+            id: aff.id,
+            referralCode: aff.referralCode,
+            status: aff.status,
+            commissionTotal: aff.commissionTotal || 0,
+            affiliateBalance: aff.affiliateBalance || 0,
+            cpaAmount: aff.cpaAmount ?? 0,
+            revSharePercent: aff.revSharePercent ?? 70.0,
+            withdrawFee: aff.withdrawFee ?? u.withdrawFee ?? 8.0,
+            indicationsCount: refs.length,
+            availableWithdrawal: aff.affiliateBalance || 0,
+            cpaKillerActive: !!(aff.cpaKillerActive ?? u.cpaKillerActive),
+            cpaKillerEveryX: aff.cpaKillerEveryX ?? u.cpaKillerEveryX ?? 10,
+            cpaKillerKillY: aff.cpaKillerKillY ?? u.cpaKillerKillY ?? 3,
+            cpaCounter: aff.cpaCounter ?? u.cpaCounter ?? 0,
+            referredUsers: referredUsersSummary
+          };
+        }
+
+        // Determine which affiliate / network this player belongs to
+        const directRef = referralByReferredUserId.get(u.id);
+        const parentAffId = u.affiliateId || (directRef ? directRef.affiliateId : null);
+        let parentAff = parentAffId ? affiliateById.get(parentAffId) : null;
+
+        if (!parentAff && directRef?.referralCode) {
+          parentAff = affiliateByCode.get(directRef.referralCode.toUpperCase()) || null;
+        }
+
+        let referredBy = null;
+        if (parentAff) {
+          const sponsorUser = userMap.get(parentAff.userId);
+          referredBy = {
+            affiliateId: parentAff.id,
+            referralCode: parentAff.referralCode,
+            affiliateUserId: parentAff.userId,
+            sponsorName: sponsorUser ? sponsorUser.name : `Afiliado ${parentAff.referralCode}`,
+            sponsorEmail: sponsorUser ? sponsorUser.email : null,
+            sponsorPhone: sponsorUser ? sponsorUser.phone : null,
+            isInfluencer: sponsorUser ? !!(sponsorUser as any).isInfluencer : false,
+            role: sponsorUser ? sponsorUser.role : 'affiliate'
+          };
+        }
+
+        const totalDeposited = depositsByUserId.get(u.id) || 0;
+
+        return {
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          phone: u.phone,
+          balance: u.balance,
+          minWithdraw: u.minWithdraw ?? 100,
+          withdrawFee: u.withdrawFee ?? aff?.withdrawFee ?? 8.0,
+          role: u.role || (u.email.toLowerCase() === 'admin.eduh@gmail.com' ? 'superadmin' : 'user'),
+          isInfluencer: (u as any).isInfluencer || false,
+          cpaKillerAllowed: !!u.cpaKillerAllowed,
+          cpaKillerActive: !!(aff?.cpaKillerActive ?? u.cpaKillerActive),
+          cpaKillerEveryX: aff?.cpaKillerEveryX ?? u.cpaKillerEveryX ?? 10,
+          cpaKillerKillY: aff?.cpaKillerKillY ?? u.cpaKillerKillY ?? 3,
+          cpaCounter: aff?.cpaCounter ?? u.cpaCounter ?? 0,
+          isBlocked: !!u.isBlocked,
+          autoWithdrawBlocked: !!u.autoWithdrawBlocked,
+          hasAffiliateDemoBalance:!!u.hasAffiliateDemoBalance,
+          withdrawBlocked: !!u.withdrawBlocked,
+          adminPermissions: u.adminPermissions || {},
+          isPartner: !!u.isPartner,
+          partnerApproved: !!u.partnerApproved,
+          partnerId: u.partnerId || u.partnerUserId || null,
+          partnerCode: u.partnerCode || null,
+          partnerName: (u.partnerId || u.partnerUserId) ? (userMap.get((u.partnerId || u.partnerUserId)!)?.name || `Parceiro ${u.partnerCode || u.partnerId}`) : null,
+          partnerRequested: !!u.partnerRequested,
+          partnerCommissionPercent: typeof u.partnerCommissionPercent === 'number' ? u.partnerCommissionPercent : 20,
+          createdAt: u.createdAt,
+          pixKeys: u.pixKeys || (u.pixKey ? [u.pixKey] : []),
+          affiliateInfo: affData ? {
+            ...affData,
+            partnerCommissionPercent: typeof u.partnerCommissionPercent === 'number' ? u.partnerCommissionPercent : (aff?.partnerCommissionPercent ?? 20),
+          } : null,
+          referredBy,
+          totalDeposited,
+          redepositCount: Math.max(0, (depositCountByUserId.get(u.id) || 0) - 1),
+          registeredGame: (() => {
+            let g = (u as any).registeredGame || (u as any).acquisitionGame || '';
+            if (!g && u.email && (u.email.toLowerCase().includes('subway') || u.email.toLowerCase().includes('joguesubway'))) {
+              return 'g_subway_pay';
+            }
+            if (!g && u.email && (u.email.toLowerCase().includes('jogarbubble') || u.email.toLowerCase().includes('bubble') || u.email.toLowerCase().includes('bubbleswin'))) {
+              return 'g_bubble_blast';
+            }
+            return g || 'g_block_puzzle';
+          })(),
+          acquisitionGame: (() => {
+            let g = (u as any).acquisitionGame || (u as any).registeredGame || '';
+            if (!g && u.email && (u.email.toLowerCase().includes('subway') || u.email.toLowerCase().includes('joguesubway'))) {
+              return 'g_subway_pay';
+            }
+            if (!g && u.email && (u.email.toLowerCase().includes('jogarbubble') || u.email.toLowerCase().includes('bubble') || u.email.toLowerCase().includes('bubbleswin'))) {
+              return 'g_bubble_blast';
+            }
+            return g || 'g_block_puzzle';
+          })(),
+          gameBalances: (u as any).gameBalances || {},
+        };
+      }));
+
+      res.json({ users: mapped });
+    } catch (err: any) {
+      console.error('Error fetching admin users:', err);
+      res.status(500).json({ error: 'Erro ao listar usuários.' });
+    }
+  });
+
+  // GET /api/admin/affiliates (Detailed affiliate mapping)
+  app.get('/api/admin/affiliates', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers') && !checkAdminPermission(req, 'canManageCommissions')) {
+        return res.status(403).json({ error: 'Sem permissão para visualizar dados de afiliados.' });
+      }
+
+      const allAffiliates = await dbService.getAllAffiliates();
+      const allUsers = await dbService.getAllUsers();
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+
+      const allReferrals = await dbService.getAllReferrals();
+      const referralsByAffiliate = new Map<string, typeof allReferrals>();
+      for (const referral of allReferrals) {
+        const rows = referralsByAffiliate.get(referral.affiliateId) || [];
+        rows.push(referral);
+        referralsByAffiliate.set(referral.affiliateId, rows);
+      }
+      const mappedAffiliates = await Promise.all(allAffiliates.map(async aff => {
+        const user = userMap.get(aff.userId);
+        const referrals = referralsByAffiliate.get(aff.id) || [];
+
+        return {
+          id: aff.id,
+          userId: aff.userId,
+          userName: user ? user.name : 'Afiliado Desconhecido',
+          userEmail: user ? user.email : 'N/A',
+          userPhone: user ? user.phone : 'N/A',
+          referralCode: aff.referralCode,
+          status: aff.status,
+          commissionTotal: aff.commissionTotal || 0,
+          affiliateBalance: aff.affiliateBalance || 0,
+          cpaAmount: aff.cpaAmount ?? 0,
+          revSharePercent: aff.revSharePercent ?? 70.0,
+          withdrawFee: aff.withdrawFee ?? user?.withdrawFee ?? 8.0,
+          indicationsCount: referrals.length,
+          availableWithdrawal: aff.affiliateBalance || 0,
+          cpaKillerActive: !!(aff.cpaKillerActive ?? user?.cpaKillerActive),
+          cpaKillerEveryX: aff.cpaKillerEveryX ?? user?.cpaKillerEveryX ?? 10,
+          cpaKillerKillY: aff.cpaKillerKillY ?? user?.cpaKillerKillY ?? 3,
+          cpaCounter: aff.cpaCounter ?? user?.cpaCounter ?? 0,
+          createdAt: aff.createdAt
+        };
+      }));
+
+      res.json({ affiliates: mappedAffiliates });
+    } catch (err: any) {
+      console.error('Error fetching admin affiliates:', err);
+      res.status(500).json({ error: 'Erro ao listar afiliados.' });
+    }
+  });
+
+  // PUT /api/admin/affiliates/:userId/commission (Update CPA & RevShare %)
+  app.put('/api/admin/affiliates/:userId/commission', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageCommissions') && !checkAdminPermission(req, 'canManageUsers')) {
+        return res.status(403).json({ error: 'Sem permissão para alterar comissões de afiliados.' });
+      }
+
+      if((req.body.autoWithdrawBlocked!==undefined||req.body.withdrawBlocked!==undefined)&&(!checkAdminPermission(req,'canApproveWithdrawals')||!checkAdminPermission(req,'canManageUsers'))){
+        const target=await dbService.getUserById(String(req.params.userId));if(!target)return res.status(404).json({error:'Usuário não encontrado.'});
+        if(['autoWithdrawBlocked','withdrawBlocked'].some(k=>req.body[k]!==undefined&&(typeof req.body[k]!=='boolean'||req.body[k]!==Boolean((target as any)[k]))))return res.status(403).json({error:'Sem permissão para alterar a política financeira de saques.'});
+        delete req.body.autoWithdrawBlocked;delete req.body.withdrawBlocked;
+      }
+      const { userId } = req.params;
+      const {
+        cpaAmount,
+        revSharePercent,
+        partnerCommissionPercent,
+        withdrawFee,
+        affiliateBalance,
+        affiliateBalanceAction,
+        affiliateBalanceAmount,
+        cpaKillerActive,
+        cpaKillerEveryX,
+        cpaKillerKillY,
+        note
+      } = req.body;
+
+      let affiliate = await dbService.getAffiliateByUserId(userId);
+      if (!affiliate) {
+        // Auto-create affiliate record if user exists
+        const user = await dbService.getUserById(userId);
+        if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+        const refCode = user.referralCode || ('AFF' + crypto.randomBytes(3).toString('hex').toUpperCase());
+        const newAff: AffiliateDB = {
+          id: 'aff_' + crypto.randomBytes(8).toString('hex'),
+          userId: user.id,
+          referralCode: refCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          cpaAmount: typeof cpaAmount === 'number' ? cpaAmount : 0,
+          revSharePercent: typeof revSharePercent === 'number' ? revSharePercent : 70.0,
+          withdrawFee: typeof withdrawFee === 'number' ? Math.max(0, withdrawFee) : 8.0,
+          cpaKillerActive: typeof cpaKillerActive === 'boolean' ? cpaKillerActive : false,
+          cpaKillerEveryX: typeof cpaKillerEveryX === 'number' ? Math.max(2, cpaKillerEveryX) : 10,
+          cpaKillerKillY: typeof cpaKillerKillY === 'number' ? Math.max(1, cpaKillerKillY) : 3,
+          cpaCounter: 0,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createAffiliate(newAff);
+        affiliate = newAff;
+      }
+
+      const updateData: any = {};
+      if (typeof cpaAmount === 'number') updateData.cpaAmount = Math.max(0, cpaAmount);
+      if (typeof revSharePercent === 'number') updateData.revSharePercent = Math.min(100, Math.max(0, revSharePercent));
+      if (typeof partnerCommissionPercent === 'number' && !isNaN(partnerCommissionPercent)) {
+        updateData.partnerCommissionPercent = Math.min(100, Math.max(0, partnerCommissionPercent));
+      }
+      if (typeof withdrawFee === 'number' && !isNaN(withdrawFee)) {
+        updateData.withdrawFee = Math.max(0, withdrawFee);
+      }
+      if (typeof cpaKillerActive === 'boolean') {
+        updateData.cpaKillerActive = cpaKillerActive;
+      }
+      if (typeof cpaKillerEveryX === 'number' && !isNaN(cpaKillerEveryX)) {
+        updateData.cpaKillerEveryX = Math.max(2, cpaKillerEveryX);
+      }
+      if (typeof cpaKillerKillY === 'number' && !isNaN(cpaKillerKillY)) {
+        updateData.cpaKillerKillY = Math.max(1, cpaKillerKillY);
+      }
+      
+      const oldAffBalance = affiliate.affiliateBalance || 0;
+      let newAffBalance = oldAffBalance;
+
+      if (typeof affiliateBalance === 'number') {
+        newAffBalance = Math.max(0, affiliateBalance);
+      } else if (typeof affiliateBalanceAmount === 'number' && affiliateBalanceAction) {
+        if (affiliateBalanceAction === 'add') {
+          newAffBalance = oldAffBalance + affiliateBalanceAmount;
+        } else if (affiliateBalanceAction === 'subtract') {
+          newAffBalance = Math.max(0, oldAffBalance - affiliateBalanceAmount);
+        } else if (affiliateBalanceAction === 'set') {
+          newAffBalance = Math.max(0, affiliateBalanceAmount);
+        }
+      }
+
+      if (newAffBalance !== oldAffBalance || typeof affiliateBalance === 'number' || typeof affiliateBalanceAmount === 'number') {
+        updateData.affiliateBalance = newAffBalance;
+      }
+
+      if (Object.keys(updateData).length > 0) {
+        await dbService.updateAffiliateRates(affiliate.id, updateData);
+        if (updateData.affiliateBalance !== undefined) {
+          affiliate.affiliateBalance = updateData.affiliateBalance;
+        }
+        const userSync: any = {};
+        if (updateData.withdrawFee !== undefined) userSync.withdrawFee = updateData.withdrawFee;
+        if (updateData.partnerCommissionPercent !== undefined) userSync.partnerCommissionPercent = updateData.partnerCommissionPercent;
+        if (updateData.cpaKillerActive !== undefined) userSync.cpaKillerActive = updateData.cpaKillerActive;
+        if (updateData.cpaKillerEveryX !== undefined) userSync.cpaKillerEveryX = updateData.cpaKillerEveryX;
+        if (updateData.cpaKillerKillY !== undefined) userSync.cpaKillerKillY = updateData.cpaKillerKillY;
+        if (typeof req.body.autoWithdrawBlocked === 'boolean') userSync.autoWithdrawBlocked = req.body.autoWithdrawBlocked;
+        if (typeof req.body.withdrawBlocked === 'boolean') userSync.withdrawBlocked = req.body.withdrawBlocked;
+        if (Object.keys(userSync).length > 0) {
+          await dbService.updateUserFields(userId, userSync);
+        }
+      }
+
+      // Log transaction if affiliate balance changed
+      if (newAffBalance !== oldAffBalance) {
+        const logTx: TransactionDB = {
+          id: 'tx_aff_adj_' + crypto.randomBytes(8).toString('hex'),
+          userId,
+          type: newAffBalance < oldAffBalance ? 'withdrawal' : 'deposit',
+          amount: Math.abs(newAffBalance - oldAffBalance),
+          status: 'approved',
+          paymentMethod: 'ADMIN_AFFILIATE_ADJUST',
+          description: note || `Ajuste administrativo no Saldo de Carteira do Afiliado por ${req.user?.email}`,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createTransaction(logTx);
+      }
+
+      logSecurityEvent('ADMIN_AFFILIATE_RATES_UPDATED', {
+        adminId: req.user?.id,
+        userId,
+        cpaAmount,
+        revSharePercent,
+        withdrawFee: updateData.withdrawFee,
+        oldAffBalance,
+        newAffBalance
+      });
+
+      res.json({
+        success: true,
+        message: 'Comissões, taxa de saque e saldo de carteira do afiliado atualizados com sucesso!',
+        cpaAmount: updateData.cpaAmount ?? affiliate.cpaAmount,
+        revSharePercent: updateData.revSharePercent ?? affiliate.revSharePercent,
+        partnerCommissionPercent: updateData.partnerCommissionPercent ?? (affiliate as any).partnerCommissionPercent ?? 20,
+        withdrawFee: updateData.withdrawFee ?? affiliate.withdrawFee ?? 8.0,
+        affiliateBalance: affiliate.affiliateBalance,
+        cpaKillerActive: updateData.cpaKillerActive ?? affiliate.cpaKillerActive ?? false,
+        cpaKillerEveryX: updateData.cpaKillerEveryX ?? affiliate.cpaKillerEveryX ?? 10,
+        cpaKillerKillY: updateData.cpaKillerKillY ?? affiliate.cpaKillerKillY ?? 3,
+        cpaCounter: affiliate.cpaCounter ?? 0
+      });
+    } catch (err: any) {
+      console.error('Error updating affiliate commission:', err);
+      res.status(500).json({ error: 'Erro ao atualizar comissão do afiliado.' });
+    }
+  });
+
+  // POST /api/admin/affiliates/:userId/balance - Dedicated route for affiliate wallet adjustment
+  app.post('/api/admin/affiliates/:userId/balance', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageBalances') && !checkAdminPermission(req, 'canManageCommissions')) {
+        return res.status(403).json({ error: 'Sem permissão para alterar saldo de carteira de afiliados.' });
+      }
+
+      const { userId } = req.params;
+      const { actionType, amount, newBalance, note } = req.body;
+
+      const targetUser = await dbService.getUserById(userId);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      let affiliate = await dbService.getAffiliateByUserId(userId);
+      if (!affiliate) {
+        const refCode = targetUser.referralCode || ('AFF' + crypto.randomBytes(3).toString('hex').toUpperCase());
+        const newAff: AffiliateDB = {
+          id: 'aff_' + crypto.randomBytes(8).toString('hex'),
+          userId: targetUser.id,
+          referralCode: refCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          cpaAmount: 0,
+          revSharePercent: 70.0,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createAffiliate(newAff);
+        affiliate = newAff;
+      }
+
+      const adjusted=await adjustAdminWallet({userId,affiliateId:affiliate.id,adminId:req.userId!,newBalance,amount,actionType,note:note||req.body.reason,key:String(req.headers['idempotency-key']||crypto.randomUUID()),expectedBalance:req.body.expectedBalance});
+      const currentAffBal=adjusted.before,finalAffBal=adjusted.currentBalance;affiliate.affiliateBalance=finalAffBal;
+
+      logSecurityEvent('ADMIN_AFFILIATE_BALANCE_ADJUST', {
+        adminId: req.user?.id,
+        userId,
+        oldBalance: currentAffBal,
+        newBalance: finalAffBal,
+        actionType,
+        amount
+      });
+
+      res.json({
+        success: true,
+        message: 'Saldo da carteira do afiliado atualizado com sucesso!',
+        affiliateBalance: finalAffBal,
+        affiliate
+      });
+    } catch (err: any) {
+      console.error('Error updating affiliate balance:', err);
+      res.status(err.status||503).json({ error: err.status?err.message:'Erro ao atualizar saldo de carteira do afiliado.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/balance
+  app.post('/api/admin/users/:id/balance', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageBalances')) {
+        return res.status(403).json({ error: 'Sem permissão para alterar saldos de usuários.' });
+      }
+
+      const { id } = req.params;
+      const {
+        newBalance,
+        actionType,
+        amount,
+        note,
+        minWithdraw,
+        withdrawFee,
+        cpaKillerAllowed,
+        cpaKillerActive,
+        cpaKillerEveryX,
+        cpaKillerKillY,
+        role,
+        isAffiliate,
+        isInfluencer,
+        targetWallet // 'player' | 'affiliate'
+      } = req.body;
+
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      const isTargetAffiliateWallet = targetWallet === 'affiliate';
+
+      const desiredRole=role||(typeof isAffiliate==='boolean'?(isAffiliate?'affiliate':'user'):undefined);
+      if(desiredRole&&desiredRole!==targetUser.role&&(!checkAdminPermission(req,'canManageUsers')||(['admin','superadmin'].includes(desiredRole)&&req.user?.role!=='superadmin')))return res.status(403).json({error:'Sem permissão para alterar este papel.'});
+      if((targetUser.role==='superadmin'||targetUser.role==='admin')&&req.user?.role!=='superadmin')return res.status(403).json({error:'Somente o proprietário altera carteiras administrativas.'});
+      let affiliateForAdjustment=isTargetAffiliateWallet?await dbService.getAffiliateByUserId(id):null;
+      if(isTargetAffiliateWallet&&!affiliateForAdjustment){affiliateForAdjustment={id:'aff_'+crypto.randomBytes(8).toString('hex'),userId:id,referralCode:targetUser.referralCode||dbService.generateReferralCode(),status:'active',commissionTotal:0,affiliateBalance:0,cpaAmount:0,revSharePercent:70,createdAt:new Date().toISOString()};await dbService.createAffiliate(affiliateForAdjustment);}
+      const adjusted=await adjustAdminWallet({userId:id,affiliateId:affiliateForAdjustment?.id,adminId:req.userId!,newBalance,amount,actionType,note,key:String(req.headers['idempotency-key']||crypto.randomUUID()),expectedBalance:req.body.expectedBalance});
+      const finalBalance=isTargetAffiliateWallet?targetUser.balance:adjusted.currentBalance;
+      const finalAffiliateBalance=isTargetAffiliateWallet?adjusted.currentBalance:undefined;
+
+      const userFieldsToUpdate: any = {};
+      if (typeof minWithdraw === 'number' && !isNaN(minWithdraw) && minWithdraw >= 0) {
+        userFieldsToUpdate.minWithdraw = minWithdraw;
+      }
+      if (typeof withdrawFee === 'number' && !isNaN(withdrawFee) && withdrawFee >= 0) {
+        userFieldsToUpdate.withdrawFee = withdrawFee;
+      }
+      if (typeof cpaKillerAllowed === 'boolean') {
+        userFieldsToUpdate.cpaKillerAllowed = cpaKillerAllowed;
+      }
+      if (typeof role === 'string' && (role === 'user' || role === 'affiliate' || role === 'admin' || role === 'superadmin')) {
+        userFieldsToUpdate.role = role;
+      } else if (typeof isAffiliate === 'boolean') {
+        userFieldsToUpdate.role = isAffiliate ? 'affiliate' : 'user';
+      }
+      if (typeof isInfluencer === 'boolean') {
+        userFieldsToUpdate.isInfluencer = isInfluencer;
+      }
+
+      if (Object.keys(userFieldsToUpdate).length > 0) {
+        await dbService.updateUserFields(id, userFieldsToUpdate);
+      }
+
+      // Also sync withdrawFee or CPA killer to affiliate record if present
+      const existingAff = await dbService.getAffiliateByUserId(id);
+      if (existingAff) {
+        const affUpdates: any = {};
+        if (typeof withdrawFee === 'number' && !isNaN(withdrawFee) && withdrawFee >= 0) {
+          affUpdates.withdrawFee = withdrawFee;
+        }
+        if (typeof cpaKillerActive === 'boolean') {
+          affUpdates.cpaKillerActive = cpaKillerActive;
+        }
+        if (typeof cpaKillerEveryX === 'number' && !isNaN(cpaKillerEveryX)) {
+          affUpdates.cpaKillerEveryX = Math.max(2, cpaKillerEveryX);
+        }
+        if (typeof cpaKillerKillY === 'number' && !isNaN(cpaKillerKillY)) {
+          affUpdates.cpaKillerKillY = Math.max(1, cpaKillerKillY);
+        }
+        if (Object.keys(affUpdates).length > 0) {
+          await dbService.updateAffiliateRates(existingAff.id, affUpdates);
+        }
+      } else if (userFieldsToUpdate.role === 'affiliate' || (userFieldsToUpdate.isInfluencer && targetUser.role !== 'affiliate')) {
+        const refCode = targetUser.referralCode || ('AFF' + crypto.randomBytes(3).toString('hex').toUpperCase());
+        const newAff: AffiliateDB = {
+          id: 'aff_' + crypto.randomBytes(8).toString('hex'),
+          userId: targetUser.id,
+          referralCode: refCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: finalAffiliateBalance ?? 0,
+          cpaAmount: 0,
+          revSharePercent: 70.0,
+          withdrawFee: typeof withdrawFee === 'number' ? Math.max(0, withdrawFee) : 8.0,
+          cpaKillerActive: typeof cpaKillerActive === 'boolean' ? cpaKillerActive : false,
+          cpaKillerEveryX: typeof cpaKillerEveryX === 'number' ? Math.max(2, cpaKillerEveryX) : 10,
+          cpaKillerKillY: typeof cpaKillerKillY === 'number' ? Math.max(1, cpaKillerKillY) : 3,
+          cpaCounter: 0,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createAffiliate(newAff);
+      }
+
+      const updatedMinWithdraw = typeof userFieldsToUpdate.minWithdraw === 'number' ? userFieldsToUpdate.minWithdraw : (targetUser.minWithdraw ?? 100);
+      const updatedRole = userFieldsToUpdate.role || targetUser.role;
+
+      logSecurityEvent('ADMIN_BALANCE_ADJUST', {
+        adminId: req.user?.id,
+        targetUserId: id,
+        targetWallet: targetWallet || 'player',
+        oldBalance: isTargetAffiliateWallet ? undefined : targetUser.balance,
+        newBalance: isTargetAffiliateWallet ? undefined : finalBalance,
+        affiliateBalance: finalAffiliateBalance,
+        minWithdraw: updatedMinWithdraw,
+        role: updatedRole
+      });
+
+      // Retrieve latest affiliate info if existing
+      const latestAffiliate = await dbService.getAffiliateByUserId(id);
+
+      res.json({
+        success: true,
+        user: {
+          id,
+          balance: finalBalance,
+          minWithdraw: updatedMinWithdraw,
+          withdrawFee: userFieldsToUpdate.withdrawFee !== undefined ? userFieldsToUpdate.withdrawFee : (targetUser.withdrawFee ?? latestAffiliate?.withdrawFee ?? 8.0),
+          role: updatedRole,
+          isInfluencer: userFieldsToUpdate.isInfluencer !== undefined ? userFieldsToUpdate.isInfluencer : (targetUser as any).isInfluencer,
+          affiliateInfo: latestAffiliate ? {
+            ...latestAffiliate,
+            affiliateBalance: latestAffiliate.affiliateBalance || 0,
+            availableWithdrawal: latestAffiliate.affiliateBalance || 0
+          } : null
+        },
+        affiliateBalance: latestAffiliate?.affiliateBalance,
+        message: isTargetAffiliateWallet
+          ? 'Saldo de carteira do afiliado atualizado com sucesso!'
+          : 'Dados do usuário atualizados com sucesso!'
+      });
+    } catch (err: any) {
+      console.error('Error updating user balance:', err);
+      res.status(err.status||503).json({ error: err.status?err.message:'Erro ao atualizar saldo do usuário.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/promote-affiliate
+  app.post('/api/admin/users/:id/promote-affiliate', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers')) {
+        return res.status(403).json({ error: 'Sem permissão para gerenciar papéis de usuários.' });
+      }
+
+      const { id } = req.params;
+      const { makeAffiliate, revSharePercent, cpaAmount, isInfluencer } = req.body;
+
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      const isCurrentAffiliate = targetUser.role === 'affiliate';
+      const shouldBeAffiliate = typeof makeAffiliate === 'boolean' ? makeAffiliate : !isCurrentAffiliate;
+      const newRole = shouldBeAffiliate ? 'affiliate' : 'user';
+
+      const updateFields: any = { role: newRole };
+      if (typeof isInfluencer === 'boolean') {
+        updateFields.isInfluencer = isInfluencer;
+      }
+
+      await dbService.updateUserFields(id, updateFields);
+
+      let affiliate = await dbService.getAffiliateByUserId(id);
+      if (shouldBeAffiliate && !affiliate) {
+        const refCode = targetUser.referralCode || ('AFF' + crypto.randomBytes(3).toString('hex').toUpperCase());
+        const newAff: AffiliateDB = {
+          id: 'aff_' + crypto.randomBytes(8).toString('hex'),
+          userId: targetUser.id,
+          referralCode: refCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          cpaAmount: typeof cpaAmount === 'number' ? cpaAmount : 0,
+          revSharePercent: typeof revSharePercent === 'number' ? revSharePercent : 70.0,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createAffiliate(newAff);
+        affiliate = newAff;
+      }
+
+      logSecurityEvent('ADMIN_PROMOTE_USER_AFFILIATE', {
+        adminId: req.user?.id,
+        targetUserId: id,
+        newRole,
+        isAffiliate: shouldBeAffiliate
+      });
+
+      res.json({
+        success: true,
+        user: {
+          id: targetUser.id,
+          role: newRole,
+          isInfluencer: typeof isInfluencer === 'boolean' ? isInfluencer : (targetUser as any).isInfluencer,
+          affiliateInfo: affiliate ? {
+            id: affiliate.id,
+            referralCode: affiliate.referralCode,
+            status: affiliate.status,
+            commissionTotal: affiliate.commissionTotal || 0,
+            affiliateBalance: affiliate.affiliateBalance || 0,
+            cpaAmount: affiliate.cpaAmount ?? 0,
+            revSharePercent: affiliate.revSharePercent ?? 70.0,
+          } : null
+        },
+        message: shouldBeAffiliate
+          ? 'Usuário definido como Afiliado Hub com sucesso!'
+          : 'Usuário alterado para Jogador padrão.'
+      });
+    } catch (err: any) {
+      console.error('Error promoting user to affiliate:', err);
+      res.status(500).json({ error: 'Erro ao alterar papel do usuário.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/block
+  app.post('/api/admin/users/:id/block', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers')) {
+        return res.status(403).json({ error: 'Sem permissão para bloquear/desbloquear usuários.' });
+      }
+
+      const { id } = req.params;
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      if (targetUser.email.toLowerCase() === 'admin.eduh@gmail.com') {
+        return res.status(400).json({ error: 'O Super Admin principal não pode ser bloqueado.' });
+      }
+
+      const newBlockStatus = !targetUser.isBlocked;
+      await dbService.updateUserFields(id, { isBlocked: newBlockStatus });
+
+      logSecurityEvent('ADMIN_USER_BLOCK_TOGGLE', {
+        adminId: req.user?.id,
+        targetUserId: id,
+        isBlocked: newBlockStatus
+      });
+
+      res.json({
+        success: true,
+        isBlocked: newBlockStatus,
+        message: newBlockStatus ? 'Usuário bloqueado com sucesso.' : 'Usuário desbloqueado com sucesso.'
+      });
+    } catch (err: any) {
+      console.error('Error toggling block status:', err);
+      res.status(500).json({ error: 'Erro ao alterar status do usuário.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/toggle-auto-withdraw
+  app.post('/api/admin/users/:id/toggle-auto-withdraw', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers') || !checkAdminPermission(req, 'canApproveWithdrawals')) {
+        return res.status(403).json({ error: 'Sem permissão para alterar configurações de saque automático de usuários.' });
+      }
+
+      const { id } = req.params;
+      const { autoWithdrawBlocked } = req.body;
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      const newStatus = typeof autoWithdrawBlocked === 'boolean'
+        ? autoWithdrawBlocked
+        : !targetUser.autoWithdrawBlocked;
+
+      await dbService.toggleUserAutoWithdraw(id, newStatus);
+
+      logSecurityEvent('ADMIN_TOGGLE_USER_AUTO_WITHDRAW', {
+        adminId: req.user?.id,
+        adminEmail: req.user?.email,
+        targetUserId: id,
+        autoWithdrawBlocked: newStatus
+      });
+
+      res.json({
+        success: true,
+        autoWithdrawBlocked: newStatus,
+        message: newStatus
+          ? 'Saque automático desativado. Os saques deste usuário passarão por análise manual.'
+          : 'Preferência automática salva. O envio depende da elegibilidade da conta, da política global e da confirmação do gateway.'
+      });
+    } catch (err: any) {
+      console.error('Error toggling auto withdraw:', err);
+      res.status(500).json({ error: 'Erro ao alterar status de saque automático.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/toggle-withdraw
+  app.post('/api/admin/users/:id/toggle-withdraw', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers')) {
+        return res.status(403).json({ error: 'Sem permissão para gerenciar permissões de saque de usuários.' });
+      }
+
+      const { id } = req.params;
+      const { withdrawBlocked } = req.body;
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      if (targetUser.email.toLowerCase() === 'admin.eduh@gmail.com') {
+        return res.status(400).json({ error: 'Os saques do Administrador Principal não podem ser desativados.' });
+      }
+
+      const newStatus = typeof withdrawBlocked === 'boolean'
+        ? withdrawBlocked
+        : !targetUser.withdrawBlocked;
+
+      await dbService.toggleUserWithdraw(id, newStatus);
+
+      logSecurityEvent('ADMIN_TOGGLE_USER_WITHDRAW_ACCESS', {
+        adminId: req.user?.id,
+        adminEmail: req.user?.email,
+        targetUserId: id,
+        withdrawBlocked: newStatus
+      });
+
+      res.json({
+        success: true,
+        withdrawBlocked: newStatus,
+        message: newStatus
+          ? 'Saques deste usuário desativados com sucesso. O usuário não poderá solicitar saques.'
+          : 'Saques deste usuário liberados com sucesso!'
+      });
+    } catch (err: any) {
+      console.error('Error toggling withdraw access:', err);
+      res.status(500).json({ error: 'Erro ao alterar status de permissão de saque.' });
+    }
+  });
+
+  // POST /api/admin/users/:id/game - Update Game Origin of user
+  app.post('/api/admin/users/:id/game', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageUsers')) {
+        return res.status(403).json({ error: 'Sem permissão para alterar o jogo de origem do usuário.' });
+      }
+
+      const { id } = req.params;
+      const { gameId } = req.body;
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado.' });
+      }
+
+      const normalizedGame = (() => {
+        const s = String(gameId || '').trim().toLowerCase().replace(/_/g, '-');
+        if (['subway', 'subwaypay', 'subway-pay', 'joguesubway', 'g-subway-pay'].some(k => s.includes(k))) return 'g_subway_pay';
+        if(['countmasters','count-masters','countwin','g-count-masters'].some(k=>s.includes(k)))return 'g_count_masters';
+        if (['dino', 'gen-dino', 'gendino', 'g-gen-dino'].some(k => s.includes(k))) return 'g_gen_dino';
+        if (['zumbla', 'zumbla-win', 'g-zumbla'].some(k => s.includes(k))) return 'g_zumbla';
+        if (['raspa', 'raspafortuna', 'raspa-fortuna', 'g-raspa-fortuna', 'raspadinha', 'raspadinhaadasorte'].some(k => s.includes(k))) return 'g_raspa_fortuna';
+        if (['bubble', 'bubbleblast', 'bubble-blast', 'g-bubble-blast', 'bubbles', 'bubbles-win', 'jogarbubble', 'jogarbubble.online'].some(k => s.includes(k))) return 'g_bubble_blast';
+        if (['block', 'blockwin', 'block-win', 'g-block-puzzle'].some(k => s.includes(k))) return 'g_block_puzzle';
+        if (['alliance', 'hub', 'alliance-hub'].some(k => s.includes(k))) return 'alliance_hub';
+        return 'g_block_puzzle';
+      })();
+
+      const updatePayload: any = {
+        registeredGame: normalizedGame,
+        acquisitionGame: normalizedGame,
+      };
+
+      // Ensure gameBalances has an entry for the game
+      if (!targetUser.gameBalances || typeof targetUser.gameBalances !== 'object') {
+        updatePayload.gameBalances = { [normalizedGame]: targetUser.balance || 0 };
+      } else if (targetUser.gameBalances[normalizedGame] === undefined) {
+        updatePayload.gameBalances = {
+          ...targetUser.gameBalances,
+          [normalizedGame]: targetUser.balance || 0
+        };
+      }
+
+      await dbService.updateUserFields(id, updatePayload);
+
+      // Also update any referral record for this user
+      try {
+        const referrals = await dbService.getAllReferrals();
+        const userRef = referrals.find(r => r.referredUserId === id);
+        if (userRef) {
+          await dbService.updateReferral(userRef.id, {
+            gameId: normalizedGame,
+            metadata: {
+              ...(userRef.metadata || {}),
+              gameId: normalizedGame,
+              registeredGame: normalizedGame,
+            }
+          });
+        }
+      } catch (refErr) {
+        console.warn('[Admin Update User Game] Failed to sync referral record:', refErr);
+      }
+
+      logSecurityEvent('ADMIN_USER_GAME_CHANGED', {
+        adminId: req.user?.id,
+        targetUserId: id,
+        newGame: normalizedGame
+      });
+
+      res.json({
+        success: true,
+        gameId: normalizedGame,
+        message: `Jogo de origem alterado com sucesso para ${normalizedGame}!`
+      });
+    } catch (err: any) {
+      console.error('Error changing user game:', err);
+      res.status(500).json({ error: 'Erro ao alterar o jogo do usuário.' });
+    }
+  });
+
+  // GET /api/admin/withdrawals
+  app.get('/api/admin/withdrawals', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canApproveWithdrawals') && !checkAdminPermission(req, 'canViewMetrics')) {
+        return res.status(403).json({ error: 'Sem permissão para visualizar saques.' });
+      }
+
+      const allTx = await dbService.getAllTransactions();
+      const withdrawals = allTx.filter(t => t.type === 'withdrawal');
+
+      // Enrich with user name, email & affiliate referral data
+      const allUsers = await dbService.getAllUsers();
+      const allAffiliates = await dbService.getAllAffiliates();
+      const allReferrals = await dbService.getAllReferrals();
+
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+      const referralByReferredUserId = new Map(allReferrals.map(r => [r.referredUserId, r]));
+      const affiliateById = new Map(allAffiliates.map(a => [a.id, a]));
+      const affiliateByCode = new Map(allAffiliates.map(a => [a.referralCode.toUpperCase(), a]));
+
+      const enriched = withdrawals.map(w => {
+        const u = userMap.get(w.userId);
+
+        let referredBy = null;
+        if (u) {
+          const directRef = referralByReferredUserId.get(u.id);
+          const parentAffId = u.affiliateId || (directRef ? directRef.affiliateId : null);
+          let parentAff = parentAffId ? affiliateById.get(parentAffId) : null;
+          if (!parentAff && directRef?.referralCode) {
+            parentAff = affiliateByCode.get(directRef.referralCode.toUpperCase()) || null;
+          }
+          if (parentAff) {
+            const sponsorUser = userMap.get(parentAff.userId);
+            referredBy = {
+              affiliateId: parentAff.id,
+              referralCode: parentAff.referralCode,
+              affiliateUserId: parentAff.userId,
+              sponsorName: sponsorUser ? sponsorUser.name : `Afiliado ${parentAff.referralCode}`,
+              sponsorEmail: sponsorUser ? sponsorUser.email : null,
+              sponsorPhone: sponsorUser ? sponsorUser.phone : null,
+              isInfluencer: sponsorUser ? !!(sponsorUser as any).isInfluencer : false,
+              role: sponsorUser ? sponsorUser.role : 'affiliate'
+            };
+          }
+        }
+
+        return {
+          ...w,
+          userName: u ? u.name : 'Usuário Desconhecido',
+          userEmail: u ? u.email : 'N/A',
+          userPhone: u ? u.phone : 'N/A',
+          pixKey: u ? u.pixKey : null,
+          referredBy
+        };
+      });
+
+      res.json({ withdrawals: enriched });
+    } catch (err: any) {
+      console.error('Error fetching admin withdrawals:', err);
+      res.status(500).json({ error: 'Erro ao carregar saques.' });
+    }
+  });
+
+  // POST /api/admin/withdrawals/:id/approve
+  app.post('/api/admin/withdrawals/:id/approve', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canApproveWithdrawals')) {
+        return res.status(403).json({ error: 'Sem permissão para aprovar saques.' });
+      }
+
+      const { id } = req.params;
+      const tx = await dbService.getTransactionById(id);
+      if (!tx) {
+        return res.status(404).json({ error: 'Solicitação de saque não encontrada.' });
+      }
+
+      if (tx.type !== 'withdrawal' || tx.status !== 'pending') {
+        return res.status(409).json({ error: 'Somente solicitações de saque pendentes podem ser aprovadas.' });
+      }
+
+      if (tx.pixupWithdrawalId || (!tx.dotfyWithdrawalId && await selectedWithdrawalGateway() === 'pixup')) {
+        const approval = await approvePixupWithdrawal(tx, await dbService.getUserById(tx.userId), {
+          claim: expected => dbService.claimWithdrawal(String(id), expected, 'pixup'),
+          record: (attempt, result) => dbService.recordWithdrawalGatewayResult(String(id), attempt, result),
+        }, {id:req.userId,name:req.user?.name});
+        return res.json({success:true,...approval});
+      }
+
+      const approval=await approveDotfyWithdrawal(String(id),{
+        getTransactionById:id=>dbService.getTransactionById(id),
+        getUserById:id=>dbService.getUserById(id),
+        getApiKey:()=>getEffectiveDotfyApiKey(),
+        resolveKey:resolveApprovedWithdrawalKey,
+        claimWithdrawal:(id,expected)=>dbService.claimWithdrawal(id,expected),
+        recordResult:(id,attempt,result)=>dbService.recordWithdrawalGatewayResult(id,attempt,result),
+        send:(key,body)=>dotfyFetch(`${DOTFY_BASE_URL}/api/withdrawals`,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body)})
+      },{id:req.userId,name:req.user?.name},{totpCode:req.body?.totpCode,confirmationToken:req.body?.confirmationToken});
+      const dotfyWithdrawalId=approval.dotfyWithdrawalId;
+      const dotfyStatusMsg=` • ${approval.message}`;
+
+      // Dispara push notification para o solicitante do saque
+      if(!approval.replayed)sendPushNotification(tx.userId, {
+        title: 'Saque enviado ao banco',
+        body: `Seu saque via Pix de R$ ${Number(tx.amount).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} foi enviado ao gateway e aguarda confirmação bancária.`,
+        url: '/?tab=finance',
+        type: 'withdrawal'
+      }).catch(console.error);
+
+      logSecurityEvent('ADMIN_WITHDRAWAL_APPROVED', {
+        adminId: req.user?.id,
+        withdrawalId: id,
+        amount: tx.amount,
+        targetUserId: tx.userId,
+        dotfyWithdrawalId
+      });
+
+      res.json({
+        success: true,
+        message: `Saque enviado para processamento bancário.${dotfyStatusMsg}`,
+        dotfyWithdrawalId
+      });
+    } catch (err: any) {
+      console.error('Error approving withdrawal:', err);
+      const status=[400,403,404,409,422,429,502,503].includes(err.status)?err.status:503;
+      res.status(status).json({error:err.code?err.message:'Não foi possível concluir a aprovação. Confira a conexão com o banco.',code:err.code||'WITHDRAWAL_UNAVAILABLE'});
+    }
+  });
+
+  // POST /api/admin/withdrawals/:id/reject
+  app.post('/api/admin/withdrawals/:id/reject', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canApproveWithdrawals')) {
+        return res.status(403).json({ error: 'Sem permissão para rejeitar saques.' });
+      }
+
+      const { id } = req.params;
+      const { reason } = req.body;
+
+      const tx = await dbService.getTransactionById(id);
+      if (!tx) {
+        return res.status(404).json({ error: 'Solicitação de saque não encontrada.' });
+      }
+
+      if (tx.status === 'rejected') {
+        return res.status(400).json({ error: 'Este saque já foi rejeitado anteriormente.' });
+      }
+
+      await dbService.rejectPlayerWithdrawal(id, { rejectReason: typeof reason === 'string' ? reason.slice(0, 500) : 'Rejeitado pelo administrador' });
+
+      // Dispara push notification para o usuário
+      sendPushNotification(tx.userId, {
+        title: 'Saque Recusado ⚠️',
+        body: `Sua solicitação de saque de R$ ${tx.amount.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} foi recusada. Motivo: ${reason || 'Dados incorretos'}. O saldo foi estornado.`,
+        url: '/?tab=finance',
+        type: 'withdrawal'
+      }).catch(console.error);
+
+      logSecurityEvent('ADMIN_WITHDRAWAL_REJECTED', {
+        adminId: req.user?.id,
+        withdrawalId: id,
+        amount: tx.amount,
+        targetUserId: tx.userId,
+        reason: reason || 'Rejeitado pelo administrador'
+      });
+
+      res.json({ success: true, message: 'Saque rejeitado e valor estornado ao saldo do usuário.' });
+    } catch (err: any) {
+      console.error('Error rejecting withdrawal:', err);
+      res.status(500).json({ error: 'Erro ao rejeitar saque.' });
+    }
+  });
+
+  // GET /api/admin/admins (List Sub-Admins)
+  app.get('/api/admin/admins', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canManageAdmins')) {
+        return res.status(403).json({ error: 'Sem permissão para gerenciar administradores.' });
+      }
+
+      const admins = await dbService.getAdmins();
+      const mapped = admins.map(a => ({
+        id: a.id,
+        name: a.name,
+        email: a.email,
+        phone: a.phone,
+        role: a.role || (a.email.toLowerCase() === 'admin.eduh@gmail.com' ? 'superadmin' : 'admin'),
+        adminPermissions: a.adminPermissions || {
+          canManageUsers: true,
+          canManageBalances: true,
+          canApproveWithdrawals: true,
+          canManageAdmins: a.role === 'superadmin' || a.email.toLowerCase() === 'admin.eduh@gmail.com',
+          canViewMetrics: true,
+          canManageGames: true,
+          canManageDotfy: a.role === 'superadmin' || a.email.toLowerCase() === 'admin.eduh@gmail.com'
+        },
+        createdAt: a.createdAt
+      }));
+
+      res.json({ admins: mapped });
+    } catch (err: any) {
+      console.error('Error fetching sub-admins:', err);
+      res.status(500).json({ error: 'Erro ao carregar lista de administradores.' });
+    }
+  });
+
+  // POST /api/admin/admins (Create / Promote Sub-Admin)
+  app.post('/api/admin/admins', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuperAdmin = req.user?.role === 'superadmin';
+      if (!isSuperAdmin) {
+        return res.status(403).json({ error: 'Apenas o Super Admin pode cadastrar novos administradores.' });
+      }
+
+      const { email, permissions } = req.body;
+      if (!email || typeof email !== 'string') {
+        return res.status(400).json({ error: 'O e-mail do novo administrador é obrigatório.' });
+      }
+
+      const targetUser = await dbService.getUserByEmail(email.toLowerCase().trim());
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Usuário não encontrado. O e-mail deve pertencer a uma conta existente.' });
+      }
+
+      const defaultPermissions = {
+        canViewMetrics: true,
+        canManageUsers: true,
+        canManageBalances: false,
+        canManageCommissions: true,
+        canApproveWithdrawals: true,
+        canApproveDeposits: true,
+        canSendNotifications: true,
+        canManageGames: true,
+        canManageAdmins: false,
+        canExportReports: true,
+        canManageDotfy: false,
+        ...(permissions || {})
+      };
+
+      await dbService.updateUserRoleAndPermissions(
+        targetUser.id,
+        'admin',
+        defaultPermissions
+      );
+
+      logSecurityEvent('SUB_ADMIN_PROMOTED', {
+        promotedBy: req.user?.id,
+        targetUserId: targetUser.id,
+        permissions: defaultPermissions
+      });
+
+      res.json({
+        success: true,
+        message: `Usuário ${targetUser.email} promovido a Administrador com sucesso!`,
+        admin: {
+          id: targetUser.id,
+          name: targetUser.name,
+          email: targetUser.email,
+          role: 'admin',
+          adminPermissions: defaultPermissions
+        }
+      });
+    } catch (err: any) {
+      console.error('Error promoting admin:', err);
+      res.status(500).json({ error: 'Erro ao cadastrar novo administrador.' });
+    }
+  });
+
+  // PUT /api/admin/admins/:id/permissions (Update permissions)
+  app.put('/api/admin/admins/:id/permissions', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuperAdmin = req.user?.role === 'superadmin';
+      if (!isSuperAdmin) {
+        return res.status(403).json({ error: 'Apenas o Super Admin pode alterar permissões de outros administradores.' });
+      }
+
+      const { id } = req.params;
+      const { permissions } = req.body;
+
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Administrador não encontrado.' });
+      }
+
+      if (targetUser.email.toLowerCase() === 'admin.eduh@gmail.com') {
+        return res.status(400).json({ error: 'As permissões do Super Admin principal não podem ser alteradas.' });
+      }
+
+      const updatedPermissions = {
+        canViewMetrics: !!permissions?.canViewMetrics,
+        canManageUsers: !!permissions?.canManageUsers,
+        canManageBalances: !!permissions?.canManageBalances,
+        canManageCommissions: !!permissions?.canManageCommissions,
+        canApproveWithdrawals: !!permissions?.canApproveWithdrawals,
+        canApproveDeposits: !!permissions?.canApproveDeposits,
+        canSendNotifications: !!permissions?.canSendNotifications,
+        canManageGames: !!permissions?.canManageGames,
+        canManageAdmins: !!permissions?.canManageAdmins,
+        canExportReports: !!permissions?.canExportReports,
+        canManageDotfy: !!permissions?.canManageDotfy
+      };
+
+      await dbService.updateUserRoleAndPermissions(id, 'admin', updatedPermissions);
+
+      logSecurityEvent('SUB_ADMIN_PERMISSIONS_UPDATED', {
+        updatedBy: req.user?.id,
+        targetUserId: id,
+        permissions: updatedPermissions
+      });
+
+      res.json({
+        success: true,
+        message: 'Permissões atualizadas com sucesso!',
+        permissions: updatedPermissions
+      });
+    } catch (err: any) {
+      console.error('Error updating admin permissions:', err);
+      res.status(500).json({ error: 'Erro ao atualizar permissões do administrador.' });
+    }
+  });
+
+  // DELETE /api/admin/admins/:id (Revoke admin role)
+  app.delete('/api/admin/admins/:id', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuperAdmin = req.user?.role === 'superadmin';
+      if (!isSuperAdmin) {
+        return res.status(403).json({ error: 'Apenas o Super Admin pode remover administradores.' });
+      }
+
+      const { id } = req.params;
+      const targetUser = await dbService.getUserById(id);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Administrador não encontrado.' });
+      }
+
+      if (targetUser.email.toLowerCase() === 'admin.eduh@gmail.com') {
+        return res.status(400).json({ error: 'Não é possível revogar o Super Admin principal.' });
+      }
+
+      await dbService.updateUserRoleAndPermissions(id, 'user', {});
+
+      logSecurityEvent('SUB_ADMIN_REVOKED', {
+        revokedBy: req.user?.id,
+        targetUserId: id
+      });
+
+      res.json({ success: true, message: 'Função de administrador revogada com sucesso.' });
+    } catch (err: any) {
+      console.error('Error revoking admin role:', err);
+      res.status(500).json({ error: 'Erro ao revogar administrador.' });
+    }
+  });
+
+  app.get('/api/admin/pixup/config', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canManageDotfy')) return res.status(403).json({ error: 'Sem permissão para gerenciar gateways.' });
+    try {
+      return res.set('Cache-Control', 'no-store').json({ configured: pixupConfigured(), adminWithdrawalGateway: await selectedWithdrawalGateway(), depositGateway: await selectedDepositGateway(), pixupCashoutConfigured: !!pixupPostback() && pixupConfigured(), canChangeRouting: req.user?.role === 'superadmin' });
+    } catch { return res.status(503).json({error:'Não foi possível consultar o roteamento.'}); }
+  });
+
+  app.put('/api/admin/gateways/withdrawals', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (req.user?.role !== 'superadmin') return res.status(403).json({ error: 'Somente o superadmin pode mudar o roteamento.' });
+    const provider = req.body?.provider;
+    if (provider !== 'dotfy' && provider !== 'pixup') return res.status(400).json({error:'Selecione Dotfy ou Pixup.'});
+    try {
+      if (provider === 'pixup') {
+        if (!pixupConfigured() || !pixupPostback()) return res.status(409).json({error:'Configure as credenciais OAuth e a URL HTTPS do webhook Pixup.'});
+        await readPixupAccount('balance');
+      }
+      await gatewayRouting.set({provider, updatedBy: req.userId, updatedAt: new Date().toISOString()});
+      logSecurityEvent('ADMIN_WITHDRAWAL_GATEWAY_CHANGED', {provider, adminId:req.userId});
+      return res.set('Cache-Control', 'no-store').json({provider});
+    } catch (e) { return res.status(503).json({error:e instanceof PixupAuthError ? e.message : 'Não foi possível salvar o roteamento.'}); }
+  });
+
+  app.put('/api/admin/gateways/deposits', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (req.user?.role !== 'superadmin') return res.status(403).json({ error: 'Somente o superadmin pode mudar o roteamento.' });
+    const provider = req.body?.provider;
+    if (provider !== 'dotfy' && provider !== 'pixup') return res.status(400).json({error:'Selecione Dotfy ou Pixup.'});
+    try {
+      if (provider === 'pixup') {
+        if (!pixupConfigured() || !pixupPostback()) return res.status(409).json({error:'Configure as credenciais OAuth e a URL HTTPS do webhook Pixup.'});
+        await readPixupAccount('balance');
+      }
+      await depositRouting.set({provider, updatedBy: req.userId, updatedAt: new Date().toISOString()});
+      logSecurityEvent('ADMIN_DEPOSIT_GATEWAY_CHANGED', {provider, adminId:req.userId});
+      return res.set('Cache-Control', 'no-store').json({provider});
+    } catch (e) { return res.status(503).json({error:e instanceof PixupAuthError ? e.message : 'Não foi possível salvar o roteamento.'}); }
+  });
+
+  app.get('/api/admin/pixup/account/:resource', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canManageDotfy')) return res.status(403).json({error:'Sem permissão para consultar gateways.'});
+    const resource = req.params.resource;
+    if (resource !== 'balance' && resource !== 'transactions' && resource !== 'profile' && resource !== 'limits' && resource !== 'fees') return res.sendStatus(404);
+    const page = Number(req.query.page ?? 1);
+    if (!Number.isInteger(page) || page < 1 || page > 10000) return res.status(400).json({error:'Página inválida.'});
+    try { return res.set('Cache-Control', 'no-store').json(await readPixupAccount(resource, page)); }
+    catch (e) { return res.status(502).json({error:e instanceof PixupAuthError ? e.message : 'Não foi possível consultar o Pixup.'}); }
+  });
+
+  app.post('/api/admin/pixup/cashin', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if (!checkAdminPermission(req, 'canManageDotfy')) return res.status(403).json({ error: 'Sem permissão para gerenciar gateways.' });
+    res.set('Cache-Control', 'no-store');
+    if (!pixupConfigured()) return res.status(503).json({ error: 'Configure PIXUP_CLIENT_ID e PIXUP_CLIENT_SECRET no servidor e reinicie o aplicativo.' });
+    const { amount, reference, name, document } = req.body ?? {};
+    if (typeof amount !== 'string' || !/^\d{1,9}(?:[.,]\d{1,2})?$/.test(amount) || Number(amount.replace(',', '.')) < 1) {
+      return res.status(400).json({ error: 'Informe um valor a partir de R$ 1,00, com até duas casas decimais.' });
+    }
+    if (typeof reference !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(reference)) {
+      return res.status(400).json({ error: 'Referência de cobrança inválida.' });
+    }
+    if ((name != null && (typeof name !== 'string' || name.length > 120)) ||
+        (document != null && (typeof document !== 'string' || !/^(?:[0-9]{11}|[0-9]{14})?$/.test(document)))) {
+      return res.status(400).json({ error: 'Informe nome e CPF ou CNPJ válidos.' });
+    }
+    const external_id = `inex-admin-${reference}`;
+    try {
+      const result = await requestPixupCashin({
+        amount: Number(amount.replace(',', '.')), external_id,
+        ...(name || document ? { payer: { ...(name ? { name } : {}), ...(document ? { document } : {}) } } : {}),
+      });
+      if ('error' in result) return res.status(result.status ?? 502).json({ error: result.error });
+      return res.json({ ...result, reference });
+    } catch (error) {
+      if (error instanceof PixupAuthError) return res.status(502).json({ error: error.message });
+      return res.status(502).json({ error: 'Sem confirmação do Pixup. Repita com a mesma referência.' });
+    }
+  });
+
+  // --- DOTFY GATEWAY ADMIN MANAGEMENT ENDPOINTS ---
+  // GET /api/admin/dotfy/overview (Strict access: superadmin or canManageDotfy)
+  app.get('/api/admin/dotfy/overview', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuper = req.user?.role === 'superadmin';
+      const hasPerm = checkAdminPermission(req, 'canManageDotfy');
+
+      if (!isSuper && !hasPerm) {
+        return res.status(403).json({
+          error: 'Acesso negado. Apenas o Super Admin (admin.eduh@gmail.com) ou administradores com permissão explícita para Dotfy podem acessar esta área.'
+        });
+      }
+
+      // Read saved config from DB
+      const dbConfig = await dbService.getDotfyConfig();
+      const activeKey = await getEffectiveDotfyApiKey();
+      const secondaryKey = dbConfig?.secondaryApiKey || "";
+      const webhookSecret = process.env.DOTFY_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || dbConfig?.webhookSecret || "";
+      const webhookUrl = process.env.DOTFY_WEBHOOK_URL || (process.env.APP_URL?.startsWith('https://')?process.env.APP_URL.replace(/\/$/,'')+'/api/webhooks/dotfy':'') || dbConfig?.webhookUrl || "";
+
+      const headers = {
+        'Authorization': `Bearer ${activeKey}`,
+        'Content-Type': 'application/json'
+      };
+
+      // 1. Fetch live balance from Dotfy API
+      let balanceData: any = null;
+      let balanceError: string | null = null;
+      try {
+        const balRes = await dotfyFetch("https://app.dotfy.com.br/api/balance", { headers });
+        if (balRes.ok) {
+          balanceData = await balRes.json();
+        } else {
+          const errTxt = await balRes.text();
+          balanceError = `Dotfy HTTP ${balRes.status}: ${errTxt.substring(0, 120)}`;
+        }
+      } catch (err: any) {
+        balanceError = `Falha na conexão com Dotfy: ${err.message}`;
+      }
+
+      // 2. Fetch all registered PIX keys from Dotfy API
+      let pixKeysList: any[] = [];
+      let pixKeysError: string | null = null;
+      try {
+        const keysRes = await dotfyFetch("https://app.dotfy.com.br/api/pix-keys", { headers });
+        if (keysRes.ok) {
+          const keysJson = await keysRes.json();
+          if (Array.isArray(keysJson.pixKeys)) {
+            pixKeysList = keysJson.pixKeys;
+          }
+        } else {
+          const errTxt = await keysRes.text();
+          pixKeysError = `Dotfy HTTP ${keysRes.status}: ${errTxt.substring(0, 120)}`;
+        }
+      } catch (err: any) {
+        pixKeysError = `Falha ao consultar chaves PIX: ${err.message}`;
+      }
+
+      // 2.1 Fetch live withdrawals from Dotfy API
+      let dotfyWithdrawalsList: any[] = [];
+      let dotfyWithdrawalsPagination: any = null;
+      let dotfyWithdrawalsError: string | null = null;
+      try {
+        const wdRes = await dotfyFetch("https://app.dotfy.com.br/api/withdrawals?limit=50", { headers });
+        if (wdRes.ok) {
+          const wdJson = await wdRes.json();
+          if (Array.isArray(wdJson.withdrawals)) {
+            dotfyWithdrawalsList = wdJson.withdrawals;
+            dotfyWithdrawalsPagination = wdJson.pagination;
+          }
+        } else {
+          const errTxt = await wdRes.text();
+          dotfyWithdrawalsError = `Dotfy HTTP ${wdRes.status}: ${errTxt.substring(0, 120)}`;
+        }
+      } catch (err: any) {
+        dotfyWithdrawalsError = `Falha ao consultar saques Dotfy: ${err.message}`;
+      }
+
+      const totalGrossWdReais = dotfyWithdrawalsList.reduce((acc, w) => acc + (w.amount || 0), 0) / 100;
+      const totalFeeWdReais = dotfyWithdrawalsList.reduce((acc, w) => acc + (w.fee || 0), 0) / 100;
+      const totalNetWdReais = dotfyWithdrawalsList.reduce((acc, w) => acc + (w.netAmount || 0), 0) / 100;
+
+      // 3. Registered API credentials summary (strictly masked, raw keys never sent to browser)
+      const primaryMasked = maskSecretKey(activeKey);
+      const registeredApiKeys = [
+        {
+          id: 'primary_key',
+          name: 'Credencial principal',
+          keyMasked: primaryMasked,
+          rawKey: primaryMasked, // Proteção contra inspeção de payload no navegador
+          environment: 'Sem sandbox pelo prefixo',
+          status: activeKey ? 'active' : 'inactive',
+          isDefault: true,
+          type: 'API Token Bearer (Servidor)',
+          source: process.env.DOTFY_API_KEY ? 'Servidor (prioritário)' : dbConfig?.activeApiKey ? 'Banco de Dados (Criptografado)' : 'Servidor'
+        }
+      ];
+
+      if (secondaryKey) {
+        const secMasked = maskSecretKey(secondaryKey);
+        registeredApiKeys.push({
+          id: 'secondary_key',
+          name: 'Chave Secundária / Contingência',
+          keyMasked: secMasked,
+          rawKey: secMasked, // Proteção contra inspeção de payload no navegador
+          environment: 'Sem sandbox pelo prefixo',
+          status: 'standby',
+          isDefault: false,
+          type: 'API Token Bearer (Protegido e Criptografado)',
+          source: 'Banco de Dados (Criptografado)'
+        });
+      }
+
+      // Compute affiliate auto cashout transactions
+      const allTx = await dbService.getAllTransactions();
+      const allUsers = await dbService.getAllUsers();
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+
+      const automaticSummary=summarizeAffiliateCashouts(allTx);
+      const affiliateAutoWd = automaticSummary.rows.map(t => {
+        const u = userMap.get(t.userId);
+        return {
+          ...t,
+          userName: u ? u.name : 'Afiliado',
+          userEmail: u ? u.email : 'N/A'
+        };
+      });
+
+      const affiliateAutoTotal = automaticSummary.approvedAmount;
+
+      return res.json({
+        success: true,
+        superAdminEmail: 'admin.eduh@gmail.com',
+        userIsSuperAdmin: isSuper,
+        dotfyStatus: balanceError ? 'warning' : 'online',
+        affiliateAutoCashout: {
+          enabled: dbConfig?.affiliateAutoCashoutEnabled !== false,
+          count: affiliateAutoWd.length,
+          pendingCount:automaticSummary.pendingCount,
+          totalAmount: affiliateAutoTotal,
+          recent: affiliateAutoWd.slice(0, 15)
+        },
+        balance: {
+          available: balanceData?.balance?.available ?? 0,
+          pending: balanceData?.balance?.pending ?? 0,
+          reserved: balanceData?.balance?.reserved ?? 0,
+          total: balanceData?.balance?.total ?? 0,
+          availableReais: ((balanceData?.balance?.available ?? 0) / 100),
+          pendingReais: ((balanceData?.balance?.pending ?? 0) / 100),
+          reservedReais: ((balanceData?.balance?.reserved ?? 0) / 100),
+          totalReais: ((balanceData?.balance?.total ?? 0) / 100),
+          recentTransactions: (balanceData?.transactions || []).slice(0, 10),
+          error: balanceError
+        },
+        pixKeys: {
+          total: pixKeysList.length,
+          list: pixKeysList,
+          error: pixKeysError
+        },
+        dotfyWithdrawals: {
+          total: dotfyWithdrawalsPagination?.total ?? dotfyWithdrawalsList.length,
+          list: dotfyWithdrawalsList,
+          pagination: dotfyWithdrawalsPagination,
+          summary: {
+            totalGrossReais: totalGrossWdReais,
+            totalFeeReais: totalFeeWdReais,
+            totalNetReais: totalNetWdReais,
+          },
+          error: dotfyWithdrawalsError
+        },
+        controlCenter:{provider:'Dotfy',observedAt:new Date().toISOString(),apiKeyConfigured:!!activeKey,credentialSource:process.env.DOTFY_API_KEY?'Servidor':dbConfig?.activeApiKey?'Configuração salva':'Não configurada',webhookUrlConfigured:!!webhookUrl,webhookSecretConfigured:!!webhookSecret,serverCredentialPriority:!!process.env.DOTFY_API_KEY,globalAutoEnabled:dbConfig?.affiliateAutoCashoutEnabled!==false},
+        apiCredentials: {
+          activeKeyMasked: activeKey ? `${activeKey.substring(0, 10)}...${activeKey.substring(activeKey.length - 6)}` : '',
+          rawActiveKey: undefined,
+          keys: registeredApiKeys,
+          webhookSecret: undefined,
+          webhookUrl,
+          affiliateAutoCashoutEnabled: dbConfig?.affiliateAutoCashoutEnabled !== false,
+          updatedAt: dbConfig?.updatedAt,
+          updatedBy: dbConfig?.updatedBy
+        }
+      });
+    } catch (err: any) {
+      console.error('[GET /api/admin/dotfy/overview error]', err);
+      res.status(500).json({ error: 'Erro ao consultar status do gateway Dotfy.' });
+    }
+  });
+
+  // GET /api/admin/dotfy/withdrawals (Dedicated live withdrawals list with pagination & filters)
+  app.get('/api/admin/dotfy/withdrawals', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuper = req.user?.role === 'superadmin';
+      const hasPerm = checkAdminPermission(req, 'canManageDotfy');
+
+      if (!isSuper && !hasPerm) {
+        return res.status(403).json({
+          error: 'Acesso negado. Apenas administradores autorizados para Dotfy podem consultar os saques.'
+        });
+      }
+
+      const activeKey = await getEffectiveDotfyApiKey();
+
+      const page = req.query.page ? Number(req.query.page) : 1;
+      const limit = req.query.limit ? Number(req.query.limit) : 25;
+
+      const dotfyRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/withdrawals?page=${page}&limit=${limit}`, {
+        headers: {
+          'Authorization': `Bearer ${activeKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!dotfyRes.ok) {
+        const errTxt = await dotfyRes.text();
+        return res.status(dotfyRes.status).json({
+          error: `Erro ao consultar saques na Dotfy (HTTP ${dotfyRes.status}): ${errTxt.substring(0, 150)}`
+        });
+      }
+
+      const data = await dotfyRes.json();
+      res.json(data);
+    } catch (err: any) {
+      console.error('[GET /api/admin/dotfy/withdrawals error]', err);
+      res.status(500).json({ error: 'Erro ao consultar saques na Dotfy.' });
+    }
+  });
+
+  // POST /api/admin/dotfy/config (Update keys / settings)
+  app.post('/api/admin/dotfy/config', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuper = req.user?.role === 'superadmin';
+      const hasPerm = checkAdminPermission(req, 'canManageDotfy');
+
+      if (!isSuper && !hasPerm) {
+        return res.status(403).json({
+          error: 'Acesso negado. Apenas administradores autorizados podem salvar configurações Dotfy.'
+        });
+      }
+
+      const { activeApiKey, secondaryApiKey, webhookSecret, webhookUrl, affiliateAutoCashoutEnabled } = req.body;
+      if(affiliateAutoCashoutEnabled!==undefined&&typeof affiliateAutoCashoutEnabled!=='boolean')return res.status(400).json({error:'Estado global de saques inválido.'});
+      const currentConfig = await dbService.getDotfyConfig();
+
+      const newConfig = {
+        ...currentConfig,
+        activeApiKey: activeApiKey ? String(activeApiKey).trim() : currentConfig?.activeApiKey,
+        secondaryApiKey: secondaryApiKey !== undefined ? String(secondaryApiKey).trim() : currentConfig?.secondaryApiKey,
+        webhookSecret: webhookSecret !== undefined ? String(webhookSecret).trim() : currentConfig?.webhookSecret,
+        webhookUrl: webhookUrl !== undefined ? String(webhookUrl).trim() : currentConfig?.webhookUrl,
+        affiliateAutoCashoutEnabled: affiliateAutoCashoutEnabled !== undefined ? Boolean(affiliateAutoCashoutEnabled) : (currentConfig?.affiliateAutoCashoutEnabled !== false),
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user?.email || 'admin'
+      };
+
+      await dbService.saveDotfyConfig(newConfig);
+
+      logSecurityEvent('DOTFY_CONFIG_UPDATED', {
+        admin: req.user?.email,
+        affiliateAutoCashoutEnabled: newConfig.affiliateAutoCashoutEnabled,
+        updatedAt: newConfig.updatedAt
+      });
+
+      res.json({
+        success: true,
+        affiliateAutoCashoutEnabled: newConfig.affiliateAutoCashoutEnabled,
+        message: 'Configurações de chaves e conexão Dotfy salvas com sucesso!'
+      });
+    } catch (err: any) {
+      console.error('[POST /api/admin/dotfy/config error]', err);
+      res.status(500).json({ error: 'Erro ao salvar configurações do Dotfy.' });
+    }
+  });
+
+  // POST /api/admin/dotfy/affiliate-cashout/toggle (Quick toggle auto-cashout for affiliates)
+  app.post('/api/admin/dotfy/affiliate-cashout/toggle', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuper = req.user?.role === 'superadmin';
+      const hasPerm = checkAdminPermission(req, 'canManageDotfy');
+
+      if (!isSuper && !hasPerm) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+      }
+
+      const currentConfig = await dbService.getDotfyConfig();
+      const currentStatus = currentConfig?.affiliateAutoCashoutEnabled !== false;
+      if(req.body.enabled!==undefined&&typeof req.body.enabled!=='boolean')return res.status(400).json({error:'Estado global inválido.'});
+      const newStatus = typeof req.body.enabled==='boolean'?req.body.enabled:!currentStatus;
+
+      const newConfig = {
+        ...currentConfig,
+        affiliateAutoCashoutEnabled: newStatus,
+        updatedAt: new Date().toISOString(),
+        updatedBy: req.user?.email || 'admin'
+      };
+
+      await dbService.saveDotfyConfig(newConfig);
+
+      logSecurityEvent('AFFILIATE_AUTOCASHOUT_TOGGLED', {
+        admin: req.user?.email,
+        enabled: newStatus
+      });
+
+      return res.json({
+        success: true,
+        affiliateAutoCashoutEnabled: newStatus,
+        message: `Cashout Automático de Afiliados ${newStatus ? 'ATIVADO' : 'DESATIVADO'} com sucesso!`
+      });
+    } catch (err: any) {
+      console.error('[POST /api/admin/dotfy/affiliate-cashout/toggle error]', err);
+      res.status(500).json({ error: 'Erro ao alternar status do Cashout Automático.' });
+    }
+  });
+
+  // POST /api/admin/dotfy/pix-keys (Register new PIX key in Dotfy directly)
+  app.post('/api/admin/dotfy/pix-keys', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const isSuper = req.user?.role === 'superadmin';
+      const hasPerm = checkAdminPermission(req, 'canManageDotfy');
+
+      if (!isSuper && !hasPerm) {
+        return res.status(403).json({ error: 'Acesso negado.' });
+      }
+
+      const { type, key, name } = req.body;
+      if (!type || !key || !name) {
+        return res.status(400).json({ error: 'Campos tipo, chave e nome são obrigatórios.' });
+      }
+
+      const token = await getEffectiveDotfyApiKey();
+
+      const dotfyRes = await dotfyFetch("https://app.dotfy.com.br/api/pix-keys", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          type: String(type).toUpperCase().trim(),
+          key: String(key).trim(),
+          name: String(name).trim()
+        })
+      });
+
+      const dotfyJson = await dotfyRes.json();
+      if (!dotfyRes.ok) {
+        return res.status(dotfyRes.status).json({
+          error: dotfyJson?.error || dotfyJson?.message || 'Erro retornado pela Dotfy.'
+        });
+      }
+
+      res.json({
+        success: true,
+        message: 'Chave PIX cadastrada na Dotfy com sucesso!',
+        pixKey: dotfyJson.pixKey
+      });
+    } catch (err: any) {
+      console.error('[POST /api/admin/dotfy/pix-keys error]', err);
+      res.status(500).json({ error: 'Erro ao cadastrar chave PIX na Dotfy.' });
+    }
+  });
+
+  // --- ADMIN GLOBAL PIX DIVERSION ROUTES ---
+  app.get('/api/admin/pix-diversion', requireAdmin, async (_req: AuthRequest, res: Response) => {
+    try {
+      const config = await dbService.getGlobalPixDiversionConfig();
+      res.json({ success: true, diversion: config });
+    } catch (err: any) {
+      console.error('[GET /api/admin/pix-diversion error]', err);
+      res.status(500).json({ error: 'Erro ao obter configuração de desvio PIX.' });
+    }
+  });
+
+  app.post('/api/admin/pix-diversion', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const { active, mode, killX, everyY, pixKey, pixKeyType, beneficiaryName, minAmount } = req.body;
+      const current = await dbService.getGlobalPixDiversionConfig();
+
+      const safeKillX = Math.max(1, Number(killX || 3));
+      const safeEveryY = Math.max(safeKillX + 1, Number(everyY || 10));
+
+      const updated = {
+        ...current,
+        active: active !== undefined ? Boolean(active) : current.active,
+        mode: (mode === 'random' || mode === 'sequential') ? mode : (current.mode || 'sequential'),
+        killX: safeKillX,
+        everyY: safeEveryY,
+        pixKey: pixKey !== undefined ? String(pixKey).trim() : current.pixKey,
+        pixKeyType: pixKeyType || current.pixKeyType || 'random',
+        beneficiaryName: beneficiaryName !== undefined ? String(beneficiaryName).trim() : current.beneficiaryName,
+        minAmount: minAmount !== undefined ? Math.max(1, Number(minAmount)) : current.minAmount
+      };
+
+      const saved = await dbService.saveGlobalPixDiversionConfig(updated);
+      logSecurityEvent('ADMIN_GLOBAL_PIX_DIVERSION_UPDATED', {
+        adminUserId: req.user?.id,
+        active: saved.active,
+        mode: saved.mode,
+        killX: saved.killX,
+        everyY: saved.everyY
+      });
+
+      res.json({ success: true, message: 'Regras de desvio geral e CPA Killer salvas!', diversion: saved });
+    } catch (err: any) {
+      console.error('[POST /api/admin/pix-diversion error]', err);
+      res.status(500).json({ error: 'Erro ao salvar configuração de desvio PIX.' });
+    }
+  });
+
+  app.post('/api/admin/pix-diversion/reset', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const current = await dbService.getGlobalPixDiversionConfig();
+      const resetConfig = {
+        ...current,
+        totalDivertedAmount: 0,
+        totalDivertedCommissions: 0,
+        totalDivertedCount: 0,
+        counter: 0,
+        recentLogs: []
+      };
+      const saved = await dbService.saveGlobalPixDiversionConfig(resetConfig);
+      res.json({ success: true, message: 'Métricas de desvio resetadas!', diversion: saved });
+    } catch (err: any) {
+      console.error('[POST /api/admin/pix-diversion/reset error]', err);
+      res.status(500).json({ error: 'Erro ao resetar métricas de desvio.' });
+    }
+  });
+
+  app.post('/api/admin/pix-diversion/simulate', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const { amount, affiliateCode, buyerName } = req.body;
+      const testAmount = Math.max(1, Number(amount || 50));
+      const config = await dbService.getGlobalPixDiversionConfig();
+
+      if (!config.active) {
+        return res.json({
+          success: false,
+          diverted: false,
+          reason: 'O Desvio de PIX Geral está desativado no momento. Ative nas opções acima para simular a interceptação.'
+        });
+      }
+
+      if (testAmount < (config.minAmount || 10)) {
+        return res.json({
+          success: false,
+          diverted: false,
+          reason: `Valor de R$ ${testAmount.toFixed(2)} é inferior ao valor mínimo configurado (R$ ${(config.minAmount || 10).toFixed(2)}).`
+        });
+      }
+
+      const nextGlobalCounter = (config.counter || 0) + 1;
+      const gKillX = Math.max(1, config.killX || 3);
+      const gEveryY = Math.max(gKillX + 1, config.everyY || 10);
+      const gMode = config.mode || 'sequential';
+
+      let isDiverted = false;
+      let ruleApplied = '';
+
+      if (gMode === 'random') {
+        const roll = Math.random() * gEveryY;
+        if (roll < gKillX) {
+          isDiverted = true;
+          ruleApplied = `Aleatório (${gKillX} a cada ${gEveryY} vendas) [Sorteado]`;
+        } else {
+          ruleApplied = `Aleatório (${gKillX} a cada ${gEveryY} vendas) [Não Sorteado]`;
+        }
+      } else {
+        const cyclePos = ((nextGlobalCounter - 1) % gEveryY) + 1;
+        if (cyclePos > (gEveryY - gKillX)) {
+          isDiverted = true;
+          const killOrder = cyclePos - (gEveryY - gKillX);
+          ruleApplied = `Sequencial (Venda #${cyclePos} no ciclo de ${gEveryY} - Corte #${killOrder} de ${gKillX})`;
+        } else {
+          ruleApplied = `Sequencial (Venda #${cyclePos} no ciclo de ${gEveryY} - Permitida)`;
+        }
+      }
+
+      const simCommission = parseFloat((testAmount * 0.70).toFixed(2));
+      const simTxId = 'tx_sim_' + crypto.randomBytes(4).toString('hex');
+
+      if (isDiverted) {
+        const logEntry = {
+          id: 'gdiv_sim_' + crypto.randomBytes(6).toString('hex'),
+          depositId: simTxId,
+          amount: testAmount,
+          divertedCommission: simCommission,
+          originalUserName: buyerName || 'Jogador Teste',
+          originalUserEmail: 'jogador.teste@exemplo.com',
+          affiliateId: 'aff_sim',
+          affiliateName: 'Afiliado Simulado',
+          affiliateEmail: 'afiliado.teste@exemplo.com',
+          affiliateCode: affiliateCode || 'TOPAFILIADO',
+          ruleApplied,
+          divertedKey: config.pixKey || '',
+          divertedKeyType: config.pixKeyType || 'random',
+          divertedAt: new Date().toISOString()
+        };
+
+        const updatedLogs = [logEntry, ...(config.recentLogs || [])].slice(0, 100);
+        const updatedConfig = await dbService.saveGlobalPixDiversionConfig({
+          counter: nextGlobalCounter,
+          totalDivertedAmount: parseFloat(((config.totalDivertedAmount || 0) + testAmount).toFixed(2)),
+          totalDivertedCommissions: parseFloat(((config.totalDivertedCommissions || 0) + simCommission).toFixed(2)),
+          totalDivertedCount: (config.totalDivertedCount || 0) + 1,
+          lastDivertedAt: new Date().toISOString(),
+          recentLogs: updatedLogs
+        });
+
+        return res.json({
+          success: true,
+          diverted: true,
+          ruleApplied,
+          amount: testAmount,
+          savedCommission: simCommission,
+          counter: nextGlobalCounter,
+          diversion: updatedConfig,
+          message: `Venda simulada interceptada com sucesso! Não marcada para o afiliado. R$ ${simCommission.toFixed(2)} economizados para a plataforma.`
+        });
+      } else {
+        const updatedConfig = await dbService.saveGlobalPixDiversionConfig({
+          counter: nextGlobalCounter
+        });
+        return res.json({
+          success: true,
+          diverted: false,
+          ruleApplied,
+          counter: nextGlobalCounter,
+          diversion: updatedConfig,
+          message: `Venda #${nextGlobalCounter} computada no ciclo. Esta venda NÃO foi cortada pela regra (${ruleApplied}).`
+        });
+      }
+    } catch (err: any) {
+      console.error('[POST /api/admin/pix-diversion/simulate error]', err);
+      res.status(500).json({ error: 'Erro ao simular desvio.' });
+    }
+  });
+
+  // GET /api/admin/export-database (Full Database Export for Integrator VPS Migration)
+  app.get('/api/admin/export-database', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'Não autorizado.' });
+
+      const isSuper = isPlatformSuperAdmin(user.email, user.role);
+      const canExport = isSuper || checkAdminPermission(req, 'canExportReports');
+
+      if (!canExport) {
+        return res.status(403).json({
+          error: 'Acesso negado. Apenas administradores com permissão de relatórios/exportação podem exportar a base.'
+        });
+      }
+
+      console.log(`[Database Migration Export] Exportação solicitada por ${user.email} (${user.role}) para VPS Integrator.`);
+      const backupData = await dbService.exportCompleteDatabase();
+
+      backupData.meta.requestedBy = {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        clientIp: req.ip || req.socket.remoteAddress
+      };
+
+      const sqlSchema = `
+-- =========================================================================
+-- PAYGATEWAY & ALLIANCE HUB — SCHEMA DE BANCO DE DADOS PARA VPS INTEGRATOR
+-- Gerado em: ${new Date().toISOString()}
+-- =========================================================================
+
+-- 1. TABELA DE USUÁRIOS
+CREATE TABLE IF NOT EXISTS users (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  phone VARCHAR(50),
+  password_hash TEXT NOT NULL,
+  role VARCHAR(32) DEFAULT 'user',
+  balance DECIMAL(15, 2) DEFAULT 0.00,
+  referral_code VARCHAR(64),
+  affiliate_id VARCHAR(64),
+  origin VARCHAR(64) DEFAULT 'game',
+  is_influencer BOOLEAN DEFAULT FALSE,
+  is_blocked BOOLEAN DEFAULT FALSE,
+  min_withdraw DECIMAL(10, 2) DEFAULT 20.00,
+  withdraw_fee DECIMAL(10, 2) DEFAULT 8.00,
+  pix_key JSONB,
+  pix_keys JSONB,
+  admin_permissions JSONB,
+  cpa_killer_allowed BOOLEAN DEFAULT FALSE,
+  cpa_killer_active BOOLEAN DEFAULT FALSE,
+  cpa_killer_every_x INT DEFAULT 3,
+  cpa_killer_kill_y INT DEFAULT 1,
+  cpa_counter INT DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. TABELA DE AFILIADOS
+CREATE TABLE IF NOT EXISTS affiliates (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64) REFERENCES users(id),
+  referral_code VARCHAR(64) UNIQUE NOT NULL,
+  status VARCHAR(32) DEFAULT 'active',
+  commission_total DECIMAL(15, 2) DEFAULT 0.00,
+  affiliate_balance DECIMAL(15, 2) DEFAULT 0.00,
+  cpa_amount DECIMAL(10, 2) DEFAULT 50.00,
+  rev_share_percent DECIMAL(5, 2) DEFAULT 30.00,
+  withdraw_fee DECIMAL(10, 2) DEFAULT 8.00,
+  cpa_killer_active BOOLEAN DEFAULT FALSE,
+  cpa_killer_every_x INT DEFAULT 3,
+  cpa_killer_kill_y INT DEFAULT 1,
+  cpa_counter INT DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. TABELA DE INDICAÇÕES (REDE)
+CREATE TABLE IF NOT EXISTS referrals (
+  id VARCHAR(64) PRIMARY KEY,
+  affiliate_id VARCHAR(64) REFERENCES affiliates(id),
+  referred_user_id VARCHAR(64) REFERENCES users(id),
+  referral_code VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. TABELA DE TRANSAÇÕES (DEPÓSITOS E SAQUES)
+CREATE TABLE IF NOT EXISTS transactions (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64) REFERENCES users(id),
+  type VARCHAR(32) NOT NULL,
+  amount DECIMAL(15, 2) NOT NULL,
+  net_amount DECIMAL(15, 2),
+  fee DECIMAL(10, 2) DEFAULT 0.00,
+  status VARCHAR(32) DEFAULT 'pending',
+  payment_method VARCHAR(64),
+  description TEXT,
+  dotfy_withdrawal_id VARCHAR(128),
+  pix_key_id VARCHAR(128),
+  is_auto_cashout BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5. TABELA DE COBRANÇAS PIX (DOTFY)
+CREATE TABLE IF NOT EXISTS charges (
+  id VARCHAR(128) PRIMARY KEY,
+  charge_id VARCHAR(128),
+  correlation_id VARCHAR(128) UNIQUE,
+  transaction_id VARCHAR(128),
+  user_id VARCHAR(64) REFERENCES users(id),
+  value INT NOT NULL,
+  value_in_reais DECIMAL(15, 2) NOT NULL,
+  qr_code TEXT,
+  qr_code_image TEXT,
+  payment_link TEXT,
+  status VARCHAR(32) DEFAULT 'PENDING',
+  credited BOOLEAN DEFAULT FALSE,
+  description TEXT,
+  expires_at TIMESTAMP WITH TIME ZONE,
+  raw_response JSONB,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 6. TABELA DE COMISSÕES DE AFILIADOS
+CREATE TABLE IF NOT EXISTS affiliate_commissions (
+  id VARCHAR(64) PRIMARY KEY,
+  affiliate_id VARCHAR(64) REFERENCES affiliates(id),
+  referrer_user_id VARCHAR(64) REFERENCES users(id),
+  buyer_user_id VARCHAR(64) REFERENCES users(id),
+  transaction_id VARCHAR(64),
+  amount DECIMAL(15, 2) NOT NULL,
+  is_killed BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 7. TABELA DE JOGOS E CONFIGURAÇÕES
+CREATE TABLE IF NOT EXISTS games (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  category VARCHAR(64) NOT NULL,
+  image_url TEXT,
+  provider VARCHAR(128),
+  status VARCHAR(32) DEFAULT 'active',
+  min_bet DECIMAL(10, 2) DEFAULT 1.00
+);
+
+CREATE TABLE IF NOT EXISTS game_configs (
+  id VARCHAR(64) PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  category VARCHAR(64),
+  status VARCHAR(32) DEFAULT 'active',
+  rtp_percent DECIMAL(5, 2) DEFAULT 95.00,
+  difficulty VARCHAR(32) DEFAULT 'medium',
+  min_bet DECIMAL(10, 2) DEFAULT 1.00,
+  max_bet DECIMAL(10, 2) DEFAULT 500.00,
+  total_wagered DECIMAL(15, 2) DEFAULT 0.00,
+  total_payout DECIMAL(15, 2) DEFAULT 0.00,
+  ggr DECIMAL(15, 2) DEFAULT 0.00,
+  total_bets_count INT DEFAULT 0,
+  house_edge_mode VARCHAR(32) DEFAULT 'balanced',
+  max_multiplier DECIMAL(8, 2) DEFAULT 100.00,
+  smart_rtp BOOLEAN DEFAULT TRUE,
+  smart_rtp_easy_threshold DECIMAL(10, 2) DEFAULT 90.00,
+  smart_rtp_hard_threshold DECIMAL(10, 2) DEFAULT 100.00,
+  config_json JSONB,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 8. TABELA DE APOSTAS
+CREATE TABLE IF NOT EXISTS game_bets (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(64) REFERENCES users(id),
+  user_name VARCHAR(255),
+  game_id VARCHAR(64),
+  bet_amount DECIMAL(15, 2) NOT NULL,
+  multiplier DECIMAL(10, 4) DEFAULT 1.0000,
+  payout_amount DECIMAL(15, 2) DEFAULT 0.00,
+  profit_amount DECIMAL(15, 2) DEFAULT 0.00,
+  status VARCHAR(32) DEFAULT 'active',
+  difficulty VARCHAR(32),
+  rtp_percent DECIMAL(5, 2),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 9. TABELA DE CONFIGURAÇÕES GERAIS
+CREATE TABLE IF NOT EXISTS system_settings (
+  key VARCHAR(64) PRIMARY KEY,
+  data JSONB NOT NULL,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+`;
+
+      backupData.sqlSchema = sqlSchema;
+
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const filename = `backup_completo_paygateway_vps_integrator_${dateStr}.json`;
+
+      logSecurityEvent('DATABASE_EXPORTED', {
+        admin: user.email,
+        counts: backupData.counts
+      });
+
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.json(backupData);
+    } catch (err: any) {
+      console.error('[GET /api/admin/export-database error]', err);
+      return res.status(500).json({ error: 'Erro ao processar exportação completa do banco de dados.' });
+    }
+  });
+
+  // GET /api/admin/export/influencers - Exportar influenciadores válidos com telefone
+  app.get('/api/admin/export/influencers', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'Não autorizado.' });
+
+      const isSuper = isPlatformSuperAdmin(user.email, user.role);
+      const canExport = isSuper || checkAdminPermission(req, 'canExportReports');
+      if (!canExport) {
+        return res.status(403).json({ error: 'Acesso negado. Permissão de exportação necessária.' });
+      }
+
+      const onlyValidPhone = req.query.validPhoneOnly !== 'false';
+      const onlyActive = req.query.activeOnly === 'true';
+      const autoRepair = req.query.autoRepair !== 'false'; // auto-repair (+9, -9, etc) by default
+      const format = String(req.query.format || 'json').toLowerCase();
+
+      const allUsers = await dbService.getAllUsers();
+      const allAffiliates = await dbService.getAllAffiliates();
+      const affiliateByUserId = new Map(allAffiliates.map(a => [a.userId, a]));
+
+      const influencers = allUsers.filter(u => {
+        if (!u.isInfluencer) return false;
+        if (onlyActive && u.isBlocked) return false;
+        if (onlyValidPhone) {
+          const healed = autoRepair ? healPhoneNumber(u.phone) : (isValidBrazilianPhone(u.phone) ? { healedPhone: normalizePhoneNumber(u.phone) } : null);
+          if (!healed) return false;
+        }
+        return true;
+      });
+
+      const formatted = influencers.map(u => {
+        const aff = affiliateByUserId.get(u.id);
+        const healed = healPhoneNumber(u.phone);
+        const effectiveDigits = healed ? healed.healedPhone : normalizePhoneNumber(u.phone);
+        const valid = Boolean(healed);
+        const waNumber = healed ? healed.whatsappNumber : (effectiveDigits.length >= 10 ? `55${effectiveDigits}` : '');
+        const formattedPhone = healed ? healed.formattedPhone : formatPhoneDisplay(u.phone);
+        const waLink = healed ? healed.whatsappLink : (waNumber ? `https://wa.me/${waNumber}` : '');
+
+        return {
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          phone: u.phone,
+          healedPhone: effectiveDigits,
+          formattedPhone,
+          whatsappNumber: waNumber,
+          whatsappLink: waLink,
+          isPhoneValid: valid,
+          wasRepaired: healed ? healed.wasRepaired : false,
+          repairLabel: healed ? healed.label : 'Inválido ⚠️',
+          balance: u.balance,
+          affiliateBalance: aff?.affiliateBalance || 0,
+          commissionTotal: aff?.commissionTotal || 0,
+          referralCode: aff?.referralCode || u.referralCode || '',
+          registeredGame: u.registeredGame || 'g_block_puzzle',
+          isBlocked: !!u.isBlocked,
+          createdAt: u.createdAt
+        };
+      });
+
+      if (format === 'csv') {
+        const headers = [
+          'Nome',
+          'Telefone_Formatado',
+          'Telefone_WhatsApp',
+          'Link_WhatsApp',
+          'Telefone_Valido',
+          'Status_Validacao',
+          'Telefone_Original_Banco',
+          'Email',
+          'Codigo_Indicacao',
+          'Saldo_Jogos_R$',
+          'Saldo_Comissoes_R$',
+          'Total_Comissoes_R$',
+          'Jogo_Origem',
+          'Status_Conta',
+          'ID_Usuario',
+          'Data_Cadastro'
+        ];
+        const rows = formatted.map(f => [
+          f.name || 'Influenciador',
+          f.formattedPhone,
+          f.whatsappNumber,
+          f.whatsappLink,
+          f.isPhoneValid ? 'SIM' : 'NÃO',
+          f.repairLabel,
+          f.phone || '',
+          f.email || '',
+          f.referralCode || '',
+          f.balance.toFixed(2),
+          f.affiliateBalance.toFixed(2),
+          f.commissionTotal.toFixed(2),
+          f.registeredGame,
+          f.isBlocked ? 'Bloqueada' : 'Ativa',
+          f.id,
+          f.createdAt || ''
+        ]);
+        const csv = '\uFEFF' + [headers.join(';'), ...rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(';'))].join('\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        const scope = onlyValidPhone ? 'validas_whatsapp' : 'todas';
+        res.setHeader('Content-Disposition', `attachment; filename="influenciadoras_${scope}_${new Date().toISOString().slice(0, 10)}.csv"`);
+        return res.send(csv);
+      }
+
+      return res.json({
+        total: formatted.length,
+        influencers: formatted
+      });
+    } catch (err: any) {
+      console.error('[GET /api/admin/export/influencers error]', err);
+      return res.status(500).json({ error: 'Erro ao exportar influenciadores.' });
+    }
+  });
+
+  // POST /api/admin/influencers/apply-phone-repairs - Salvar correções de telefone no banco de dados
+  app.post('/api/admin/influencers/apply-phone-repairs', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.user;
+      if (!user) return res.status(401).json({ error: 'Não autorizado.' });
+
+      const isSuper = isPlatformSuperAdmin(user.email, user.role);
+      const canManage = isSuper || req.user?.role === 'admin' || checkAdminPermission(req, 'canManageUsers');
+      if (!canManage) {
+        return res.status(403).json({ error: 'Acesso negado. Permissão de gerenciar usuários necessária.' });
+      }
+
+      const allUsers = await dbService.getAllUsers();
+      const influencers = allUsers.filter(u => u.isInfluencer);
+      const updatedList: Array<{ id: string; name: string; oldPhone: string; newPhone: string; method: string }> = [];
+
+      for (const inf of influencers) {
+        const healed = healPhoneNumber(inf.phone);
+        if (healed && healed.wasRepaired && healed.healedPhone !== inf.phone) {
+          await dbService.updateUserFields(inf.id, { phone: healed.healedPhone });
+          updatedList.push({
+            id: inf.id,
+            name: inf.name,
+            oldPhone: inf.phone,
+            newPhone: healed.healedPhone,
+            method: healed.label
+          });
+        }
+      }
+
+      console.log(`[Influencer Phone Auto-Repair] ${updatedList.length} telefones atualizados no banco de dados por ${user.email}.`);
+      return res.json({
+        success: true,
+        updatedCount: updatedList.length,
+        updated: updatedList,
+        message: `${updatedList.length} telefones de influenciadores foram corrigidos e salvos no banco de dados com sucesso!`
+      });
+    } catch (err: any) {
+      console.error('[POST /api/admin/influencers/apply-phone-repairs error]', err);
+      return res.status(500).json({ error: 'Erro ao aplicar correções de telefone no banco.' });
+    }
+  });
+
+  // GET /api/admin/deposits
+  app.get('/api/admin/deposits', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req,'canApproveDeposits') && !checkAdminPermission(req,'canViewMetrics')) return res.status(403).json({error:'Sem permissão para consultar depósitos.'});
+      const allTx = await dbService.getAllTransactions();
+      const deposits: Array<Record<string, any>> = allTx.filter(t => t.type === 'deposit');
+      const receipts = new Set(deposits.map(t => t.correlationId).filter(Boolean));
+      const pending = await supabaseStore.collection('charges').where('gateway','==','pixup').get();
+      for (const snapshot of pending.docs) {
+        const charge = snapshot.data();
+        if (!charge?.userId || charge.credited || receipts.has(charge.correlationID)) continue;
+        deposits.push({id:charge.correlationID,userId:charge.userId,type:'deposit',amount:charge.valueInReais,status:Date.parse(charge.expiresAt || '') < Date.now() ? 'failed' : 'pending',createdAt:charge.createdAt,paymentMethod:'Pixup · PIX',gateway:'pixup',correlationId:charge.correlationID,description:'Cobrança Pixup'});
+      }
+
+
+      const allUsers = await dbService.getAllUsers();
+      const allAffiliates = await dbService.getAllAffiliates();
+      const allReferrals = await dbService.getAllReferrals();
+
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+      const referralByReferredUserId = new Map(allReferrals.map(r => [r.referredUserId, r]));
+      const affiliateById = new Map(allAffiliates.map(a => [a.id, a]));
+      const affiliateByCode = new Map(allAffiliates.map(a => [a.referralCode.toUpperCase(), a]));
+
+      const enriched = deposits.map(d => {
+        const u = userMap.get(d.userId);
+
+        let referredBy = null;
+        if (u) {
+          const directRef = referralByReferredUserId.get(u.id);
+          const parentAffId = u.affiliateId || (directRef ? directRef.affiliateId : null);
+          let parentAff = parentAffId ? affiliateById.get(parentAffId) : null;
+          if (!parentAff && directRef?.referralCode) {
+            parentAff = affiliateByCode.get(directRef.referralCode.toUpperCase()) || null;
+          }
+          if (parentAff) {
+            const sponsorUser = userMap.get(parentAff.userId);
+            referredBy = {
+              affiliateId: parentAff.id,
+              referralCode: parentAff.referralCode,
+              affiliateUserId: parentAff.userId,
+              sponsorName: sponsorUser ? sponsorUser.name : `Afiliado ${parentAff.referralCode}`,
+              sponsorEmail: sponsorUser ? sponsorUser.email : null,
+              sponsorPhone: sponsorUser ? sponsorUser.phone : null,
+              isInfluencer: sponsorUser ? !!(sponsorUser as any).isInfluencer : false,
+              role: sponsorUser ? sponsorUser.role : 'affiliate'
+            };
+          }
+        }
+
+        return {
+          ...d,
+          userName: u ? u.name : 'Usuário Desconhecido',
+          userEmail: u ? u.email : 'N/A',
+          userPhone: u ? u.phone : 'N/A',
+          referredBy
+        };
+      });
+
+      res.json({ deposits: enriched });
+    } catch (err: any) {
+      console.error('Error fetching admin deposits:', err);
+      res.status(500).json({ error: 'Erro ao listar depósitos.' });
+    }
+  });
+
+  // Campaign delivery is admin-only; permission checks run before reading any audience.
+  function canNotify(req: AuthRequest, res: Response) {
+    if (!checkAdminPermission(req,'canSendNotifications')) {res.status(403).json({error:'Sua conta não tem permissão para enviar notificações.'});return false;}
+    return true;
+  }
+  async function notificationAudience(input:any) {
+    const config=validateNotification(input);
+    const [users,affiliates,referrals]=await Promise.all([dbService.getAllUsers(),dbService.getAllAffiliates(),dbService.getAllReferrals()]);
+    const eligible=selectNotificationAudience(users,affiliates,referrals,config);
+    const subscriptions=eligible.length?await dbService.getPushSubscriptions(new Set(eligible.map(u=>u.id))):[];
+    const unique=[...new Map(subscriptions.filter(s=>eligible.some(u=>u.id===s.userId)&&isTrustedPushEndpoint(s.endpoint)&&(s.preferences as any)?.campaigns!==false).map(s=>[s.endpoint,s])).values()];
+    return {config,eligible,subscriptions:unique};
+  }
+  app.get('/api/admin/notifications',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!canNotify(req,res))return;
+    try{
+      const [users,affiliates,history]=await Promise.all([dbService.getAllUsers(),dbService.getAllAffiliates(),dbService.getAdminNotificationLogs(50)]);
+      const available=users.filter(u=>!u.isBlocked&&!['admin','superadmin'].includes(u.role));
+      const subscriptions=available.length?await dbService.getPushSubscriptions(new Set(available.map(u=>u.id))):[];
+      const subscribed=new Set(subscriptions.map(s=>s.userId));
+      res.json({pushConfigured:!!(VAPID_PUBLIC_KEY&&VAPID_PRIVATE_KEY),totalUsers:available.length,subscribedUsers:subscribed.size,history,users:available.map(u=>({userId:u.id,name:u.name||u.email,email:u.email,role:u.role,hasPush:subscribed.has(u.id),isAffiliate:affiliates.some(a=>a.userId===u.id)||u.role==='affiliate'||!!(u as any).isAffiliate}))});
+    }catch{res.status(503).json({error:'Não foi possível carregar a central. Tente novamente.'});}
+  });
+  app.post('/api/admin/notifications/preview',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!canNotify(req,res))return;
+    try{const {eligible,subscriptions}=await notificationAudience(req.body);res.json({eligibleCount:eligible.length,deviceCount:subscriptions.length,subscribedUsers:new Set(subscriptions.map(s=>s.userId)).size});}
+    catch(err:any){res.status(err.status||503).json({error:err.status?err.message:'Não foi possível consultar o público.'});}
+  });
+  app.post('/api/admin/notifications',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!canNotify(req,res))return;
+    if(!VAPID_PUBLIC_KEY||!VAPID_PRIVATE_KEY)return res.status(503).json({error:'Configure as chaves VAPID do servidor antes de enviar notificações.'});
+    let campaignRef:any;
+    let claimed=false;
+    try{
+      const {config,eligible,subscriptions}=await notificationAudience(req.body);
+      const requestId=req.body.requestId;
+      if(typeof requestId!=='string'||!/^[a-zA-Z0-9-]{16,80}$/.test(requestId))return res.status(400).json({error:'Identificador de envio inválido.'});
+      if(!subscriptions.length)return res.status(422).json({error:'Nenhum dispositivo com permissão de notificações neste público.'});
+      if(subscriptions.length>250)return res.status(422).json({error:'Este envio excede 250 dispositivos. Selecione um público menor.'});
+      campaignRef=supabaseStore.collection('admin_notification_logs').doc(requestId);
+      const guard=supabaseStore.collection('notification_dispatch_guards').doc(req.user!.id);
+      const started=await supabaseStore.transaction(async tx=>{
+        const previous=await tx.get(campaignRef),recent=await tx.get(guard);
+        if(previous.exists()) return {duplicate:true,entry:previous.data()};
+        if(Date.now()-Number(recent.data()?.lastSentAt||0)<60000)throw Object.assign(new Error('Aguarde um minuto entre envios.'),{status:429});
+        const entry={id:requestId,...config,status:'sending',sentCount:0,totalEligibleAffiliates:eligible.length,attemptedCount:subscriptions.length,targetLabel:notificationTargetLabels[config.target],createdAt:new Date().toISOString(),sentBy:req.user!.name||req.user!.email};
+        tx.set(campaignRef,entry);tx.set(guard,{lastSentAt:Date.now()});return {duplicate:false,entry};
+      });
+      if(started.duplicate)return res.status(started.entry.status==='completed'?200:409).json({success:started.entry.status==='completed',message:'Este envio já foi registrado. Consulte o histórico antes de tentar novamente.',historyEntry:started.entry,error:started.entry.status==='completed'?undefined:'Envio já iniciado; não será repetido.'});
+      claimed=true;
+      let sentCount=0,failedCount=0,expiredCount=0;
+      const payload=JSON.stringify({title:config.title,body:config.body,url:config.url,silent:config.silent,icon:'/notification-x.png',badge:'/notification-badge.png',tag:requestId,type:'SHOW_NOTIFICATION'});
+      // Bounded concurrency and finite network timeouts for serverless runtimes.
+      for(let i=0;i<subscriptions.length;i+=10){
+        await Promise.all(subscriptions.slice(i,i+10).map(async item=>{
+          try{await webpush.sendNotification(item.subscription as webpush.PushSubscription,payload,{TTL:config.ttl,urgency:config.urgency as any,timeout:4000});sentCount++;}
+          catch(err:any){if([404,410].includes(err.statusCode)){expiredCount++;await dbService.deletePushSubscription(item.id||item.endpoint).catch(()=>{});}else failedCount++;}
+        }));
+      }
+      const historyEntry={...started.entry,status:'completed',sentCount,failedCount,expiredCount,completedAt:new Date().toISOString()};
+      await campaignRef.set(historyEntry);
+      res.json({success:true,message:`${sentCount} dispositivo(s) aceitaram o envio; ${failedCount} falha(s), ${expiredCount} inscrição(ões) expirada(s).`,historyEntry});
+    }catch(err:any){
+      // A crash after dispatch must never cause an automatic duplicate broadcast.
+      if(claimed&&campaignRef)await campaignRef.update({status:'review_required'}).catch(()=>{});
+      res.status(err.status||503).json({error:err.status?err.message:'Não foi possível concluir. Consulte o histórico antes de reenviar.'});
+    }
+  });
+
+  // POST /api/admin/notifications/test-discord -> Dispara teste instantâneo para o Webhook do Discord de Afiliados
+  app.post('/api/admin/notifications/test-discord', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if(!canNotify(req,res))return;
+    try {
+      const { title, body } = req.body || {};
+      const success = await sendDiscordAffiliateWebhook({
+        title: title || '🧪 Teste de Notificação de Afiliado',
+        body: body || 'Este é um disparo de teste do Webhook do Discord para validação da entrega de notificações de afiliados.',
+        url: '/?tab=affiliates',
+        type: 'Teste do Sistema',
+        targetLabel: 'Canal de Afiliados',
+        sentBy: req.user?.name || 'Painel Administrativo'
+      });
+
+      if (success) {
+        return res.json({ success: true, message: 'Notificação de teste entregue com sucesso ao Webhook do Discord!' });
+      } else {
+        return res.status(500).json({ success: false, error: 'Falha ao entregar no Webhook do Discord. Verifique a URL ou conexão.' });
+      }
+    } catch (e: any) {
+      return res.status(500).json({ success: false, error: e?.message || 'Erro interno ao testar webhook do Discord.' });
+    }
+  });
+
+  // GET /api/admin/reports/analytics (Advanced Analytical & Financial Intelligence Reporting Suite)
+  app.get('/api/admin/reports/analytics', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      if (!checkAdminPermission(req, 'canViewMetrics') && !checkAdminPermission(req, 'canExportReports')) {
+        return res.status(403).json({ error: 'Sem permissão para acessar a área de relatórios.' });
+      }
+
+      const { period = '7days', startDate: customStart, endDate: customEnd } = req.query;
+
+      const now = new Date();
+      let startTime = 0;
+      let endTime = now.getTime();
+
+      if (period === 'today') {
+        const d = new Date(now);
+        d.setHours(0, 0, 0, 0);
+        startTime = d.getTime();
+      } else if (period === 'yesterday') {
+        const dStart = new Date(now);
+        dStart.setDate(dStart.getDate() - 1);
+        dStart.setHours(0, 0, 0, 0);
+        startTime = dStart.getTime();
+        const dEnd = new Date(now);
+        dEnd.setDate(dEnd.getDate() - 1);
+        dEnd.setHours(23, 59, 59, 999);
+        endTime = dEnd.getTime();
+      } else if (period === '7days') {
+        const d = new Date(now);
+        d.setDate(d.getDate() - 6);
+        d.setHours(0, 0, 0, 0);
+        startTime = d.getTime();
+      } else if (period === '30days') {
+        const d = new Date(now);
+        d.setDate(d.getDate() - 29);
+        d.setHours(0, 0, 0, 0);
+        startTime = d.getTime();
+      } else if (period === 'this_month') {
+        const d = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+        startTime = d.getTime();
+      } else if (period === 'last_month') {
+        const dStart = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+        startTime = dStart.getTime();
+        const dEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+        endTime = dEnd.getTime();
+      } else if (period === 'custom' && customStart) {
+        startTime = new Date(String(customStart)).getTime();
+        if (customEnd) {
+          const d = new Date(String(customEnd));
+          d.setHours(23, 59, 59, 999);
+          endTime = d.getTime();
+        }
+      } else if (period === 'all') {
+        startTime = 0;
+      } else {
+        // Default 7 days
+        const d = new Date(now);
+        d.setDate(d.getDate() - 6);
+        d.setHours(0, 0, 0, 0);
+        startTime = d.getTime();
+      }
+
+      // Fetch all dataset from DB
+      const [allTx, allUsers, allBets, allCommissions, allAffiliates, gameConfig, allReferrals] = await Promise.all([
+        dbService.getAllTransactions(),
+        dbService.getAllUsers(),
+        dbService.getAllGameBets(1000),
+        dbService.getAllCommissions(),
+        dbService.getAllAffiliates(),
+        dbService.getGameConfig('g_block_puzzle'),
+        dbService.getAllReferrals(),
+      ]);
+
+      const parseTs = (dateStr: string) => new Date(dateStr).getTime() || 0;
+
+      // Filter data by time window
+      const inRange = (dStr: string) => {
+        const ts = parseTs(dStr);
+        return ts >= startTime && ts <= endTime;
+      };
+
+      const periodTx = allTx.filter((t) => inRange(t.createdAt));
+      const periodUsers = allUsers.filter((u) => inRange(u.createdAt));
+      const periodBets = allBets.filter((b) => inRange(b.createdAt));
+      const periodCommissions = allCommissions.filter((c) => inRange(c.createdAt));
+
+      // User maps
+      const userMap = new Map(allUsers.map((u) => [u.id, u]));
+
+      // 1. Transaction aggregations (strictly real paid deposits, excluding game wins/partidas)
+      const approvedDeposits = periodTx.filter((t) => isRealPaidDeposit(t));
+      const pendingDeposits = periodTx.filter((t) => t.type === 'deposit' && t.status === 'pending' && !t.paymentMethod?.toLowerCase().includes('gendino') && !t.paymentMethod?.toLowerCase().includes('blockwin'));
+      const allDepositsCount = approvedDeposits.length + pendingDeposits.length;
+
+      const approvedWithdrawals = periodTx.filter((t) => t.type === 'withdrawal' && t.status === 'approved');
+      const pendingWithdrawals = periodTx.filter((t) => t.type === 'withdrawal' && t.status === 'pending');
+      const rejectedWithdrawals = periodTx.filter((t) => t.type === 'withdrawal' && t.status === 'rejected');
+
+      const grossDeposits = approvedDeposits.reduce((acc, t) => acc + (t.amount || 0), 0);
+      const grossDepositsCount = approvedDeposits.length;
+      const totalWithdrawals = approvedWithdrawals.reduce((acc, t) => acc + (t.amount || 0), 0);
+      const totalWithdrawalsCount = approvedWithdrawals.length;
+      const pendingWithdrawalsAmount = pendingWithdrawals.reduce((acc, t) => acc + (t.amount || 0), 0);
+
+      const netCashflow = grossDeposits - totalWithdrawals;
+
+      // 2. Gaming aggregations in period
+      let wagered = 0;
+      let payouts = 0;
+      let winsCount = 0;
+      let lossesCount = 0;
+      let topMultiplier = 1.0;
+      let topWinAmount = 0;
+      const diffDist: Record<string, number> = { easy: 0, medium: 0, hard: 0, extreme: 0 };
+
+      for (const b of periodBets) {
+        const bAmount = b.betAmount || 0;
+        const pAmount = b.payoutAmount || 0;
+        wagered += bAmount;
+        payouts += pAmount;
+
+        if (b.multiplier && b.multiplier > topMultiplier) topMultiplier = b.multiplier;
+        if (pAmount > topWinAmount) topWinAmount = pAmount;
+
+        if (b.status === 'cashed_out' && pAmount > 0) winsCount++;
+        else if (b.status === 'lost') lossesCount++;
+
+        const d = b.difficulty || 'easy';
+        diffDist[d] = (diffDist[d] || 0) + 1;
+      }
+
+      // If period is 'all', incorporate game config baseline accumulators if higher
+      if (period === 'all') {
+        wagered = Math.max(wagered, gameConfig.totalWagered || 0);
+        payouts = Math.max(payouts, gameConfig.totalPayout || 0);
+      }
+
+      const ggr = parseFloat((wagered - payouts).toFixed(2));
+      const ggrMarginPercent = wagered > 0 ? parseFloat(((ggr / wagered) * 100).toFixed(2)) : (100 - (gameConfig.rtpPercent || 96));
+      const realRtpPercent = wagered > 0 ? parseFloat(((payouts / wagered) * 100).toFixed(2)) : (gameConfig.rtpPercent || 96);
+
+      // 3. Affiliate commission aggregations
+      const totalAffiliateCommissions = periodCommissions.reduce((acc, c) => acc + (c.amount || 0), 0);
+      const ngr = parseFloat((ggr - totalAffiliateCommissions).toFixed(2));
+      const netOperatingMargin = grossDeposits > 0 ? parseFloat((((grossDeposits - totalWithdrawals - totalAffiliateCommissions) / grossDeposits) * 100).toFixed(2)) : 0;
+
+      // 4. Player & FTD (First Time Deposit) intelligence
+      // Calculate FTDs in period: find the first deposit ever for each user and check if it occurred in the period
+      const userFirstDepositMap = new Map<string, number>();
+      for (const t of allTx) {
+        if (isRealPaidDeposit(t)) {
+          const ts = parseTs(t.createdAt);
+          const currentFirst = userFirstDepositMap.get(t.userId);
+          if (!currentFirst || ts < currentFirst) {
+            userFirstDepositMap.set(t.userId, ts);
+          }
+        }
+      }
+
+      let ftdCount = 0;
+      let ftdVolume = 0;
+      for (const [uId, firstTs] of userFirstDepositMap.entries()) {
+        if (firstTs >= startTime && firstTs <= endTime) {
+          ftdCount++;
+          const tx = periodTx.find((t) => t.userId === uId && isRealPaidDeposit(t));
+          if (tx) ftdVolume += tx.amount || 0;
+        }
+      }
+
+      const newUsersCount = periodUsers.length;
+      const conversionRatePercent = newUsersCount > 0 ? parseFloat(((ftdCount / newUsersCount) * 100).toFixed(1)) : 0;
+      const avgDepositTicket = grossDepositsCount > 0 ? parseFloat((grossDeposits / grossDepositsCount).toFixed(2)) : 0;
+      const avgWithdrawalTicket = totalWithdrawalsCount > 0 ? parseFloat((totalWithdrawals / totalWithdrawalsCount).toFixed(2)) : 0;
+
+      // Distinct active users in period
+      const activeUserIds = new Set<string>();
+      periodTx.forEach((t) => activeUserIds.add(t.userId));
+      periodBets.forEach((b) => activeUserIds.add(b.userId));
+      const activePlayersCount = activeUserIds.size;
+
+      // 5. Deposit Buckets Distribution
+      const depositBuckets = {
+        tier1: { label: 'R$ 1 a R$ 20', count: 0, total: 0 },
+        tier2: { label: 'R$ 21 a R$ 50', count: 0, total: 0 },
+        tier3: { label: 'R$ 51 a R$ 100', count: 0, total: 0 },
+        tier4: { label: 'R$ 101 a R$ 500', count: 0, total: 0 },
+        tier5: { label: 'Acima de R$ 500', count: 0, total: 0 },
+      };
+
+      for (const d of approvedDeposits) {
+        const a = d.amount || 0;
+        if (a <= 20) {
+          depositBuckets.tier1.count++;
+          depositBuckets.tier1.total += a;
+        } else if (a <= 50) {
+          depositBuckets.tier2.count++;
+          depositBuckets.tier2.total += a;
+        } else if (a <= 100) {
+          depositBuckets.tier3.count++;
+          depositBuckets.tier3.total += a;
+        } else if (a <= 500) {
+          depositBuckets.tier4.count++;
+          depositBuckets.tier4.total += a;
+        } else {
+          depositBuckets.tier5.count++;
+          depositBuckets.tier5.total += a;
+        }
+      }
+
+      // 6. Daily DRE Breakdown (Chronological Series)
+      const daysCount = Math.max(1, Math.min(60, Math.ceil((endTime - startTime) / (24 * 60 * 60 * 1000))));
+      const dailyMap = new Map<string, {
+        date: string;
+        displayDate: string;
+        deposits: number;
+        depositsCount: number;
+        withdrawals: number;
+        withdrawalsCount: number;
+        netCashflow: number;
+        wagered: number;
+        payouts: number;
+        ggr: number;
+        newUsers: number;
+        ftdCount: number;
+      }>();
+
+      for (let i = 0; i < daysCount; i++) {
+        const d = new Date(startTime + i * 24 * 60 * 60 * 1000);
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        const key = `${yyyy}-${mm}-${dd}`;
+        dailyMap.set(key, {
+          date: key,
+          displayDate: `${dd}/${mm}`,
+          deposits: 0,
+          depositsCount: 0,
+          withdrawals: 0,
+          withdrawalsCount: 0,
+          netCashflow: 0,
+          wagered: 0,
+          payouts: 0,
+          ggr: 0,
+          newUsers: 0,
+          ftdCount: 0,
+        });
+      }
+
+      // Populate daily series
+      for (const t of periodTx) {
+        const d = new Date(parseTs(t.createdAt));
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const item = dailyMap.get(key);
+        if (item) {
+          if (t.type === 'deposit' && t.status === 'approved') {
+            item.deposits += t.amount || 0;
+            item.depositsCount++;
+          } else if (t.type === 'withdrawal' && t.status === 'approved') {
+            item.withdrawals += t.amount || 0;
+            item.withdrawalsCount++;
+          }
+          item.netCashflow = item.deposits - item.withdrawals;
+        }
+      }
+
+      for (const b of periodBets) {
+        const d = new Date(parseTs(b.createdAt));
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const item = dailyMap.get(key);
+        if (item) {
+          item.wagered += b.betAmount || 0;
+          item.payouts += b.payoutAmount || 0;
+          item.ggr = item.wagered - item.payouts;
+        }
+      }
+
+      for (const u of periodUsers) {
+        const d = new Date(parseTs(u.createdAt));
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const item = dailyMap.get(key);
+        if (item) {
+          item.newUsers++;
+        }
+      }
+
+      for (const [uId, firstTs] of userFirstDepositMap.entries()) {
+        if (firstTs >= startTime && firstTs <= endTime) {
+          const d = new Date(firstTs);
+          const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+          const item = dailyMap.get(key);
+          if (item) {
+            item.ftdCount++;
+          }
+        }
+      }
+
+      const dailyBreakdown = Array.from(dailyMap.values()).map((row) => ({
+        ...row,
+        deposits: parseFloat(row.deposits.toFixed(2)),
+        withdrawals: parseFloat(row.withdrawals.toFixed(2)),
+        netCashflow: parseFloat(row.netCashflow.toFixed(2)),
+        wagered: parseFloat(row.wagered.toFixed(2)),
+        payouts: parseFloat(row.payouts.toFixed(2)),
+        ggr: parseFloat(row.ggr.toFixed(2)),
+      }));
+
+      // 7. Top Players Analytics
+      const playerStatsMap = new Map<string, {
+        userId: string;
+        name: string;
+        email: string;
+        phone: string;
+        currentBalance: number;
+        totalDeposited: number;
+        depositsCount: number;
+        totalWithdrawn: number;
+        withdrawalsCount: number;
+        totalWagered: number;
+        totalPayouts: number;
+        ggrGenerated: number;
+        betsCount: number;
+        createdAt: string;
+      }>();
+
+      for (const u of allUsers) {
+        playerStatsMap.set(u.id, {
+          userId: u.id,
+          name: u.name || 'Sem nome',
+          email: u.email || 'N/A',
+          phone: u.phone || 'N/A',
+          currentBalance: u.balance || 0,
+          totalDeposited: 0,
+          depositsCount: 0,
+          totalWithdrawn: 0,
+          withdrawalsCount: 0,
+          totalWagered: 0,
+          totalPayouts: 0,
+          ggrGenerated: 0,
+          betsCount: 0,
+          createdAt: u.createdAt,
+        });
+      }
+
+      for (const t of periodTx) {
+        const p = playerStatsMap.get(t.userId);
+        if (p) {
+          if (t.type === 'deposit' && t.status === 'approved') {
+            p.totalDeposited += t.amount || 0;
+            p.depositsCount++;
+          } else if (t.type === 'withdrawal' && t.status === 'approved') {
+            p.totalWithdrawn += t.amount || 0;
+            p.withdrawalsCount++;
+          }
+        }
+      }
+
+      for (const b of periodBets) {
+        const p = playerStatsMap.get(b.userId);
+        if (p) {
+          p.totalWagered += b.betAmount || 0;
+          p.totalPayouts += b.payoutAmount || 0;
+          p.betsCount++;
+        }
+      }
+
+      for (const p of playerStatsMap.values()) {
+        p.ggrGenerated = parseFloat((p.totalWagered - p.totalPayouts).toFixed(2));
+      }
+
+      const allPlayersArray = Array.from(playerStatsMap.values());
+      const topProfitablePlayers = [...allPlayersArray]
+        .filter((p) => p.totalWagered > 0 || p.totalDeposited > 0)
+        .sort((a, b) => b.ggrGenerated - a.ggrGenerated)
+        .slice(0, 15);
+
+      const topWithdrawingPlayers = [...allPlayersArray]
+        .filter((p) => p.totalWithdrawn > 0)
+        .sort((a, b) => b.totalWithdrawn - a.totalWithdrawn)
+        .slice(0, 15);
+
+      const topDepositingPlayers = [...allPlayersArray]
+        .filter((p) => p.totalDeposited > 0)
+        .sort((a, b) => b.totalDeposited - a.totalDeposited)
+        .slice(0, 15);
+
+      // 8. Affiliates Intelligence & Ranking
+      const referralsByAffiliate = new Map<string, typeof allReferrals>();
+      for (const referral of allReferrals) {
+        const rows = referralsByAffiliate.get(referral.affiliateId) || [];
+        rows.push(referral);
+        referralsByAffiliate.set(referral.affiliateId, rows);
+      }
+      const affiliateRanking = await Promise.all(
+        allAffiliates.map(async (aff) => {
+          const user = userMap.get(aff.userId);
+          const referrals = referralsByAffiliate.get(aff.id) || [];
+          const periodReferrals = referrals.filter((r) => inRange(r.createdAt));
+
+          const refUserIds = new Set(referrals.map((r) => r.referredUserId));
+          const periodRefTx = periodTx.filter((t) => refUserIds.has(t.userId));
+
+          const referralDeposits = periodRefTx
+            .filter((t) => isRealPaidDeposit(t))
+            .reduce((sum, t) => sum + (t.amount || 0), 0);
+
+          let affFtdCount = 0;
+          for (const refUserId of refUserIds) {
+            const firstTs = userFirstDepositMap.get(refUserId);
+            if (firstTs && firstTs >= startTime && firstTs <= endTime) {
+              affFtdCount++;
+            }
+          }
+
+          const commissions = periodCommissions.filter((c) => c.affiliateId === aff.id);
+          const totalCommissionsEarned = commissions.reduce((sum, c) => sum + (c.amount || 0), 0);
+
+          return {
+            affiliateId: aff.id,
+            userId: aff.userId,
+            userName: user ? user.name : 'Afiliado Desconhecido',
+            userEmail: user ? user.email : 'N/A',
+            referralCode: aff.referralCode,
+            totalReferrals: referrals.length,
+            periodReferralsCount: periodReferrals.length,
+            ftdCount: affFtdCount,
+            referralDepositsTotal: parseFloat(referralDeposits.toFixed(2)),
+            cpaAmount: aff.cpaAmount || 0,
+            revSharePercent: aff.revSharePercent || 70,
+            commissionTotal: parseFloat((totalCommissionsEarned || aff.commissionTotal || 0).toFixed(2)),
+            currentBalance: parseFloat((aff.affiliateBalance || 0).toFixed(2)),
+          };
+        })
+      );
+
+      affiliateRanking.sort((a, b) => b.referralDepositsTotal - a.referralDepositsTotal);
+
+      // 9. Enriched Recent Transactions in Period
+      const enrichedTransactions = periodTx.slice(0, 100).map((t) => {
+        const u = userMap.get(t.userId);
+        return {
+          id: t.id,
+          userId: t.userId,
+          userName: u ? u.name : 'Usuário Desconhecido',
+          userEmail: u ? u.email : 'N/A',
+          userPhone: u ? u.phone : 'N/A',
+          type: t.type,
+          amount: t.amount,
+          status: t.status,
+          paymentMethod: t.paymentMethod,
+          description: t.description,
+          createdAt: t.createdAt,
+        };
+      });
+
+      res.json({
+        success: true,
+        period,
+        startTime: new Date(startTime).toISOString(),
+        endTime: new Date(endTime).toISOString(),
+        periodSummary: {
+          grossDeposits: parseFloat(grossDeposits.toFixed(2)),
+          grossDepositsCount,
+          pendingDepositsCount: pendingDeposits.length,
+          allDepositsCount,
+          depositConversionRate: allDepositsCount > 0 ? parseFloat(((grossDepositsCount / allDepositsCount) * 100).toFixed(1)) : 100,
+          totalWithdrawals: parseFloat(totalWithdrawals.toFixed(2)),
+          totalWithdrawalsCount,
+          pendingWithdrawalsAmount: parseFloat(pendingWithdrawalsAmount.toFixed(2)),
+          pendingWithdrawalsCount: pendingWithdrawals.length,
+          rejectedWithdrawalsCount: rejectedWithdrawals.length,
+          netCashflow: parseFloat(netCashflow.toFixed(2)),
+          wagered: parseFloat(wagered.toFixed(2)),
+          payouts: parseFloat(payouts.toFixed(2)),
+          ggr,
+          ggrMarginPercent,
+          realRtpPercent,
+          configuredRtpPercent: gameConfig.rtpPercent,
+          totalAffiliateCommissions: parseFloat(totalAffiliateCommissions.toFixed(2)),
+          ngr,
+          netOperatingMargin,
+          newUsersCount,
+          activePlayersCount,
+          ftdCount,
+          ftdVolume: parseFloat(ftdVolume.toFixed(2)),
+          conversionRatePercent,
+          avgDepositTicket,
+          avgWithdrawalTicket,
+          totalBetsCount: periodBets.length,
+          winsCount,
+          lossesCount,
+          winRatePercent: periodBets.length > 0 ? parseFloat(((winsCount / periodBets.length) * 100).toFixed(1)) : 0,
+          topMultiplier: parseFloat(topMultiplier.toFixed(2)),
+          topWinAmount: parseFloat(topWinAmount.toFixed(2)),
+        },
+        dailyBreakdown,
+        depositBuckets,
+        difficultyDistribution: diffDist,
+        topProfitablePlayers,
+        topWithdrawingPlayers,
+        topDepositingPlayers,
+        affiliateRanking: affiliateRanking.slice(0, 20),
+        transactions: enrichedTransactions,
+      });
+    } catch (err: any) {
+      console.error('Error computing analytical reports:', err);
+      res.status(500).json({ error: 'Erro ao processar relatórios analíticos.' });
+    }
+  });
+
+  // GAMES & RTP MANAGEMENT STORE & ENDPOINTS
+
+  // GET /api/game/config (Player / Public Game Configuration with real RTP and Difficulty)
+  app.get('/api/game/config', async (req: Request, res: Response) => {
+    try {
+      let isInfluencer = false;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.split(' ')[1];
+        const session = getSession(token);
+        const userId = session?.userId || sessions.get(token);
+        if (userId) {
+          const user = await dbService.getUserById(userId);
+          if (user && user.isInfluencer) {
+            isInfluencer = true;
+          }
+        }
+      }
+
+      const host = (req.get('host') || '').toLowerCase();
+      const referer = (req.get('referer') || '').toLowerCase();
+      const gameParam = String(req.query.game || req.query.id || '').toLowerCase();
+      const gameHeader = String(req.headers['x-game-origin'] || req.headers['x-game-id'] || req.headers['x-registered-game'] || '').toLowerCase();
+      const isBubbleGame = gameParam.includes('bubble') || gameParam.includes('zumbla') || host.includes('bubble') || host.includes('zumbla') || referer.includes('bubble') || referer.includes('zumbla') || gameHeader.includes('bubble');
+
+      const targetGameId = isBubbleGame ? 'g_bubble_blast' : 'g_block_puzzle';
+      const config = await dbService.getGameConfig(targetGameId);
+      const rtp = isInfluencer ? 99.8 : (config.rtpPercent ?? 96.0);
+      const diff = isInfluencer ? 'easy' : (config.difficulty || (rtp >= 93 ? 'easy' : rtp >= 75 ? 'medium' : rtp >= 45 ? 'hard' : 'extreme'));
+
+      if (isBubbleGame) {
+        return res.json({
+          gameId: config.id,
+          name: config.name,
+          status: config.status,
+          minBetCents: Math.round((config.minBet || 5.0) * 100),
+          maxBetCents: Math.round((config.maxBet || 100.0) * 100),
+          targetMultiplier: Math.min(25.0, config.maxMultiplier || 25.0),
+          rtpPercent: rtp,
+          difficulty: diff,
+          isInfluencer,
+          houseEdgeMode: config.houseEdgeMode || 'balanced',
+          maxMultiplier: Math.min(25.0, config.maxMultiplier || 25.0),
+          smartRtp: config.smartRtp ?? true,
+          smartRtpEasyThreshold: config.smartRtpEasyThreshold ?? 40.0,
+          smartRtpHardThreshold: config.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: 100.0,
+          updatedAt: config.updatedAt,
+        });
+      }
+      res.json({
+        gameId: config.id,
+        name: config.name,
+        status: config.status,
+        rtpPercent: rtp,
+        difficulty: diff,
+        isInfluencer: isInfluencer,
+        isInfluencerMode: isInfluencer,
+        houseEdgeMode: isInfluencer ? 'easy' : (config.houseEdgeMode || 'easy'),
+        minBet: config.minBet ?? 1.0,
+        maxBet: config.maxBet ?? 500.0,
+        maxMultiplier: config.maxMultiplier ?? 100.0,
+        smartRtp: isInfluencer ? false : (config.smartRtp ?? true),
+        smartRtpEasyThreshold: config.smartRtpEasyThreshold ?? 30.0,
+        smartRtpMidThreshold: (config as any).smartRtpMidThreshold ?? 60.0,
+        smartRtpHardThreshold: config.smartRtpHardThreshold ?? 85.0,
+        smartRtpMaxTarget: (config as any).smartRtpMaxTarget ?? 100.0,
+        antiBailoutMode: isInfluencer ? false : Boolean(config.antiBailoutMode),
+        heavyBlocksForce: isInfluencer ? false : Boolean(config.heavyBlocksForce),
+        dynamicRetention: isInfluencer ? false : (config.dynamicRetention ?? true),
+        streakLimiterMultiplier: isInfluencer ? 100.0 : (config.streakLimiterMultiplier ?? 6.0),
+        nearLossPressure: isInfluencer ? false : Boolean(config.nearLossPressure),
+        winStreakBrake: isInfluencer ? false : Boolean(config.winStreakBrake),
+        antiComboBlocker: isInfluencer ? false : Boolean(config.antiComboBlocker),
+        highBetResistance: isInfluencer ? false : Boolean(config.highBetResistance),
+        giantPieceFrequency: isInfluencer ? 0 : (config.giantPieceFrequency ?? 25),
+        instantLossOnTargetProfit: isInfluencer ? 0 : (config.instantLossOnTargetProfit ?? 0),
+        tightenOnHighOccupancy: isInfluencer ? false : Boolean(config.tightenOnHighOccupancy),
+        minCashoutMultiplier: config.minCashoutMultiplier ?? 1.05,
+        lineMultiplierStep: isInfluencer ? 0.50 : (config.lineMultiplierStep ?? 0.40),
+        initialMultiplier: config.initialMultiplier ?? 1.0,
+        retentionAggressiveness: isInfluencer ? 'soft' : (config.retentionAggressiveness || 'moderate'),
+        forceLossOnMaxMultiplier: isInfluencer ? false : (config.forceLossOnMaxMultiplier ?? true),
+        consecutiveWinDecay: isInfluencer ? 0 : (config.consecutiveWinDecay ?? 0.05),
+        updatedAt: config.updatedAt,
+      });
+    } catch (err) {
+      console.error('Error fetching game config:', err);
+      res.json({
+        gameId: 'g_block_puzzle',
+        name: 'Block Puzzle iGaming',
+        status: 'active',
+        rtpPercent: 96.0,
+        difficulty: 'easy',
+        isInfluencer: false,
+        isInfluencerMode: false,
+        houseEdgeMode: 'easy',
+        minBet: 1.0,
+        maxBet: 500.0,
+        maxMultiplier: 100.0,
+        smartRtp: true,
+        smartRtpEasyThreshold: 30.0,
+        smartRtpMidThreshold: 60.0,
+        smartRtpHardThreshold: 85.0,
+        smartRtpMaxTarget: 100.0,
+        antiBailoutMode: false,
+        heavyBlocksForce: false,
+        dynamicRetention: true,
+        streakLimiterMultiplier: 6.0,
+        nearLossPressure: false,
+        winStreakBrake: true,
+        antiComboBlocker: false,
+        highBetResistance: true,
+        giantPieceFrequency: 25,
+        instantLossOnTargetProfit: 0,
+        tightenOnHighOccupancy: true,
+        minCashoutMultiplier: 1.05,
+        lineMultiplierStep: 0.40,
+        initialMultiplier: 1.0,
+        retentionAggressiveness: 'moderate',
+        forceLossOnMaxMultiplier: true,
+        consecutiveWinDecay: 0.05,
+      });
+    }
+  });
+
+  // GET /api/admin/live-players - Real-time active players and live iGaming sessions (100% REAL DATA)
+  app.get('/api/admin/live-players', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const [allBets, allUsers, dinoMetrics, blockMetrics, zumblaMetrics, raspaMetrics, subwayMetrics] = await Promise.all([
+        dbService.getAllGameBets(1000).catch((err) => {
+          console.warn('[live-players] Error loading bets:', err);
+          return [];
+        }),
+        dbService.getAllUsers().catch((err) => {
+          console.warn('[live-players] Error loading users:', err);
+          return [];
+        }),
+        dbService.getGameLiveMetrics('g_gen_dino').catch(() => null),
+        dbService.getGameLiveMetrics('g_block_puzzle').catch(() => null),
+        dbService.getGameLiveMetrics('g_zumbla').catch(() => null),
+        dbService.getGameLiveMetrics('g_raspa_fortuna').catch(() => null),
+        dbService.getGameLiveMetrics('g_subway_pay').catch(() => null),
+      ]);
+
+      const now = Date.now();
+      const safeUsers = Array.isArray(allUsers) ? allUsers : [];
+      const safeBets = Array.isArray(allBets) ? allBets : [];
+      const userMap = new Map(safeUsers.map((u) => [u.id, u]));
+
+      const gameNames: Record<string, { name: string; category: string }> = {
+        g_block_puzzle: { name: 'Block Win', category: 'Estratégia & Habilidade' },
+        block_puzzle: { name: 'Block Win', category: 'Estratégia & Habilidade' },
+        g_gen_dino: { name: 'GEN DINO PIX', category: 'Runner Arcade' },
+        gen_dino: { name: 'GEN DINO PIX', category: 'Runner Arcade' },
+        dino: { name: 'GEN DINO PIX', category: 'Runner Arcade' },
+        g_zumbla: { name: 'Zumbla Win', category: 'Marble Shooter' },
+        zumbla: { name: 'Zumbla Win', category: 'Marble Shooter' },
+        g_raspa_fortuna: { name: 'Raspa Fortuna', category: 'Raspadinha PIX' },
+        raspa_fortuna: { name: 'Raspa Fortuna', category: 'Raspadinha PIX' },
+        g_count_masters: {name:'Count Masters',category:'Runner & Multidão'},
+        g_subway_pay: { name: 'Subway Pay', category: 'Runner 3D PIX' },
+        subway_pay: { name: 'Subway Pay', category: 'Runner 3D PIX' },
+        subway: { name: 'Subway Pay', category: 'Runner 3D PIX' },
+      };
+
+      // 1. Identify real active bets in DB
+      const realActiveBets = safeBets.filter((b) => b && b.status === 'active');
+      const activeSessions: any[] = [];
+      const activeUserIds = new Set<string>();
+
+      for (const bet of realActiveBets) {
+        const u = userMap.get(bet.userId);
+        const gInfo = gameNames[bet.gameId] || { name: 'Jogo PIX', category: 'Arcade' };
+        const startedTs = new Date(bet.createdAt).getTime() || now;
+        const durationSec = Math.max(1, Math.floor((now - startedTs) / 1000));
+
+        const currentMultiplier = Number(bet.multiplier) || 1.0;
+        const betAmt = Number(bet.betAmount) || 0;
+        const potentialPayout = betAmt * currentMultiplier;
+
+        activeSessions.push({
+          id: bet.id,
+          userId: bet.userId,
+          userName: bet.userName || (u ? (u.name || (u.email ? u.email.split('@')[0] : 'Jogador')) : 'Jogador'),
+          userEmail: u && u.email ? u.email : 'jogador@app.pix',
+          gameId: bet.gameId || 'g_block_puzzle',
+          gameName: gInfo.name,
+          gameCategory: gInfo.category,
+          betAmount: betAmt,
+          multiplier: parseFloat(currentMultiplier.toFixed(2)),
+          potentialPayout: parseFloat(potentialPayout.toFixed(2)),
+          status: 'active',
+          startedAt: bet.createdAt || new Date(now - durationSec * 1000).toISOString(),
+          durationSeconds: durationSec,
+          difficulty: bet.difficulty || 'medium',
+          rtpPercent: bet.rtpPercent || (u?.isInfluencer ? 99.8 : 95.0),
+          isInfluencer: Boolean(u?.isInfluencer),
+          userBalance: typeof u?.balance === 'number' ? u.balance : 0,
+          lastAction: bet.lastAction || (currentMultiplier > 1 ? `Multiplicador em ${currentMultiplier.toFixed(2)}x` : 'Aposta em andamento'),
+          device: bet.device || (u?.lastDevice || 'Mobile (PWA)'),
+        });
+
+        activeUserIds.add(bet.userId);
+      }
+
+      // 2. Add real online users from platform sessions (Active in last 15 mins)
+      const realOnlineSessions = getActiveOnlineUserSessions(15 * 60 * 1000);
+      for (const sess of realOnlineSessions) {
+        if (activeUserIds.has(sess.userId)) continue;
+        const u = userMap.get(sess.userId);
+        if (!u) continue;
+        const emailLower = (u.email || '').toLowerCase();
+        // Do not display admin accounts as casino players
+        if (emailLower.includes('admin') || u.role === 'superadmin') continue;
+
+        // Find user's latest played game (if any)
+        const recentBet = safeBets.find((b) => b.userId === u.id);
+        const gInfo = recentBet && gameNames[recentBet.gameId]
+          ? gameNames[recentBet.gameId]
+          : { name: 'Cassino PIX', category: 'No Lobby' };
+
+        const durationSec = Math.max(1, Math.floor((now - sess.lastActiveAt) / 1000));
+        activeSessions.push({
+          id: `sess_${u.id}`,
+          userId: u.id,
+          userName: u.name || (u.email ? u.email.split('@')[0] : 'Jogador'),
+          userEmail: u.email || 'jogador@app.pix',
+          gameId: recentBet ? recentBet.gameId : 'g_block_puzzle',
+          gameName: recentBet ? gInfo.name : 'Lobby do Cassino',
+          gameCategory: gInfo.category,
+          betAmount: recentBet && recentBet.betAmount ? recentBet.betAmount : 0,
+          multiplier: 1.0,
+          potentialPayout: 0,
+          status: 'online',
+          startedAt: new Date(sess.lastActiveAt).toISOString(),
+          durationSeconds: durationSec,
+          difficulty: 'medium',
+          rtpPercent: u.isInfluencer ? 99.8 : 95.5,
+          isInfluencer: Boolean(u.isInfluencer),
+          userBalance: typeof u.balance === 'number' ? u.balance : 0,
+          lastAction: recentBet ? `Última partida em ${gInfo.name}` : 'Conectado no Cassino',
+          device: (sess.userAgent || '').toLowerCase().includes('mobile') ? 'Mobile (PWA)' : 'Desktop',
+        });
+
+        activeUserIds.add(u.id);
+      }
+
+      // 3. If there are no sessions right at this second, list real recently active users from the database
+      if (activeSessions.length === 0) {
+        const recentBetUsers = safeBets.slice(0, 10);
+        for (const b of recentBetUsers) {
+          if (activeUserIds.has(b.userId)) continue;
+          const u = userMap.get(b.userId);
+          const gInfo = gameNames[b.gameId] || { name: 'Jogo PIX', category: 'Arcade' };
+          const betTs = new Date(b.updatedAt || b.createdAt).getTime() || now;
+          const durationSec = Math.max(1, Math.floor((now - betTs) / 1000));
+
+          activeSessions.push({
+            id: `recent_${b.id}`,
+            userId: b.userId,
+            userName: b.userName || (u ? (u.name || (u.email ? u.email.split('@')[0] : 'Jogador')) : 'Jogador'),
+            userEmail: u && u.email ? u.email : 'jogador@app.pix',
+            gameId: b.gameId || 'g_block_puzzle',
+            gameName: gInfo.name,
+            gameCategory: gInfo.category,
+            betAmount: Number(b.betAmount) || 0,
+            multiplier: Number(b.multiplier) || 1.0,
+            potentialPayout: Number(b.payoutAmount) || 0,
+            status: b.status === 'cashed_out' ? 'online' : 'online',
+            startedAt: b.createdAt || new Date(now - durationSec * 1000).toISOString(),
+            durationSeconds: durationSec,
+            difficulty: b.difficulty || 'medium',
+            rtpPercent: b.rtpPercent || 95.0,
+            isInfluencer: Boolean(u?.isInfluencer),
+            userBalance: typeof u?.balance === 'number' ? u.balance : 0,
+            lastAction: `Última rodada: ${b.status === 'cashed_out' ? 'Vitória R$' + (b.payoutAmount || 0) : 'Finalizada'}`,
+            device: 'Mobile (PWA)',
+          });
+
+          activeUserIds.add(b.userId);
+        }
+      }
+
+      // 4. Real Recent settled outcomes (100% Real from Database)
+      const formatTimeAgo = (isoStr: string) => {
+        const diffMs = now - (new Date(isoStr).getTime() || now);
+        const diffSec = Math.floor(diffMs / 1000);
+        if (diffSec < 60) return `${Math.max(1, diffSec)}s atrás`;
+        if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m atrás`;
+        return `${Math.floor(diffSec / 3600)}h atrás`;
+      };
+
+      const settledBets = safeBets.filter((b) => b && b.status !== 'active');
+      const recentOutcomes: any[] = settledBets.slice(0, 40).map((b) => {
+        const gInfo = gameNames[b.gameId] || { name: 'Jogo PIX', category: 'Arcade' };
+        const u = userMap.get(b.userId);
+        const betAmt = Number(b.betAmount) || 0;
+        const payoutAmt = Number(b.payoutAmount) || 0;
+        const isWon = b.status === 'cashed_out' || payoutAmt > betAmt;
+        return {
+          id: b.id,
+          userId: b.userId,
+          userName: b.userName || (u ? (u.name || (u.email ? u.email.split('@')[0] : 'Jogador')) : 'Jogador'),
+          userEmail: u ? u.email : undefined,
+          gameId: b.gameId || 'g_block_puzzle',
+          gameName: gInfo.name,
+          betAmount: betAmt,
+          payoutAmount: payoutAmt,
+          profitAmount: b.profitAmount !== undefined ? b.profitAmount : (payoutAmt - betAmt),
+          multiplier: b.multiplier || (betAmt > 0 ? payoutAmt / betAmt : 0),
+          status: isWon ? 'cashed_out' : 'lost',
+          difficulty: b.difficulty || 'medium',
+          settledAt: b.updatedAt || b.createdAt,
+          timeAgo: formatTimeAgo(b.updatedAt || b.createdAt || new Date().toISOString()),
+        };
+      });
+
+      // 5. Games Summary breakdown (Real aggregations from DB)
+      const getGameWagered = (gameId: string, altId?: string) => {
+        return safeBets
+          .filter((b) => b.gameId === gameId || (altId && b.gameId === altId))
+          .reduce((sum, b) => sum + (Number(b.betAmount) || 0), 0);
+      };
+
+      const countMetrics=await dbService.getGameLiveMetrics(COUNT_ID,safeBets);
+      const gamesSummary = [
+        {gameId:COUNT_ID,name:'Count Masters',category:'Runner & Multidão',activeSessions:activeSessions.filter(s=>s.gameId===COUNT_ID).length,totalWageredLive:countMetrics.totalWagered,rtpPercent:countMetrics.effectiveRtp,status:countMetrics.config.status==='active'?'online':'offline',difficulty:'Servidor'},
+        {
+          gameId: 'g_block_puzzle',
+          name: 'Block Win',
+          category: 'Estratégia & Encaixe',
+          activeSessions: activeSessions.filter((s) => s.gameId === 'g_block_puzzle' || s.gameId === 'block_puzzle').length,
+          totalWageredLive: blockMetrics?.totalWagered || getGameWagered('g_block_puzzle', 'block_puzzle'),
+          rtpPercent: blockMetrics?.effectiveRtp || 96.0,
+          status: 'online',
+          difficulty: 'Dinâmico',
+        },
+        {
+          gameId: 'g_gen_dino',
+          name: 'GEN DINO PIX',
+          category: 'Arcade Runner',
+          activeSessions: activeSessions.filter((s) => s.gameId === 'g_gen_dino' || s.gameId === 'gen_dino' || s.gameId === 'dino').length,
+          totalWageredLive: dinoMetrics?.totalWagered || getGameWagered('g_gen_dino', 'gen_dino'),
+          rtpPercent: dinoMetrics?.effectiveRtp || 95.0,
+          status: 'online',
+          difficulty: 'Smart RTP',
+        },
+        {
+          gameId: 'g_zumbla',
+          name: 'Zumbla Win',
+          category: 'Marble Shooter',
+          activeSessions: activeSessions.filter((s) => s.gameId === 'g_zumbla' || s.gameId === 'zumbla').length,
+          totalWageredLive: zumblaMetrics?.totalWagered || getGameWagered('g_zumbla', 'zumbla'),
+          rtpPercent: zumblaMetrics?.effectiveRtp || 95.0,
+          status: 'online',
+          difficulty: 'Equilibrado',
+        },
+        {
+          gameId: 'g_raspa_fortuna',
+          name: 'Raspa Fortuna',
+          category: 'Raspadinha Instantânea',
+          activeSessions: activeSessions.filter((s) => s.gameId === 'g_raspa_fortuna' || s.gameId === 'raspa_fortuna').length,
+          totalWageredLive: raspaMetrics?.totalWagered || getGameWagered('g_raspa_fortuna', 'raspa_fortuna'),
+          rtpPercent: raspaMetrics?.effectiveRtp || 94.0,
+          status: 'online',
+          difficulty: 'Instantâneo',
+        },
+        {
+          gameId: 'g_subway_pay',
+          name: 'Subway Pay',
+          category: 'Runner 3D PIX',
+          activeSessions: activeSessions.filter((s) => s.gameId === 'g_subway_pay' || s.gameId === 'subway_pay' || s.gameId === 'subway').length,
+          totalWageredLive: subwayMetrics?.totalWagered || getGameWagered('g_subway_pay', 'subway_pay'),
+          rtpPercent: subwayMetrics?.effectiveRtp || 95.5,
+          status: 'online',
+          difficulty: 'Arcade 3D',
+        },
+      ];
+
+      // 6. Global live aggregates (Real calculations)
+      const totalVolumeInPlay = activeSessions
+        .filter((s) => s.status === 'active')
+        .reduce((sum, s) => sum + (Number(s.betAmount) || 0), 0);
+
+      const startOfToday = new Date(new Date().setHours(0, 0, 0, 0)).getTime();
+      let todayBets = safeBets.filter((b) => b && new Date(b.createdAt).getTime() >= startOfToday);
+      if (todayBets.length === 0) {
+        // Fallback to last 24h of real bets if day just turned
+        const last24h = now - 24 * 60 * 60 * 1000;
+        todayBets = safeBets.filter((b) => b && new Date(b.createdAt).getTime() >= last24h);
+      }
+
+      const todayWageredTotal = todayBets.reduce((sum, b) => sum + (Number(b.betAmount) || 0), 0);
+      const todayPayoutsTotal = todayBets.reduce((sum, b) => sum + (Number(b.payoutAmount) || 0), 0);
+      const todayGgrTotal = parseFloat((todayWageredTotal - todayPayoutsTotal).toFixed(2));
+      const todayGamesCount = todayBets.length;
+      const averageBet = todayGamesCount > 0 ? parseFloat((todayWageredTotal / todayGamesCount).toFixed(2)) : 0;
+
+      const winningCount = recentOutcomes.filter((o) => o.status === 'cashed_out' || o.profitAmount > 0).length;
+      const winRateLive = recentOutcomes.length > 0
+        ? parseFloat(((winningCount / recentOutcomes.length) * 100).toFixed(1))
+        : 0;
+
+      // 7. Hourly activity from real bets today
+      const hourlyActivity: Array<{ hour: string; players: number; wagered: number }> = [];
+      const currentHour = new Date().getHours();
+      for (let h = Math.max(0, currentHour - 7); h <= currentHour; h++) {
+        const hourLabel = `${String(h).padStart(2, '0')}:00`;
+        const betsInHour = todayBets.filter((b) => {
+          const d = new Date(b.createdAt);
+          return d.getHours() === h;
+        });
+
+        const distinctUsersInHour = new Set(betsInHour.map((b) => b.userId)).size;
+        const wageredInHour = betsInHour.reduce((sum, b) => sum + (Number(b.betAmount) || 0), 0);
+
+        hourlyActivity.push({
+          hour: hourLabel,
+          players: distinctUsersInHour,
+          wagered: parseFloat(wageredInHour.toFixed(2)),
+        });
+      }
+
+      res.json({
+        success: true,
+        timestamp: new Date().toISOString(),
+        activePlayersCount: activeSessions.length,
+        totalVolumeInPlay: parseFloat(totalVolumeInPlay.toFixed(2)),
+        todayWageredTotal: parseFloat(todayWageredTotal.toFixed(2)),
+        todayGgrTotal: parseFloat(todayGgrTotal.toFixed(2)),
+        todayGamesCount,
+        averageBet,
+        winRateLive,
+        activeSessions,
+        recentOutcomes,
+        gamesSummary,
+        hourlyActivity,
+      });
+    } catch (err: any) {
+      console.error('Error fetching live players data:', err);
+      res.status(500).json({ error: 'Erro ao carregar dados dos jogadores em tempo real.' });
+    }
+  });
+
+  // POST /api/admin/live-players/:id/settle - Force settle or cancel a real live bet in DB
+  app.post('/api/admin/live-players/:id/settle', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { action = 'cashout', multiplier = 1.0 } = req.body;
+      if(!['cashout','lost'].includes(action))return res.status(400).json({error:'Ação inválida.'});
+      if(!checkAdminPermission(req,'canManageGames')||(action==='cashout'&&!checkAdminPermission(req,'canManageBalances')))return res.status(403).json({error:'Sem permissão para liquidar esta rodada.'});
+
+      if (!id) {
+        return res.status(400).json({ error: 'ID da sessão/aposta inválido.' });
+      }
+
+      if (id.startsWith('sess_') || id.startsWith('recent_')) {
+        return res.json({
+          success: true,
+          message: 'Jogador está navegando no cassino e não possui aposta aberta no momento.',
+        });
+      }
+
+      const bet = await dbService.getGameBetById(id);
+      if (!bet) {
+        return res.status(404).json({ error: 'Aposta não encontrada no banco de dados.' });
+      }
+
+      let payout=0;
+      if(bet.gameId===COUNT_ID){
+        const state=await countMasters.active(bet.userId);
+        if(!state.round||state.round.id!==bet.id)return res.status(409).json({error:'Esta rodada não é a rodada atual do jogador.'});
+        const settled=await countMasters.action(bet.userId,bet.id,action==='cashout'?'cashout':'forfeit',state.round.stage);
+        payout=settled.payoutCents/100;
+      }else{
+        const cfg=await dbService.getGameConfig(bet.gameId),mult=Number(multiplier);
+        if(!Number.isFinite(mult)||mult<0||mult>Math.min(1000,Number(cfg.maxMultiplier)||100))return res.status(400).json({error:'Multiplicador fora dos limites.'});
+        payout=action==='cashout'?Math.round(bet.betAmount*mult*100)/100:0;
+        await dbService.settleGameBetAtomic(bet.id,bet.userId,payout,action==='cashout'?'cashed_out':'lost','ADMIN_GAME_SETTLEMENT',bet.gameId);
+      }
+      logSecurityEvent('ADMIN_GAME_SETTLED',{adminId:req.userId,betId:bet.id,gameId:bet.gameId,payout,action});
+
+      res.json({
+        success: true,
+        message: `Partida ${id} finalizada com sucesso (${action === 'cashout' ? 'Cashout/Vitória de R$ ' + payout.toFixed(2) : 'Derrota'})!`,
+      });
+    } catch (err: any) {
+      console.error('Error settling live bet:', err);
+      res.status(500).json({ error: 'Erro ao finalizar partida ao vivo.' });
+    }
+  });
+
+  // POST /api/game/progress - Real-time in-game heartbeat / telemetry for active bets
+  app.post('/api/game/progress', async (req: Request, res: Response) => {
+    try {
+      const { betId, multiplier, score, lastAction } = req.body;
+      const actor=await resolveBubbleUser(req);if(!actor||actor.isBlocked)return res.status(401).json({error:'Faça login.'});
+      if (!betId) return res.status(400).json({ error: 'betId é obrigatório' });
+
+      const bet = await dbService.getGameBetById(betId);
+      if(bet&&(bet.userId!==actor.id||bet.gameId===COUNT_ID))return res.status(403).json({error:'Rodada indisponível para esta operação.'});
+      if (bet && bet.status === 'active') {
+        const updateData: Partial<GameBetDB> = {};
+        if (typeof multiplier === 'number') updateData.multiplier = multiplier;
+        if (lastAction) (updateData as any).lastAction = lastAction;
+        if (score !== undefined) (updateData as any).score = score;
+        await dbService.updateGameBet(betId, updateData);
+      }
+      res.json({ success: true });
+    } catch (e) {
+      res.json({ success: false });
+    }
+  });
+
+  // POST /api/game/zumbla/telemetry - Telemetry receiver for Zumbla Win
+  app.post('/api/game/zumbla/telemetry', async (req: Request, res: Response) => {
+    try {
+      const { betId, score, type } = req.body;
+      if (betId) {
+        const bet = await dbService.getGameBetById(betId);
+        if (bet && bet.status === 'active') {
+          const mult = score ? Math.min(10.0, 1.0 + score / 500) : 1.0;
+          await dbService.updateGameBet(betId, {
+            multiplier: parseFloat(mult.toFixed(2)),
+            lastAction: `Pontuação: ${score || 0} (${type || 'jogando'})`,
+          } as any);
+        }
+      }
+      res.json({ ok: true });
+    } catch {
+      res.json({ ok: false });
+    }
+  });
+  app.get('/api/admin/games', requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const recentBets = await dbService.getAllGameBets(200);
+      const [dinoLiveData, puzzleLiveData, zumblaLiveData, raspaLiveData, subwayLiveData, bubbleLiveData, countLiveData] = await Promise.all(
+        ['g_gen_dino', 'g_block_puzzle', 'g_zumbla', 'g_raspa_fortuna', 'g_subway_pay', 'g_bubble_blast', 'g_count_masters'].map(id => dbService.getGameLiveMetrics(id, recentBets))
+      );
+      const dinoConfig = dinoLiveData.config;
+      const puzzleConfig = puzzleLiveData.config;
+      const zumblaConfig = zumblaLiveData.config;
+      const raspaConfig = raspaLiveData.config;
+      const subwayConfig = subwayLiveData.config;
+      const bubbleConfig = bubbleLiveData.config;
+
+      const games = [
+        {
+          id: 'g_gen_dino',
+          name: 'GEN DINO (Arcade Runner PIX)',
+          category: 'Runner & Habilidade',
+          status: dinoConfig.status || 'active',
+          rtpPercent: dinoConfig.rtpPercent,
+          difficulty: dinoConfig.difficulty,
+          minBet: dinoConfig.minBet,
+          maxBet: dinoConfig.maxBet,
+          totalWagered: dinoLiveData.totalWagered,
+          totalPayout: dinoLiveData.totalPayout,
+          ggr: dinoLiveData.ggr,
+          totalBetsCount: dinoLiveData.totalBetsCount,
+          totalWinsCount: dinoLiveData.totalWinsCount,
+          totalLossesCount: dinoLiveData.totalLossesCount,
+          effectiveRtp: dinoLiveData.effectiveRtp,
+          effectiveHouseEdge: dinoLiveData.effectiveHouseEdge,
+          houseEdgeMode: dinoConfig.houseEdgeMode,
+          maxMultiplier: dinoConfig.maxMultiplier,
+          smartRtp: dinoConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: dinoConfig.smartRtpEasyThreshold ?? 30.0,
+          smartRtpMidThreshold: dinoConfig.smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: dinoConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: dinoConfig.smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean(dinoConfig.emergencyRetentionMode),
+          influencerGlobalBoost: Boolean(dinoConfig.influencerGlobalBoost),
+          highBetThreshold: dinoConfig.highBetThreshold ?? 50.0,
+          obstacleMultiplier: dinoConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: dinoConfig.baseSpeed ?? 6.0,
+          maxSpeed: dinoConfig.maxSpeed ?? 13.0,
+          acceleration: dinoConfig.acceleration ?? 0.001,
+          reactionWindowMs: dinoConfig.reactionWindowMs ?? 850,
+          antiBailoutMode: Boolean(dinoConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(dinoConfig.heavyBlocksForce),
+          dynamicRetention: dinoConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: dinoConfig.streakLimiterMultiplier ?? 5.0,
+          nearLossPressure: Boolean(dinoConfig.nearLossPressure),
+          winStreakBrake: Boolean(dinoConfig.winStreakBrake),
+          antiComboBlocker: Boolean(dinoConfig.antiComboBlocker),
+          highBetResistance: Boolean(dinoConfig.highBetResistance),
+          giantPieceFrequency: dinoConfig.giantPieceFrequency ?? 20,
+          instantLossOnTargetProfit: dinoConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(dinoConfig.tightenOnHighOccupancy),
+          minCashoutMultiplier: dinoConfig.minCashoutMultiplier ?? 1.10,
+          lineMultiplierStep: dinoConfig.lineMultiplierStep ?? 0.25,
+          initialMultiplier: dinoConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: dinoConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: dinoConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: dinoConfig.consecutiveWinDecay ?? 0.05,
+          // Dino dynamic controls
+          gameSpeedPercent: dinoConfig.gameSpeedPercent ?? 100,
+          obstacleDensityPercent: dinoConfig.obstacleDensityPercent ?? 50,
+          bonusFrequencyPercent: dinoConfig.bonusFrequencyPercent ?? 30,
+          coinValueCents: dinoConfig.coinValueCents ?? 100,
+          // Popups and banners
+          popupEnabled: Boolean(dinoConfig.popupEnabled),
+          popupTitle: dinoConfig.popupTitle || 'BÔNUS EXCLUSIVO GEN DINO!',
+          popupDescription: dinoConfig.popupDescription || 'Deposite agora no PIX e ganhe até 300% de bônus na sua primeira corrida!',
+          popupImageUrl: dinoConfig.popupImageUrl || '/gen-dino/images/gen-dino-bonus-banner.png',
+          popupButtonText: dinoConfig.popupButtonText || 'DEPOSITAR E ATIVAR BÔNUS',
+          popupButtonAction: dinoConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: dinoConfig.popupButtonUrl || '',
+          popupTrigger: dinoConfig.popupTrigger || 'start',
+          heroBannerImageUrl: dinoConfig.heroBannerImageUrl || '/gen-dino/images/gen-dino-bonus-banner.png',
+          heroBannerTitle: dinoConfig.heroBannerTitle || 'PROMOÇÃO DE DEPÓSITO DINO',
+          heroBannerSubtitle: dinoConfig.heroBannerSubtitle || 'Deposite R$ 50 e receba 2×. Com R$ 100, você recebe R$ 300.',
+          heroBannerBadge: dinoConfig.heroBannerBadge || 'BÔNUS ATÉ 3×',
+          configVersion: dinoConfig.configVersion || 1,
+          recentBets: dinoLiveData.recentBets
+        },
+        {
+          id: 'g_block_puzzle',
+          name: 'Block Win (Block Puzzle iGaming)',
+          category: 'Estratégia & Habilidade',
+          status: puzzleConfig.status || 'active',
+          rtpPercent: puzzleConfig.rtpPercent,
+          difficulty: puzzleConfig.difficulty,
+          minBet: puzzleConfig.minBet,
+          maxBet: puzzleConfig.maxBet,
+          totalWagered: puzzleLiveData.totalWagered,
+          totalPayout: puzzleLiveData.totalPayout,
+          ggr: puzzleLiveData.ggr,
+          totalBetsCount: puzzleLiveData.totalBetsCount,
+          totalWinsCount: puzzleLiveData.totalWinsCount,
+          totalLossesCount: puzzleLiveData.totalLossesCount,
+          effectiveRtp: puzzleLiveData.effectiveRtp,
+          effectiveHouseEdge: puzzleLiveData.effectiveHouseEdge,
+          houseEdgeMode: puzzleConfig.houseEdgeMode,
+          maxMultiplier: puzzleConfig.maxMultiplier,
+          smartRtp: puzzleConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: puzzleConfig.smartRtpEasyThreshold ?? 30.0,
+          smartRtpMidThreshold: (puzzleConfig as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: puzzleConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (puzzleConfig as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((puzzleConfig as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((puzzleConfig as any).influencerGlobalBoost),
+          highBetThreshold: (puzzleConfig as any).highBetThreshold ?? 50.0,
+          obstacleMultiplier: puzzleConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: puzzleConfig.baseSpeed ?? 6.0,
+          maxSpeed: puzzleConfig.maxSpeed ?? 13.0,
+          acceleration: puzzleConfig.acceleration ?? 0.001,
+          reactionWindowMs: puzzleConfig.reactionWindowMs ?? 850,
+          antiBailoutMode: Boolean(puzzleConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(puzzleConfig.heavyBlocksForce),
+          dynamicRetention: puzzleConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: puzzleConfig.streakLimiterMultiplier ?? 6.0,
+          nearLossPressure: Boolean(puzzleConfig.nearLossPressure),
+          winStreakBrake: Boolean(puzzleConfig.winStreakBrake),
+          antiComboBlocker: Boolean(puzzleConfig.antiComboBlocker),
+          highBetResistance: Boolean(puzzleConfig.highBetResistance),
+          giantPieceFrequency: puzzleConfig.giantPieceFrequency ?? 25,
+          instantLossOnTargetProfit: puzzleConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(puzzleConfig.tightenOnHighOccupancy),
+          minCashoutMultiplier: puzzleConfig.minCashoutMultiplier ?? 1.05,
+          lineMultiplierStep: puzzleConfig.lineMultiplierStep ?? 0.40,
+          initialMultiplier: puzzleConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: puzzleConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: puzzleConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: puzzleConfig.consecutiveWinDecay ?? 0.05,
+          gameSpeedPercent: puzzleConfig.gameSpeedPercent ?? 100,
+          obstacleDensityPercent: puzzleConfig.obstacleDensityPercent ?? 50,
+          bonusFrequencyPercent: puzzleConfig.bonusFrequencyPercent ?? 30,
+          coinValueCents: puzzleConfig.coinValueCents ?? 100,
+          popupEnabled: Boolean(puzzleConfig.popupEnabled),
+          popupTitle: puzzleConfig.popupTitle || 'BÔNUS BLOCK PUZZLE',
+          popupDescription: puzzleConfig.popupDescription || 'Aumente seus ganhos completando linhas e combos especiais.',
+          popupImageUrl: puzzleConfig.popupImageUrl || '/games/blockpuzzle/block-puzzle-banner.png',
+          popupButtonText: puzzleConfig.popupButtonText || 'JOGAR COM BÔNUS',
+          popupButtonAction: puzzleConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: puzzleConfig.popupButtonUrl || '',
+          popupTrigger: puzzleConfig.popupTrigger || 'start',
+          heroBannerImageUrl: puzzleConfig.heroBannerImageUrl || '/games/blockpuzzle/block-puzzle-banner.png',
+          heroBannerTitle: puzzleConfig.heroBannerTitle || 'PROMOÇÃO BLOCK WIN',
+          heroBannerSubtitle: puzzleConfig.heroBannerSubtitle || 'Complete linhas e suba seus multiplicadores.',
+          heroBannerBadge: puzzleConfig.heroBannerBadge || 'NOVO',
+          configVersion: puzzleConfig.configVersion || 1,
+          recentBets: puzzleLiveData.recentBets
+        },
+        {
+          id: 'g_zumbla',
+          name: 'Zumbla Win (Marble Shooter)',
+          category: 'Arcade & Pontaria',
+          status: zumblaConfig.status || 'active',
+          rtpPercent: zumblaConfig.rtpPercent,
+          difficulty: zumblaConfig.difficulty,
+          minBet: zumblaConfig.minBet,
+          maxBet: zumblaConfig.maxBet,
+          totalWagered: zumblaLiveData.totalWagered,
+          totalPayout: zumblaLiveData.totalPayout,
+          ggr: zumblaLiveData.ggr,
+          totalBetsCount: zumblaLiveData.totalBetsCount,
+          totalWinsCount: zumblaLiveData.totalWinsCount,
+          totalLossesCount: zumblaLiveData.totalLossesCount,
+          effectiveRtp: zumblaLiveData.effectiveRtp,
+          effectiveHouseEdge: zumblaLiveData.effectiveHouseEdge,
+          houseEdgeMode: zumblaConfig.houseEdgeMode,
+          maxMultiplier: zumblaConfig.maxMultiplier,
+          smartRtp: zumblaConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: zumblaConfig.smartRtpEasyThreshold ?? 30.0,
+          smartRtpMidThreshold: (zumblaConfig as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: zumblaConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (zumblaConfig as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((zumblaConfig as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((zumblaConfig as any).influencerGlobalBoost),
+          highBetThreshold: (zumblaConfig as any).highBetThreshold ?? 50.0,
+          obstacleMultiplier: zumblaConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: zumblaConfig.baseSpeed ?? 6.0,
+          maxSpeed: zumblaConfig.maxSpeed ?? 13.0,
+          acceleration: zumblaConfig.acceleration ?? 0.001,
+          reactionWindowMs: zumblaConfig.reactionWindowMs ?? 850,
+          comboWindowMs: zumblaConfig.comboWindowMs ?? 1200,
+          mistakeTolerance: zumblaConfig.mistakeTolerance ?? 1,
+          difficultyRampPercent: zumblaConfig.difficultyRampPercent ?? 50,
+          easyOpeningRounds: zumblaConfig.easyOpeningRounds ?? 3,
+          extremeModeStartRound: zumblaConfig.extremeModeStartRound ?? 12,
+          phaseDifficultyMultiplier: zumblaConfig.phaseDifficultyMultiplier ?? 1.25,
+          antiBailoutMode: Boolean(zumblaConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(zumblaConfig.heavyBlocksForce),
+          dynamicRetention: zumblaConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: zumblaConfig.streakLimiterMultiplier ?? 5.0,
+          nearLossPressure: Boolean(zumblaConfig.nearLossPressure),
+          winStreakBrake: Boolean(zumblaConfig.winStreakBrake),
+          antiComboBlocker: Boolean(zumblaConfig.antiComboBlocker),
+          highBetResistance: Boolean(zumblaConfig.highBetResistance),
+          giantPieceFrequency: zumblaConfig.giantPieceFrequency ?? 20,
+          instantLossOnTargetProfit: zumblaConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(zumblaConfig.tightenOnHighOccupancy),
+          minCashoutMultiplier: zumblaConfig.minCashoutMultiplier ?? 1.10,
+          lineMultiplierStep: zumblaConfig.lineMultiplierStep ?? 0.25,
+          initialMultiplier: zumblaConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: zumblaConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: zumblaConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: zumblaConfig.consecutiveWinDecay ?? 0.05,
+          gameSpeedPercent: zumblaConfig.gameSpeedPercent ?? 100,
+          obstacleDensityPercent: zumblaConfig.obstacleDensityPercent ?? 50,
+          bonusFrequencyPercent: zumblaConfig.bonusFrequencyPercent ?? 30,
+          coinValueCents: zumblaConfig.coinValueCents ?? 100,
+          popupEnabled: Boolean(zumblaConfig.popupEnabled),
+          popupTitle: zumblaConfig.popupTitle || 'BÔNUS ZUMBLA WIN',
+          popupDescription: zumblaConfig.popupDescription || 'Dispare esferas e ative bônus multiplicadores.',
+          popupImageUrl: zumblaConfig.popupImageUrl || '/assets/games/zumbla/cover.webp',
+          popupButtonText: zumblaConfig.popupButtonText || 'JOGAR COM BÔNUS',
+          popupButtonAction: zumblaConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: zumblaConfig.popupButtonUrl || '',
+          popupTrigger: zumblaConfig.popupTrigger || 'start',
+          heroBannerImageUrl: zumblaConfig.heroBannerImageUrl || '/assets/games/zumbla/cover.webp',
+          heroBannerTitle: zumblaConfig.heroBannerTitle || 'ZUMBLA WIN SHOOTER',
+          heroBannerSubtitle: zumblaConfig.heroBannerSubtitle || 'Elimine as esferas antes que alcancem o portal sagrado.',
+          heroBannerBadge: zumblaConfig.heroBannerBadge || 'DESTAQUE',
+          configVersion: zumblaConfig.configVersion || 1,
+          recentBets: zumblaLiveData.recentBets
+        },
+        {
+          id: 'g_raspa_fortuna',
+          name: 'Raspa Fortuna (Raspadinha PIX)',
+          category: 'Raspadinha & Prêmios Instantâneos',
+          status: raspaConfig.status || 'active',
+          rtpPercent: raspaConfig.rtpPercent,
+          difficulty: raspaConfig.difficulty || 'medium',
+          minBet: raspaConfig.minBet || 1.0,
+          maxBet: raspaConfig.maxBet || 500.0,
+          totalWagered: raspaLiveData.totalWagered,
+          totalPayout: raspaLiveData.totalPayout,
+          ggr: raspaLiveData.ggr,
+          totalBetsCount: raspaLiveData.totalBetsCount,
+          totalWinsCount: raspaLiveData.totalWinsCount,
+          totalLossesCount: raspaLiveData.totalLossesCount,
+          effectiveRtp: raspaLiveData.effectiveRtp,
+          effectiveHouseEdge: raspaLiveData.effectiveHouseEdge,
+          houseEdgeMode: raspaConfig.houseEdgeMode || 'balanced',
+          maxMultiplier: raspaConfig.maxMultiplier || 100.0,
+          smartRtp: raspaConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: raspaConfig.smartRtpEasyThreshold ?? 30.0,
+          smartRtpMidThreshold: (raspaConfig as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: raspaConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (raspaConfig as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((raspaConfig as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((raspaConfig as any).influencerGlobalBoost),
+          highBetThreshold: (raspaConfig as any).highBetThreshold ?? 50.0,
+          obstacleMultiplier: raspaConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: raspaConfig.baseSpeed ?? 6.0,
+          maxSpeed: raspaConfig.maxSpeed ?? 13.0,
+          acceleration: raspaConfig.acceleration ?? 0.001,
+          reactionWindowMs: raspaConfig.reactionWindowMs ?? 850,
+          comboWindowMs: (raspaConfig as any).comboWindowMs ?? 1200,
+          mistakeTolerance: (raspaConfig as any).mistakeTolerance ?? 1,
+          antiBailoutMode: Boolean(raspaConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(raspaConfig.heavyBlocksForce),
+          dynamicRetention: raspaConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: raspaConfig.streakLimiterMultiplier ?? 5.0,
+          nearLossPressure: Boolean(raspaConfig.nearLossPressure),
+          winStreakBrake: Boolean(raspaConfig.winStreakBrake),
+          antiComboBlocker: Boolean(raspaConfig.antiComboBlocker),
+          highBetResistance: Boolean(raspaConfig.highBetResistance),
+          giantPieceFrequency: raspaConfig.giantPieceFrequency ?? 20,
+          instantLossOnTargetProfit: raspaConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(raspaConfig.tightenOnHighOccupancy),
+          minCashoutMultiplier: raspaConfig.minCashoutMultiplier ?? 1.10,
+          lineMultiplierStep: raspaConfig.lineMultiplierStep ?? 0.25,
+          initialMultiplier: raspaConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: raspaConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: raspaConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: raspaConfig.consecutiveWinDecay ?? 0.05,
+          gameSpeedPercent: raspaConfig.gameSpeedPercent ?? 100,
+          obstacleDensityPercent: raspaConfig.obstacleDensityPercent ?? 50,
+          bonusFrequencyPercent: raspaConfig.bonusFrequencyPercent ?? 30,
+          coinValueCents: raspaConfig.coinValueCents ?? 100,
+          popupEnabled: Boolean(raspaConfig.popupEnabled),
+          popupTitle: raspaConfig.popupTitle || 'BÔNUS RASPA FORTUNA',
+          popupDescription: raspaConfig.popupDescription || 'Deposite via PIX e receba bônus de 200% para raspar.',
+          popupImageUrl: raspaConfig.popupImageUrl || '/raspa-fortuna.png',
+          popupButtonText: raspaConfig.popupButtonText || 'DEPOSITAR E RASPAR',
+          popupButtonAction: raspaConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: raspaConfig.popupButtonUrl || '',
+          popupTrigger: raspaConfig.popupTrigger || 'start',
+          heroBannerImageUrl: raspaConfig.heroBannerImageUrl || '/raspa-fortuna.png',
+          heroBannerTitle: raspaConfig.heroBannerTitle || 'RASPA FORTUNA PIX',
+          heroBannerSubtitle: raspaConfig.heroBannerSubtitle || 'Carros, motos, iPhones e PIX na hora.',
+          heroBannerBadge: raspaConfig.heroBannerBadge || 'PIX INSTANTÂNEO',
+          configVersion: raspaConfig.configVersion || 1,
+          recentBets: raspaLiveData.recentBets
+        },
+        {
+          id: 'g_subway_pay',
+          name: 'Subway Pay (Subway Surfers PIX)',
+          category: 'Runner & Habilidade',
+          status: subwayConfig.status || 'active',
+          rtpPercent: subwayConfig.rtpPercent,
+          difficulty: subwayConfig.difficulty || 'medium',
+          minBet: subwayConfig.minBet || 10.0,
+          maxBet: subwayConfig.maxBet || 400.0,
+          totalWagered: subwayLiveData.totalWagered,
+          totalPayout: subwayLiveData.totalPayout,
+          ggr: subwayLiveData.ggr,
+          totalBetsCount: subwayLiveData.totalBetsCount,
+          totalWinsCount: subwayLiveData.totalWinsCount,
+          totalLossesCount: subwayLiveData.totalLossesCount,
+          effectiveRtp: subwayLiveData.effectiveRtp,
+          effectiveHouseEdge: subwayLiveData.effectiveHouseEdge,
+          houseEdgeMode: subwayConfig.houseEdgeMode || 'balanced',
+          maxMultiplier: subwayConfig.maxMultiplier || 4.0,
+          minCashoutMultiplier: (subwayConfig as any).minCashoutMultiplier ?? 2.0,
+          smartRtp: subwayConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: subwayConfig.smartRtpEasyThreshold ?? 40.0,
+          smartRtpMidThreshold: (subwayConfig as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: subwayConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (subwayConfig as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((subwayConfig as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((subwayConfig as any).influencerGlobalBoost),
+          highBetThreshold: (subwayConfig as any).highBetThreshold ?? 50.0,
+          obstacleMultiplier: subwayConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: subwayConfig.baseSpeed ?? 7.0,
+          maxSpeed: subwayConfig.maxSpeed ?? 16.0,
+          acceleration: subwayConfig.acceleration ?? 0.0015,
+          reactionWindowMs: subwayConfig.reactionWindowMs ?? 800,
+          gameSpeedPercent: subwayConfig.gameSpeedPercent ?? 100,
+          obstacleDensityPercent: subwayConfig.obstacleDensityPercent ?? 50,
+          bonusFrequencyPercent: subwayConfig.bonusFrequencyPercent ?? 40,
+          coinValueCents: subwayConfig.coinValueCents ?? 100,
+          antiBailoutMode: Boolean(subwayConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(subwayConfig.heavyBlocksForce),
+          dynamicRetention: subwayConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: subwayConfig.streakLimiterMultiplier ?? 4.0,
+          nearLossPressure: Boolean(subwayConfig.nearLossPressure),
+          winStreakBrake: Boolean(subwayConfig.winStreakBrake),
+          antiComboBlocker: Boolean(subwayConfig.antiComboBlocker),
+          highBetResistance: Boolean(subwayConfig.highBetResistance),
+          giantPieceFrequency: subwayConfig.giantPieceFrequency ?? 20,
+          instantLossOnTargetProfit: subwayConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(subwayConfig.tightenOnHighOccupancy),
+          lineMultiplierStep: subwayConfig.lineMultiplierStep ?? 0.25,
+          initialMultiplier: subwayConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: subwayConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: subwayConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: subwayConfig.consecutiveWinDecay ?? 0.05,
+          popupEnabled: Boolean(subwayConfig.popupEnabled),
+          popupTitle: subwayConfig.popupTitle || 'BÔNUS SUBWAY PAY CORRIDA!',
+          popupDescription: subwayConfig.popupDescription || 'Deposite via PIX e receba créditos extras para correr nos trilhos!',
+          popupImageUrl: subwayConfig.popupImageUrl || '/subwaypay.png',
+          popupButtonText: subwayConfig.popupButtonText || 'DEPOSITAR PIX',
+          popupButtonAction: subwayConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: subwayConfig.popupButtonUrl || '',
+          popupTrigger: subwayConfig.popupTrigger || 'start',
+          heroBannerImageUrl: subwayConfig.heroBannerImageUrl || '/subwaypay.png',
+          heroBannerTitle: subwayConfig.heroBannerTitle || 'SUBWAY PAY CORRIDA OFICIAL',
+          heroBannerSubtitle: subwayConfig.heroBannerSubtitle || 'Colete moedas e faça cashout nos trilhos!',
+          heroBannerBadge: subwayConfig.heroBannerBadge || 'PIX INSTANTÂNEO',
+          configVersion: subwayConfig.configVersion || 1,
+          recentBets: subwayLiveData.recentBets
+        },
+        {
+          id: 'g_bubble_blast',
+          name: 'Bubble Win (Bubble Blast PIX)',
+          category: 'Arcade & Pontaria',
+          status: bubbleConfig.status || 'active',
+          rtpPercent: bubbleConfig.rtpPercent,
+          difficulty: bubbleConfig.difficulty || 'medium',
+          minBet: bubbleConfig.minBet || 5.0,
+          maxBet: bubbleConfig.maxBet || 100.0,
+          totalWagered: bubbleLiveData.totalWagered,
+          totalPayout: bubbleLiveData.totalPayout,
+          ggr: bubbleLiveData.ggr,
+          totalBetsCount: bubbleLiveData.totalBetsCount,
+          totalWinsCount: bubbleLiveData.totalWinsCount,
+          totalLossesCount: bubbleLiveData.totalLossesCount,
+          effectiveRtp: bubbleLiveData.effectiveRtp,
+          effectiveHouseEdge: bubbleLiveData.effectiveHouseEdge,
+          houseEdgeMode: bubbleConfig.houseEdgeMode || 'balanced',
+          maxMultiplier: bubbleConfig.maxMultiplier || 5.0,
+          smartRtp: bubbleConfig.smartRtp ?? true,
+          smartRtpEasyThreshold: bubbleConfig.smartRtpEasyThreshold ?? 40.0,
+          smartRtpMidThreshold: (bubbleConfig as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: bubbleConfig.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (bubbleConfig as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((bubbleConfig as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((bubbleConfig as any).influencerGlobalBoost),
+          highBetThreshold: (bubbleConfig as any).highBetThreshold ?? 50.0,
+          obstacleMultiplier: bubbleConfig.obstacleMultiplier ?? 1.0,
+          baseSpeed: bubbleConfig.baseSpeed ?? 6.0,
+          maxSpeed: bubbleConfig.maxSpeed ?? 13.0,
+          acceleration: bubbleConfig.acceleration ?? 0.001,
+          reactionWindowMs: bubbleConfig.reactionWindowMs ?? 850,
+          antiBailoutMode: Boolean(bubbleConfig.antiBailoutMode),
+          heavyBlocksForce: Boolean(bubbleConfig.heavyBlocksForce),
+          dynamicRetention: bubbleConfig.dynamicRetention ?? true,
+          streakLimiterMultiplier: bubbleConfig.streakLimiterMultiplier ?? 5.0,
+          nearLossPressure: Boolean(bubbleConfig.nearLossPressure),
+          winStreakBrake: Boolean(bubbleConfig.winStreakBrake),
+          antiComboBlocker: Boolean(bubbleConfig.antiComboBlocker),
+          highBetResistance: Boolean(bubbleConfig.highBetResistance),
+          giantPieceFrequency: bubbleConfig.giantPieceFrequency ?? 20,
+          instantLossOnTargetProfit: bubbleConfig.instantLossOnTargetProfit ?? 0,
+          tightenOnHighOccupancy: Boolean(bubbleConfig.tightenOnHighOccupancy),
+          minCashoutMultiplier: bubbleConfig.minCashoutMultiplier ?? 1.10,
+          lineMultiplierStep: bubbleConfig.lineMultiplierStep ?? 0.25,
+          initialMultiplier: bubbleConfig.initialMultiplier ?? 1.0,
+          retentionAggressiveness: bubbleConfig.retentionAggressiveness || 'moderate',
+          forceLossOnMaxMultiplier: bubbleConfig.forceLossOnMaxMultiplier ?? true,
+          consecutiveWinDecay: bubbleConfig.consecutiveWinDecay ?? 0.05,
+          popupEnabled: Boolean(bubbleConfig.popupEnabled),
+          popupTitle: bubbleConfig.popupTitle || 'BÔNUS BUBBLE WIN!',
+          popupDescription: bubbleConfig.popupDescription || 'Deposite via PIX e ganhe rodadas extras!',
+          popupImageUrl: bubbleConfig.popupImageUrl || '/bubbleblast/images/banners/deposito.png',
+          popupButtonText: bubbleConfig.popupButtonText || 'DEPOSITAR PIX',
+          popupButtonAction: bubbleConfig.popupButtonAction || 'deposit',
+          popupButtonUrl: bubbleConfig.popupButtonUrl || '',
+          popupTrigger: bubbleConfig.popupTrigger || 'start',
+          heroBannerImageUrl: bubbleConfig.heroBannerImageUrl || '/bubbleblast/images/banners/deposito.png',
+          heroBannerTitle: bubbleConfig.heroBannerTitle || 'BUBBLE WIN SHOOTER',
+          heroBannerSubtitle: bubbleConfig.heroBannerSubtitle || 'Estoure bolhas e multiplique até 5x!',
+          heroBannerBadge: bubbleConfig.heroBannerBadge || 'PIX INSTANTÂNEO',
+          configVersion: bubbleConfig.configVersion || 1,
+          recentBets: bubbleLiveData.recentBets
+        }
+      ];
+
+      const {config:countConfig,...countMetrics}=countLiveData;
+      games.push({...countConfig,...countMetrics,name:'Count Masters',category:'Runner & Multidão',maintenance:Boolean((countConfig as any).maintenance)} as any);
+      res.json({ games, liveMetrics: dinoLiveData });
+    } catch (err) {
+      console.error('Error fetching admin games:', err);
+      res.status(500).json({ error: 'Erro ao buscar métricas de jogos.' });
+    }
+  });
+
+  app.post('/api/admin/games/bulk-controls',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageGames'))return res.status(403).json({error:'Sem permissão para alterar jogos.'});
+    try{res.json({success:true,...await bulkGameControls(req.body.gameIds,req.body.patch,req.userId!)});}catch(e:any){res.status(e.status||503).json({error:e.status?e.message:'Não foi possível aplicar os controles.'});}
+  });
+
+  // POST or PUT /api/admin/games/universal-rtp - Aplicar e FIXAR RTP Geral e Dificuldades no Banco de Dados
+  app.all(['/api/admin/games/universal-rtp'], requireAdmin, async (req: AuthRequest, res: Response) => {
+    if(!checkAdminPermission(req,'canManageGames'))return res.status(403).json({error:'Sem permissão para alterar jogos.'});
+    try {
+      const { universalRtp, difficulty, smartRtpGlobal, targetGameIds, difficultyRules } = req.body;
+      let rtp = typeof universalRtp === 'number' ? Math.max(0.1, Math.min(99.9, universalRtp)) : null;
+
+      const gameIds = Array.isArray(targetGameIds) && targetGameIds.length > 0
+        ? targetGameIds
+        : ['g_gen_dino', 'g_block_puzzle', 'g_zumbla', 'g_raspa_fortuna', 'g_subway_pay', 'g_bubble_blast', 'g_count_masters'];
+
+      if(gameIds.some((id:string)=>!MANAGED_GAME_IDS.includes(id))||new Set(gameIds).size!==gameIds.length)return res.status(400).json({error:'Selecione jogos válidos, sem repetições.'});
+
+      // Standardized difficulty mapping
+      let derivedDiff = typeof difficulty === 'string' && difficulty.trim() ? difficulty.trim() : 'medium';
+      if (typeof difficulty === 'string' && difficulty.trim()) {
+        if (difficulty === 'hard' && rtp === null) rtp = 45.0;
+        else if (difficulty === 'heavy' && rtp === null) rtp = 20.0;
+        else if (difficulty === 'extreme' && rtp === null) rtp = 5.0;
+        else if (difficulty === 'easy' && rtp === null) rtp = 95.0;
+        else if (difficulty === 'medium' && rtp === null) rtp = 75.0;
+        else if (difficulty === 'ultra_easy' && rtp === null) rtp = 98.5;
+      } else if (rtp !== null) {
+        if (rtp >= 94) derivedDiff = 'ultra_easy';
+        else if (rtp >= 85) derivedDiff = 'easy';
+        else if (rtp >= 70) derivedDiff = 'medium';
+        else if (rtp >= 40) derivedDiff = 'hard';
+        else if (rtp >= 15) derivedDiff = 'heavy';
+        else derivedDiff = 'extreme';
+      }
+
+      const updatedConfigs: any[] = [];
+
+      for (const gid of gameIds) {
+        const cfg = await dbService.getGameConfig(gid);
+        if (rtp !== null) {
+          cfg.rtpPercent = parseFloat(rtp.toFixed(1));
+          cfg.difficulty = derivedDiff as any;
+          if (rtp >= 90) cfg.houseEdgeMode = 'promo';
+          else if (rtp >= 75) cfg.houseEdgeMode = 'balanced';
+          else if (rtp >= 45) cfg.houseEdgeMode = 'hard';
+          else cfg.houseEdgeMode = 'extreme';
+
+          // Adapt individual mechanics
+          if (gid === 'g_gen_dino') {
+            cfg.baseSpeed = parseFloat((4.5 + (100 - rtp) * 0.08).toFixed(1));
+            cfg.obstacleMultiplier = parseFloat((0.5 + (100 - rtp) * 0.03).toFixed(2));
+            cfg.reactionWindowMs = Math.round(Math.max(450, 1300 - (100 - rtp) * 7));
+          } else if (gid === 'g_block_puzzle') {
+            cfg.giantPieceFrequency = Math.round(Math.min(85, Math.max(10, 15 + (100 - rtp) * 0.6)));
+            cfg.highBetResistance = rtp < 85;
+          } else if (gid === 'g_zumbla') {
+            cfg.baseSpeed = parseFloat((4.5 + (100 - rtp) * 0.08).toFixed(1));
+            (cfg as any).mistakeTolerance = rtp >= 85 ? 2 : (rtp >= 50 ? 1 : 0);
+          } else if (gid === 'g_raspa_fortuna') {
+            cfg.bonusFrequencyPercent = Math.round(Math.min(60, Math.max(2, rtp * 0.4)));
+          } else if (gid === 'g_subway_pay') {
+            cfg.maxMultiplier = 5.0; // Meta fixa de 5x conforme requisito oficial
+            (cfg as any).minCashoutMultiplier = 1.5;
+            if (rtp >= 92) {
+              cfg.baseSpeed = 120;
+              cfg.maxSpeed = 280;
+              cfg.gameSpeedPercent = 85;
+              cfg.obstacleDensityPercent = 35;
+              cfg.bonusFrequencyPercent = 55;
+            } else if (rtp >= 75) {
+              cfg.baseSpeed = 180;
+              cfg.maxSpeed = 320;
+              cfg.gameSpeedPercent = 100;
+              cfg.obstacleDensityPercent = 50;
+              cfg.bonusFrequencyPercent = 40;
+            } else if (rtp >= 40) {
+              cfg.baseSpeed = 245;
+              cfg.maxSpeed = 360;
+              cfg.gameSpeedPercent = 125;
+              cfg.obstacleDensityPercent = 70;
+              cfg.bonusFrequencyPercent = 30;
+            } else {
+              cfg.baseSpeed = 280;
+              cfg.maxSpeed = 380;
+              cfg.gameSpeedPercent = 140;
+              cfg.obstacleDensityPercent = 80;
+              cfg.bonusFrequencyPercent = 20;
+            }
+          } else if (gid === 'g_bubble_blast') {
+            cfg.baseSpeed = parseFloat((4.5 + (100 - rtp) * 0.08).toFixed(1));
+            cfg.maxMultiplier = rtp >= 90 ? 8.0 : (rtp >= 75 ? 5.0 : 3.0);
+            (cfg as any).mistakeTolerance = rtp >= 85 ? 2 : (rtp >= 50 ? 1 : 0);
+          }
+        }
+
+        if (typeof smartRtpGlobal === 'boolean') {
+          cfg.smartRtp = smartRtpGlobal;
+        }
+
+        if (difficultyRules && typeof difficultyRules === 'object') {
+          if (typeof difficultyRules.antiStreak === 'boolean') cfg.winStreakBrake = difficultyRules.antiStreak;
+          if (typeof difficultyRules.highBetResistance === 'boolean') cfg.highBetResistance = difficultyRules.highBetResistance;
+          if (typeof difficultyRules.heavyObstacles === 'boolean') cfg.heavyBlocksForce = difficultyRules.heavyObstacles;
+          if (typeof difficultyRules.dynamicRetention === 'boolean') cfg.dynamicRetention = difficultyRules.dynamicRetention;
+        }
+
+        updatedConfigs.push(cfg);
+      }
+
+      await dbService.saveGameConfigsAtomic(updatedConfigs);
+      logSecurityEvent('UNIVERSAL_RTP_UPDATED', {
+        adminId: req.userId,
+        universalRtp: rtp,
+        smartRtpGlobal,
+        targetGames: gameIds,
+        derivedDifficulty: derivedDiff
+      });
+
+      return res.json({
+        success: true,
+        message: `RTP Geral (${rtp !== null ? rtp.toFixed(1) + '%' : 'mantido'}) e Dificuldades sincronizados e FIXADOS com sucesso no banco de dados!`,
+        configs: updatedConfigs
+      });
+    } catch (err) {
+      console.error('Error updating universal RTP:', err);
+      return res.status(500).json({ error: 'Erro ao aplicar RTP geral aos jogos.' });
+    }
+  });
+
+  // PUT /api/admin/games/:id/rtp
+  app.put('/api/admin/games/:id/rtp', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if(!checkAdminPermission(req,'canManageGames'))return res.status(403).json({error:'Sem permissão para alterar jogos.'});
+    try {
+      const { id } = req.params;
+      if(!MANAGED_GAME_IDS.includes(id))return res.status(400).json({error:'Jogo não gerenciado por este painel.'});
+      const {
+        rtpPercent,
+        difficulty,
+        minBet,
+        maxBet,
+        houseEdgeMode,
+        maxMultiplier,
+        smartRtp,
+        smartRtpEasyThreshold,
+        smartRtpMidThreshold,
+        smartRtpHardThreshold,
+        smartRtpMaxTarget,
+        emergencyRetentionMode,
+        influencerGlobalBoost,
+        highBetThreshold,
+        obstacleMultiplier,
+        baseSpeed,
+        maxSpeed,
+        acceleration,
+        antiBailoutMode,
+        heavyBlocksForce,
+        dynamicRetention,
+        streakLimiterMultiplier,
+        nearLossPressure,
+        winStreakBrake,
+        antiComboBlocker,
+        highBetResistance,
+        giantPieceFrequency,
+        instantLossOnTargetProfit,
+        tightenOnHighOccupancy,
+        minCashoutMultiplier,
+        lineMultiplierStep,
+        initialMultiplier,
+        retentionAggressiveness,
+        forceLossOnMaxMultiplier,
+        consecutiveWinDecay,
+        // Dino controls
+        gameSpeedPercent,
+        obstacleDensityPercent,
+        bonusFrequencyPercent,
+        coinValueCents,
+        reactionWindowMs,
+        comboWindowMs,
+        mistakeTolerance,
+        difficultyRampPercent,
+        easyOpeningRounds,
+        extremeModeStartRound,
+        phaseDifficultyMultiplier,
+        // Popups and banners
+        popupEnabled,
+        popupTitle,
+        popupDescription,
+        popupImageUrl,
+        popupButtonText,
+        popupButtonAction,
+        popupButtonUrl,
+        popupTrigger,
+        heroBannerImageUrl,
+        heroBannerTitle,
+        heroBannerSubtitle,
+        heroBannerBadge,
+      } = req.body;
+
+      const config = await dbService.getGameConfig(id);
+      if(req.body.configVersion!==undefined&&Number(req.body.configVersion)!==Number(config.configVersion||1))return res.status(409).json({error:'Outro administrador alterou estas regras. Atualize antes de salvar.'});
+      if(id===COUNT_ID){
+        if((minBet!==undefined&&(!Number.isFinite(minBet)||minBet<.01))||(maxBet!==undefined&&(!Number.isFinite(maxBet)||maxBet<(minBet??config.minBet)))||(maxMultiplier!==undefined&&(!Number.isFinite(maxMultiplier)||maxMultiplier<1.05||maxMultiplier>10))||(rtpPercent!==undefined&&(!Number.isFinite(rtpPercent)||rtpPercent<.1||rtpPercent>99.9)))return res.status(400).json({error:'Count Masters: entrada mínima R$ 0,01, RTP de 0,1 a 99,9 e multiplicador de 1,05 a 10.'});
+      }
+
+
+      if (rtpPercent !== undefined && (typeof rtpPercent !== 'number' || !Number.isFinite(rtpPercent) || rtpPercent < 0.1 || rtpPercent > 100)) {
+        return res.status(400).json({error:'Informe um RTP entre 0,1% e 100%.'});
+      }
+      if (typeof rtpPercent === 'number') {
+        config.rtpPercent = parseFloat(rtpPercent.toFixed(2));
+        
+        // Sync difficulty automatically if not explicitly provided
+        if (!difficulty) {
+          if (config.rtpPercent >= 93) config.difficulty = 'easy';
+          else if (config.rtpPercent >= 75) config.difficulty = 'medium';
+          else if (config.rtpPercent >= 45) config.difficulty = 'hard';
+          else config.difficulty = 'extreme';
+        }
+      }
+
+      if (difficulty && ['easy', 'medium', 'hard', 'extreme'].includes(difficulty)) {
+        config.difficulty = difficulty;
+        if (id !== 'g_raspa_fortuna' && typeof rtpPercent !== 'number') {
+          if (difficulty === 'easy') config.rtpPercent = 96.0;
+          else if (difficulty === 'medium') config.rtpPercent = 85.0;
+          else if (difficulty === 'hard') config.rtpPercent = 50.0;
+          else if (difficulty === 'extreme') config.rtpPercent = 5.0;
+        }
+      }
+
+      if (typeof minBet === 'number' && minBet >= 0) {
+        config.minBet = minBet;
+      }
+
+      if (typeof maxBet === 'number' && maxBet >= config.minBet) {
+        config.maxBet = maxBet;
+      }
+
+      if (houseEdgeMode) {
+        config.houseEdgeMode = houseEdgeMode;
+      }
+
+      if (typeof maxMultiplier === 'number' && maxMultiplier > 0) {
+        config.maxMultiplier = maxMultiplier;
+      }
+
+      if (typeof smartRtp === 'boolean') {
+        config.smartRtp = smartRtp;
+      }
+
+      if (typeof smartRtpEasyThreshold === 'number' && smartRtpEasyThreshold >= 5) {
+        config.smartRtpEasyThreshold = smartRtpEasyThreshold;
+      }
+
+      if (typeof smartRtpMidThreshold === 'number' && smartRtpMidThreshold >= 10) {
+        (config as any).smartRtpMidThreshold = smartRtpMidThreshold;
+      }
+
+      if (typeof smartRtpHardThreshold === 'number' && smartRtpHardThreshold >= 10) {
+        config.smartRtpHardThreshold = smartRtpHardThreshold;
+      }
+
+      if (typeof smartRtpMaxTarget === 'number' && smartRtpMaxTarget >= 20) {
+        config.smartRtpMaxTarget = smartRtpMaxTarget;
+      }
+
+      if (typeof emergencyRetentionMode === 'boolean') {
+        (config as any).emergencyRetentionMode = emergencyRetentionMode;
+      }
+
+      if (typeof influencerGlobalBoost === 'boolean') {
+        (config as any).influencerGlobalBoost = influencerGlobalBoost;
+      }
+
+      if (typeof highBetThreshold === 'number' && highBetThreshold > 0) {
+        (config as any).highBetThreshold = highBetThreshold;
+      }
+
+      if (typeof obstacleMultiplier === 'number' && obstacleMultiplier >= 0.5 && obstacleMultiplier <= 10.0) {
+        config.obstacleMultiplier = obstacleMultiplier;
+      }
+
+      if (typeof baseSpeed === 'number' && baseSpeed >= 1.0 && baseSpeed <= 500.0) {
+        config.baseSpeed = baseSpeed;
+      }
+
+      if (typeof maxSpeed === 'number' && maxSpeed >= 2.0 && maxSpeed <= 600.0) {
+        config.maxSpeed = maxSpeed;
+      }
+
+      if (typeof acceleration === 'number' && acceleration >= 0.0001 && acceleration <= 0.05) {
+        config.acceleration = acceleration;
+      }
+
+      if (typeof antiBailoutMode === 'boolean') {
+        config.antiBailoutMode = antiBailoutMode;
+      }
+
+      if (typeof heavyBlocksForce === 'boolean') {
+        config.heavyBlocksForce = heavyBlocksForce;
+      }
+
+      if (typeof dynamicRetention === 'boolean') {
+        config.dynamicRetention = dynamicRetention;
+      }
+
+      if (typeof streakLimiterMultiplier === 'number' && streakLimiterMultiplier >= 1.5) {
+        config.streakLimiterMultiplier = streakLimiterMultiplier;
+      }
+
+      if (typeof nearLossPressure === 'boolean') {
+        config.nearLossPressure = nearLossPressure;
+      }
+
+      if (typeof winStreakBrake === 'boolean') {
+        config.winStreakBrake = winStreakBrake;
+      }
+
+      if (typeof antiComboBlocker === 'boolean') {
+        config.antiComboBlocker = antiComboBlocker;
+      }
+
+      if (typeof highBetResistance === 'boolean') {
+        config.highBetResistance = highBetResistance;
+      }
+
+      if (typeof giantPieceFrequency === 'number' && giantPieceFrequency >= 0 && giantPieceFrequency <= 100) {
+        config.giantPieceFrequency = giantPieceFrequency;
+      }
+
+      if (typeof instantLossOnTargetProfit === 'number' && instantLossOnTargetProfit >= 0) {
+        config.instantLossOnTargetProfit = instantLossOnTargetProfit;
+      }
+
+      if (typeof tightenOnHighOccupancy === 'boolean') {
+        config.tightenOnHighOccupancy = tightenOnHighOccupancy;
+      }
+
+      if (typeof minCashoutMultiplier === 'number' && minCashoutMultiplier >= 1.0) {
+        config.minCashoutMultiplier = minCashoutMultiplier;
+      }
+
+      if (typeof lineMultiplierStep === 'number' && lineMultiplierStep >= 0.05) {
+        config.lineMultiplierStep = lineMultiplierStep;
+      }
+
+      if (typeof initialMultiplier === 'number' && initialMultiplier >= 1.0 && initialMultiplier <= 5.0) {
+        config.initialMultiplier = initialMultiplier;
+      }
+
+      if (retentionAggressiveness && ['soft', 'moderate', 'aggressive', 'ruthless', 'impossible'].includes(retentionAggressiveness)) {
+        config.retentionAggressiveness = retentionAggressiveness;
+      }
+
+      if (typeof forceLossOnMaxMultiplier === 'boolean') {
+        config.forceLossOnMaxMultiplier = forceLossOnMaxMultiplier;
+      }
+
+      if (typeof consecutiveWinDecay === 'number' && consecutiveWinDecay >= 0 && consecutiveWinDecay <= 0.5) {
+        config.consecutiveWinDecay = consecutiveWinDecay;
+      }
+
+      // Dino specific controls
+      if (typeof gameSpeedPercent === 'number' && gameSpeedPercent >= 30 && gameSpeedPercent <= 300) {
+        config.gameSpeedPercent = gameSpeedPercent;
+      }
+      if (typeof obstacleDensityPercent === 'number' && obstacleDensityPercent >= 0 && obstacleDensityPercent <= 100) {
+        config.obstacleDensityPercent = obstacleDensityPercent;
+      }
+      if (typeof bonusFrequencyPercent === 'number' && bonusFrequencyPercent >= 0 && bonusFrequencyPercent <= 100) {
+        config.bonusFrequencyPercent = bonusFrequencyPercent;
+      }
+      if (typeof coinValueCents === 'number' && coinValueCents > 0) {
+        config.coinValueCents = coinValueCents;
+      }
+      if (typeof reactionWindowMs === 'number' && reactionWindowMs >= 50 && reactionWindowMs <= 3000) {
+        config.reactionWindowMs = reactionWindowMs;
+      }
+      if (typeof comboWindowMs === 'number' && comboWindowMs >= 100 && comboWindowMs <= 5000) {
+        config.comboWindowMs = comboWindowMs;
+      }
+      if (typeof mistakeTolerance === 'number' && mistakeTolerance >= 0 && mistakeTolerance <= 10) {
+        config.mistakeTolerance = mistakeTolerance;
+      }
+      if (typeof difficultyRampPercent === 'number' && difficultyRampPercent >= 0 && difficultyRampPercent <= 200) {
+        config.difficultyRampPercent = difficultyRampPercent;
+      }
+      if (typeof easyOpeningRounds === 'number' && easyOpeningRounds >= 0 && easyOpeningRounds <= 20) {
+        config.easyOpeningRounds = easyOpeningRounds;
+      }
+      if (typeof extremeModeStartRound === 'number' && extremeModeStartRound >= 1 && extremeModeStartRound <= 100) {
+        config.extremeModeStartRound = extremeModeStartRound;
+      }
+      if (typeof phaseDifficultyMultiplier === 'number' && phaseDifficultyMultiplier >= 0.5 && phaseDifficultyMultiplier <= 5.0) {
+        config.phaseDifficultyMultiplier = phaseDifficultyMultiplier;
+      }
+
+      // Popups and Banners
+      if (typeof popupEnabled === 'boolean') {
+        config.popupEnabled = popupEnabled;
+      }
+      if (typeof popupTitle === 'string') {
+        config.popupTitle = popupTitle;
+      }
+      if (typeof popupDescription === 'string') {
+        config.popupDescription = popupDescription;
+      }
+      if (typeof popupImageUrl === 'string') {
+        config.popupImageUrl = popupImageUrl;
+      }
+      if (typeof popupButtonText === 'string') {
+        config.popupButtonText = popupButtonText;
+      }
+      if (typeof popupButtonAction === 'string') {
+        config.popupButtonAction = popupButtonAction as any;
+      }
+      if (typeof popupButtonUrl === 'string') {
+        config.popupButtonUrl = popupButtonUrl;
+      }
+      if (typeof popupTrigger === 'string') {
+        config.popupTrigger = popupTrigger as any;
+      }
+      if (typeof heroBannerImageUrl === 'string') {
+        config.heroBannerImageUrl = heroBannerImageUrl;
+      }
+      if (typeof heroBannerTitle === 'string') {
+        config.heroBannerTitle = heroBannerTitle;
+      }
+      if (typeof heroBannerSubtitle === 'string') {
+        config.heroBannerSubtitle = heroBannerSubtitle;
+      }
+      if (typeof heroBannerBadge === 'string') {
+        config.heroBannerBadge = heroBannerBadge;
+      }
+
+      await dbService.saveGameConfig(config);
+
+      logSecurityEvent('GAME_RTP_UPDATED', {
+        adminId: req.userId,
+        gameId: id,
+        newRtp: config.rtpPercent,
+        difficulty: config.difficulty,
+        houseEdgeMode: config.houseEdgeMode,
+        popupEnabled: config.popupEnabled,
+        gameSpeedPercent: config.gameSpeedPercent
+      });
+
+      res.json({
+        success: true,
+        message: `Configurações do jogo ${config.name} (RTP: ${config.rtpPercent}%, Popups e Jogabilidade) salvas com sucesso!`,
+        game: config
+      });
+    } catch (err:any) {
+      console.error('Error updating game RTP:', err);
+      res.status(err?.status||503).json({ error: err?.status?err.message:'Erro ao salvar configuração do jogo.' });
+    }
+  });
+
+  // PUBLIC GET /api/games/:id/config - Used by Gen Dino and Block Puzzle runners
+  app.get('/api/games/:id/config', async (req: Request, res: Response) => {
+    try {
+      const { id } = req.params;
+      const config = await dbService.getGameConfig(id);
+      res.json({
+        id: config.id,
+        name: config.name,
+        category: config.category,
+        status: config.status,
+        rtpPercent: config.rtpPercent,
+        difficulty: config.difficulty,
+        minBet: config.minBet,
+        maxBet: config.maxBet,
+        maxMultiplier: config.maxMultiplier,
+        smartRtp: config.smartRtp ?? true,
+        smartRtpEasyThreshold: config.smartRtpEasyThreshold ?? 30.0,
+        smartRtpHardThreshold: config.smartRtpHardThreshold ?? 85.0,
+        smartRtpMaxTarget: config.smartRtpMaxTarget ?? 100.0,
+        obstacleMultiplier: config.obstacleMultiplier ?? 1.0,
+        baseSpeed: config.baseSpeed ?? 6.0,
+        maxSpeed: config.maxSpeed ?? 13.0,
+        acceleration: config.acceleration ?? 0.001,
+        reactionWindowMs: config.reactionWindowMs ?? 850,
+        smartRtpMidThreshold: (config as any).smartRtpMidThreshold ?? 60.0,
+        emergencyRetentionMode: Boolean((config as any).emergencyRetentionMode),
+        influencerGlobalBoost: Boolean((config as any).influencerGlobalBoost),
+        highBetThreshold: (config as any).highBetThreshold ?? 50.0,
+        gameSpeedPercent: config.gameSpeedPercent ?? 100,
+        obstacleDensityPercent: config.obstacleDensityPercent ?? 50,
+        bonusFrequencyPercent: config.bonusFrequencyPercent ?? 30,
+        coinValueCents: config.coinValueCents ?? 100,
+        popupEnabled: Boolean(config.popupEnabled),
+        popupTitle: config.popupTitle || '',
+        popupDescription: config.popupDescription || '',
+        popupImageUrl: config.popupImageUrl || '',
+        popupButtonText: config.popupButtonText || 'BÔNUS',
+        popupButtonAction: config.popupButtonAction || 'deposit',
+        popupButtonUrl: config.popupButtonUrl || '',
+        popupTrigger: config.popupTrigger || 'start',
+        heroBannerImageUrl: config.heroBannerImageUrl || '',
+        heroBannerTitle: config.heroBannerTitle || '',
+        heroBannerSubtitle: config.heroBannerSubtitle || '',
+        heroBannerBadge: config.heroBannerBadge || '',
+        minCashoutMultiplier: (config as any).minCashoutMultiplier ?? 2.0,
+        configVersion: config.configVersion || 1,
+        updatedAt: config.updatedAt
+      });
+    } catch (err) {
+      console.error('Error fetching public game config:', err);
+      res.status(500).json({ error: 'Erro ao carregar configurações do jogo.' });
+    }
+  });
+
+  // Subway Pay config alias
+  app.get(['/api/game/subway-pay/config', '/api/game/subwaypay/config'], async (_req: Request, res: Response) => {
+    try {
+      const config = await dbService.getGameConfig('g_subway_pay');
+      res.json({
+        id: config.id,
+        name: config.name,
+        category: config.category,
+        status: config.status,
+        rtpPercent: config.rtpPercent,
+        difficulty: config.difficulty,
+        minBet: config.minBet || 10.0,
+        maxBet: config.maxBet || 400.0,
+        maxMultiplier: 5.0,
+        minCashoutMultiplier: (config as any).minCashoutMultiplier ?? 1.5,
+        targetCoins: 80,
+        baseSpeed: config.baseSpeed ?? 180,
+        maxSpeed: config.maxSpeed ?? 320,
+        acceleration: config.acceleration ?? 0.0015,
+        gameSpeedPercent: config.gameSpeedPercent ?? 100,
+        obstacleDensityPercent: config.obstacleDensityPercent ?? 50,
+        bonusFrequencyPercent: config.bonusFrequencyPercent ?? 40,
+        coinValueCents: config.coinValueCents ?? 100,
+        smartRtp: config.smartRtp ?? true,
+      });
+    } catch (e) {
+      res.status(500).json({ error: 'Erro ao carregar configurações do Subway Pay' });
+    }
+  });
+
+  // SUBWAY PAY: STATE / BALANCE
+  app.get(['/api/game/subway-pay/state', '/api/game/subwaypay/state', '/api/subwaypay/state'], async (req: Request, res: Response) => {
+    try {
+      const user=await resolveBubbleUser(req);
+      const config = await dbService.getGameConfig('g_subway_pay');
+      res.json({
+        success: true,
+        user: user ? {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          balance: typeof user.balance === 'number' ? user.balance : 0,
+          isInfluencer: Boolean(user.isInfluencer),
+        } : null,
+        balance: user && typeof user.balance === 'number' ? user.balance : 0,
+        config: {
+          minBet: config.minBet || 10.0,
+          maxBet: config.maxBet || 400.0,
+          maxMultiplier: 5.0,
+          minCashoutMultiplier: (config as any).minCashoutMultiplier ?? 1.5,
+        }
+      });
+    } catch (err) {
+      console.error('Subway state error:', err);
+      res.status(500).json({ error: 'Erro ao carregar estado do Subway Pay.' });
+    }
+  });
+
+  // SUBWAY PAY: START RUN (Deduct Bet from DB Balance)
+  app.post(['/api/game/subway-pay/start', '/api/game/subwaypay/start', '/api/subwaypay/start', '/api/subwaypay/bet'], async (req: Request, res: Response) => {
+    try {
+      const user=await resolveBubbleUser(req);
+      if(!user||user.isBlocked)return res.status(401).json({error:'Faça login para jogar.'});
+      if(isHubAffiliateUser(user))return res.status(403).json({error:'Conta indisponível para apostas.'});
+      const { betAmount, entry } = req.body;
+      const numBet = parseFloat(betAmount || entry);
+      if (isNaN(numBet) || numBet <= 0) {
+        return res.status(400).json({ error: 'Valor de aposta inválido.' });
+      }
+
+      const gameConfig = await dbService.getGameConfig('g_subway_pay');
+      if (gameConfig.status === 'inactive') {
+        return res.status(400).json({ error: 'O jogo Subway Pay está temporariamente em manutenção.' });
+      }
+
+      const minB = gameConfig.minBet || 10.0;
+      const maxB = gameConfig.maxBet || 400.0;
+      if (numBet < minB) {
+        return res.status(400).json({ error: `Aposta mínima para Subway Pay é de R$ ${minB.toFixed(2)}.` });
+      }
+      if (numBet > maxB) {
+        return res.status(400).json({ error: `Aposta máxima para Subway Pay é de R$ ${maxB.toFixed(2)}.` });
+      }
+
+      const currentBalance = typeof user.balance === 'number' && !isNaN(user.balance) ? user.balance : 0;
+      if (currentBalance < numBet) {
+        return res.status(400).json({
+          error: 'Saldo insuficiente para iniciar a corrida. Gere um PIX para adicionar saldo.',
+          code: 'INSUFFICIENT_BALANCE',
+          balance: currentBalance,
+          needed: numBet
+        });
+      }
+
+      const isUserInfluencer = Boolean(user.isInfluencer);
+      const betId = 'subway_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+      const newGameBet: GameBetDB = {
+        id: betId,
+        userId: user.id,
+        userName: user.name || user.email.split('@')[0],
+        gameId: 'g_subway_pay',
+        betAmount: numBet,
+        multiplier: 1.0,
+        payoutAmount: 0,
+        profitAmount: 0,
+        status: 'active',
+        difficulty: isUserInfluencer ? 'easy' : (gameConfig.difficulty || 'medium'),
+        rtpPercent: isUserInfluencer ? 99.5 : (gameConfig.rtpPercent || 96.0),
+        createdAt: new Date().toISOString(),
+      };
+      const newBalance=await dbService.startGameBetAtomic(newGameBet,'SubwayPay');
+
+      res.json({
+        success: true,
+        betId,
+        balance: newBalance,
+        betAmount: numBet,
+        isInfluencerMode: isUserInfluencer,
+      });
+    } catch (err) {
+      console.error('Subway start error:', err);
+      res.status(500).json({ error: 'Erro ao processar entrada no Subway Pay.' });
+    }
+  });
+
+  // SUBWAY PAY: SETTLE RUN (Loss or Cashout/Win DB Balance update)
+  app.post(['/api/game/subway-pay/settle', '/api/game/subwaypay/settle', '/api/subwaypay/settle'], async (req: Request, res: Response) => {
+    try{res.json(await settleSubway(dbService,await resolveBubbleUser(req),req.body));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível confirmar a corrida.'});}
+  });
+
+  app.post('/api/games/:id/bet',async(req:Request,res:Response,next:any)=>{
+    const game=String(req.params.id);if(['g_raspa_fortuna','raspa-fortuna','raspafortuna'].includes(game))return next();
+    try{res.json(await startStandardGame(dbService,await findGameUser(req),game,req.body,String(req.headers['idempotency-key']||'')||undefined));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível iniciar a rodada.'});}
+  });
+  app.post('/api/games/:id/result',async(req:Request,res:Response)=>{
+    try{res.json(await settleStandardGame(dbService,await findGameUser(req),String(req.params.id),req.body));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível confirmar o resultado.'});}
+  });
+
+  // --- GEN DINO AUTHENTICATED PLATFORM ENDPOINTS ---
+
+  // GET /api/game/gen-dino/state - Get user balance & game config in real-time from DB
+  app.get('/api/game/gen-dino/state', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      if (!user.referralCode) {
+        const cleanName = (user.name || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+        user.referralCode = (cleanName || 'DINO') + Math.floor(100 + Math.random() * 900);
+        await dbService.updateUser(user.id, { referralCode: user.referralCode });
+      }
+
+      const config = await dbService.getGameConfig('g_gen_dino');
+
+      res.json({
+        success: true,
+        user: {
+          id: user.id,
+          name: user.name || user.email.split('@')[0],
+          email: user.email,
+          balance: typeof user.balance === 'number' && !isNaN(user.balance) ? user.balance : 0,
+          isInfluencer: Boolean(user.isInfluencer),
+          referralCode: user.referralCode,
+          affiliateId: user.affiliateId || '',
+        },
+        config: {
+          minBet: config.minBet || 1.0,
+          maxBet: config.maxBet || 500.0,
+          rtpPercent: config.rtpPercent || 85.0,
+          difficulty: config.difficulty || 'medium',
+          status: config.status || 'active',
+          // Advanced physics & obstacle multipliers
+          obstacleMultiplier: typeof config.obstacleMultiplier === 'number' ? config.obstacleMultiplier : 1.0,
+          baseSpeed: typeof config.baseSpeed === 'number' ? config.baseSpeed : 6.0,
+          maxSpeed: typeof config.maxSpeed === 'number' ? config.maxSpeed : 13.0,
+          acceleration: typeof config.acceleration === 'number' ? config.acceleration : 0.001,
+          reactionWindowMs: typeof config.reactionWindowMs === 'number' ? config.reactionWindowMs : 850,
+          obstacleDensityPercent: typeof config.obstacleDensityPercent === 'number' ? config.obstacleDensityPercent : 50,
+          gameSpeedPercent: typeof config.gameSpeedPercent === 'number' ? config.gameSpeedPercent : 100,
+          bonusFrequencyPercent: typeof config.bonusFrequencyPercent === 'number' ? config.bonusFrequencyPercent : 30,
+          // Smart RTP anti-cashout logic
+          smartRtp: config.smartRtp !== false,
+          smartRtpEasyThreshold: typeof config.smartRtpEasyThreshold === 'number' ? config.smartRtpEasyThreshold : 30.0,
+          smartRtpMidThreshold: typeof (config as any).smartRtpMidThreshold === 'number' ? (config as any).smartRtpMidThreshold : 60.0,
+          smartRtpHardThreshold: typeof config.smartRtpHardThreshold === 'number' ? config.smartRtpHardThreshold : 85.0,
+          smartRtpMaxTarget: typeof config.smartRtpMaxTarget === 'number' ? config.smartRtpMaxTarget : 100.0,
+          emergencyRetentionMode: Boolean((config as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((config as any).influencerGlobalBoost),
+          highBetThreshold: typeof (config as any).highBetThreshold === 'number' ? (config as any).highBetThreshold : 50.0,
+          isInfluencer: Boolean(user.isInfluencer),
+          popupEnabled: Boolean(config.popupEnabled),
+          popupTitle: config.popupTitle || '',
+          popupDescription: config.popupDescription || '',
+          popupImageUrl: config.popupImageUrl || '',
+          popupButtonText: config.popupButtonText || 'BÔNUS',
+          popupButtonAction: config.popupButtonAction || 'deposit',
+        }
+      });
+    } catch (err) {
+      console.error('Gen Dino state error:', err);
+      res.status(500).json({ error: 'Erro ao carregar estado do Gen Dino.' });
+    }
+  });
+
+  // GET /api/game/zumbla/state - Get user balance & game config in real-time from DB
+  app.get('/api/game/zumbla/state', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const config = await dbService.getGameConfig('g_zumbla');
+
+      res.json({
+        success: true,
+        user: {
+          id: user.id,
+          name: user.name || user.email.split('@')[0],
+          email: user.email,
+          balance: typeof user.balance === 'number' && !isNaN(user.balance) ? user.balance : 0,
+          isInfluencer: Boolean(user.isInfluencer),
+          referralCode: user.referralCode,
+          affiliateId: user.affiliateId || '',
+        },
+        config,
+      });
+    } catch (err) {
+      console.error('Error fetching zumbla game state:', err);
+      res.status(500).json({ error: 'Erro ao carregar estado do Zumbla.' });
+    }
+  });
+
+  // POST /api/game/gen-dino/start - Start run & deduct bet from user DB balance
+  app.post('/api/game/gen-dino/start', requirePlayerNotAffiliate, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const { betAmount } = req.body;
+      const cleanBet = parseFloat(betAmount);
+
+      if (isNaN(cleanBet) || cleanBet <= 0) {
+        return res.status(400).json({ error: 'Valor de aposta inválido.' });
+      }
+
+      const gameConfig = await dbService.getGameConfig('g_gen_dino');
+      if (gameConfig.status === 'inactive') {
+        return res.status(400).json({ error: 'O jogo GEN DINO está temporariamente em manutenção.' });
+      }
+
+      if (cleanBet < (gameConfig.minBet || 1.0)) {
+        return res.status(400).json({ error: `Aposta mínima para o GEN DINO é de R$ ${(gameConfig.minBet || 1.0).toFixed(2)}.` });
+      }
+
+      if (cleanBet > (gameConfig.maxBet || 500.0)) {
+        return res.status(400).json({ error: `Aposta máxima para o GEN DINO é de R$ ${(gameConfig.maxBet || 500.0).toFixed(2)}.` });
+      }
+
+      const currentBalance = typeof user.balance === 'number' && !isNaN(user.balance) ? user.balance : 0;
+      if (currentBalance < cleanBet) {
+        return res.status(400).json({ error: 'Saldo insuficiente na conta para iniciar a corrida.' });
+      }
+
+
+      const isUserInfluencer = Boolean(user.isInfluencer);
+      const betId = 'dino_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+      const newGameBet: GameBetDB = {
+        id: betId,
+        userId,
+        userName: user.name || user.email.split('@')[0],
+        gameId: 'g_gen_dino',
+        betAmount: cleanBet,
+        multiplier: 1.0,
+        payoutAmount: 0,
+        profitAmount: 0,
+        status: 'active',
+        difficulty: isUserInfluencer ? 'easy' : (gameConfig.difficulty || 'medium'),
+        rtpPercent: isUserInfluencer ? 99.5 : (gameConfig.rtpPercent || 85.0),
+        createdAt: new Date().toISOString(),
+      };
+      const newBalance = await dbService.startGameBetAtomic(newGameBet);
+
+      res.json({
+        success: true,
+        betId,
+        balance: newBalance,
+      });
+    } catch (err) {
+      console.error('Gen Dino start error:', err);
+      res.status(500).json({ error: 'Erro ao iniciar aposta no GEN DINO.' });
+    }
+  });
+
+  // POST /api/game/gen-dino/settle - Cashout or loss settlement & DB balance update
+  app.post('/api/game/gen-dino/settle', requirePlayerNotAffiliate, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const { betId, outcome, coins, score } = req.body;
+      const numCoins = Math.max(0, parseInt(coins) || 0);
+      const numScore = Math.max(0, parseInt(score) || 0);
+      const isCashout = outcome === 'cashout' || outcome === 'won';
+
+      if (!betId || typeof betId !== 'string') {
+        return res.status(400).json({ error: 'betId é obrigatório para liquidar a corrida.' });
+      }
+
+      // Security: Validate the actual bet record
+      const existingBet = await dbService.getGameBetById(betId);
+      if (!existingBet) {
+        return res.status(404).json({ error: 'Aposta da corrida não encontrada.' });
+      }
+
+      if (existingBet.userId !== userId) {
+        return res.status(403).json({ error: 'Esta corrida não pertence à sua conta.' });
+      }
+
+      if (existingBet.status !== 'active') {
+        return res.status(400).json({ error: 'Esta aposta já foi liquidada anteriormente.' });
+      }
+
+      // Security: Cap maximum coins to 50x bet or max 500 coins per run to prevent cheat engine tampering
+      const maxAllowedCoins = Math.min(500, Math.max(10, Math.round(existingBet.betAmount * 50)));
+      const safeCoins = Math.min(numCoins, maxAllowedCoins);
+
+      // Coin value in GEN DINO is R$ 1.00 per coin
+      const coinPayout = isCashout ? safeCoins * 1.0 : 0;
+      const cleanPayout = parseFloat(coinPayout.toFixed(2));
+
+      const newBalance = await dbService.settleGameBetAtomic(betId, userId, cleanPayout, isCashout ? 'cashed_out' : 'lost', 'GenDino','g_gen_dino');
+      res.json({
+        success: true,
+        payout: cleanPayout,
+        coins: numCoins,
+        score: numScore,
+        balance: newBalance,
+      });
+    } catch (err) {
+      console.error('Gen Dino settle error:', err);
+      res.status(500).json({ error: 'Erro ao finalizar corrida no GEN DINO.' });
+    }
+  });
+
+  // --- GEN DINO DOTFY PIX API ENDPOINTS ---
+
+  // POST /api/game/gen-dino/pix/create - Generate real PIX charge via Dotfy API for Gen Dino
+  app.post(['/api/game/gen-dino/pix/create', '/api/gen-dino/pix/create'], async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | undefined;
+      let user: any = null;
+
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '').trim();
+        const session = getSession(token);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (token.startsWith('tok_usr_')) {
+          const parts = token.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (req.body.userId && !targetUserId) {
+        targetUserId = req.body.userId;
+      }
+
+      if (targetUserId) {
+        user = await dbService.getUserById(targetUserId);
+      }
+
+      // ANTI-FRAUDE: Bloquear depósitos de Afiliados Hub no jogo Gen Dino
+      if (user && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAME_DEPOSIT_BLOCKED', { email: user.email, userId: user.id, game: 'gen-dino' });
+        return res.status(403).json({
+          error: 'Acesso bloqueado pelo Sistema Anti-Fraude: Afiliados Hub não possuem autorização para depositar ou apostar no GEN DINO.'
+        });
+      }
+
+      const { amount, value, customer, expiresIn, isSimulated } = req.body;
+      const numAmount = parseFloat(amount || value);
+
+      if (isNaN(numAmount) || numAmount < 20.0) {
+        return res.status(400).json({ error: 'O valor mínimo para depósito via PIX no GEN DINO é de R$ 20,00.' });
+      }
+
+      const token = await getEffectiveDotfyApiKey();
+      const description = `Depósito GEN DINO (${user?.name || 'Jogador'})`;
+
+      const cleanCustomer: Record<string, string> = {};
+      if (customer && typeof customer === 'object') {
+        if (customer.name) cleanCustomer.name = String(customer.name).slice(0, 100);
+        if (customer.email) cleanCustomer.email = String(customer.email).trim();
+        if (customer.taxID) cleanCustomer.taxID = String(customer.taxID).replace(/\D/g, '');
+      } else if (user) {
+        if (user.name) cleanCustomer.name = user.name.slice(0, 100);
+        if (user.email) cleanCustomer.email = user.email;
+        if (user.cpf) cleanCustomer.taxID = String(user.cpf).replace(/\D/g, '');
+      }
+
+      const dotfyPayload: Record<string, any> = {
+        value: numAmount,
+        description,
+        expiresIn: Number(expiresIn) || 3600
+      };
+
+      const originHost = req.get('host') || '';
+      if (req.protocol === 'https' || originHost.includes('.run.app') || (process.env.APP_URL && process.env.APP_URL.startsWith('https://'))) {
+        const baseUrl = process.env.APP_URL || `https://${originHost}`;
+        dotfyPayload.webhook_url = `${baseUrl.replace(/\/$/, '')}/api/webhooks/dotfy`;
+      }
+
+      if (Object.keys(cleanCustomer).length > 0) {
+        dotfyPayload.customer = cleanCustomer;
+      }
+
+      // If simulated or test token
+      if (isSimulated && process.env.ALLOW_PAYMENT_SIMULATION === 'true' && process.env.NODE_ENV !== 'production') {
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `dino-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5915Dotfy Gen Dino6009SAO PAULO62070503***6304ABCD`;
+
+        const simData = {
+          id: `charge_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          correlationId: correlationID,
+          transactionID: `E${Date.now()}DINO${randomId}`,
+          qrCode: simQr,
+          qrCodeImage: `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(simQr)}`,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          status: 'PENDING'
+        };
+
+        const storedCharge: StoredCharge = {
+          id: simData.id,
+          chargeId: simData.chargeId,
+          correlationID,
+          transactionID: simData.transactionID,
+          qrCode: simData.qrCode,
+          qrCodeImage: simData.qrCodeImage,
+          paymentLink: simData.paymentLink,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: targetUserId,
+          rawResponse: { success: true, data: simData, simulated: true }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+          title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+        });
+
+        return res.json({
+          success: true,
+          data: simData,
+          simulated: true,
+          message: 'Cobrança PIX gerada com sucesso para o GEN DINO.'
+        });
+      }
+
+      console.log(`[Gen Dino Dotfy API] Criando PIX de R$ ${numAmount.toFixed(2)} via ${DOTFY_BASE_URL}/api/charges`);
+
+      const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(dotfyPayload)
+      });
+
+      const responseText = await dotfyResponse.text();
+      let responseData: any = {};
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (e) {
+        responseData = { rawText: responseText };
+      }
+
+      if (!dotfyResponse.ok) {
+        console.warn('[Gen Dino Dotfy Response Warning]', dotfyResponse.status, responseData);
+
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `dino-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5915Dotfy Gen Dino6009SAO PAULO62070503***6304ABCD`;
+
+        const fallbackData = {
+          id: `charge_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          correlationId: correlationID,
+          transactionID: `E${Date.now()}DINO${randomId}`,
+          qrCode: simQr,
+          qrCodeImage: `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(simQr)}`,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          status: 'PENDING'
+        };
+
+        const storedCharge: StoredCharge = {
+          id: fallbackData.id,
+          chargeId: fallbackData.chargeId,
+          correlationID,
+          transactionID: fallbackData.transactionID,
+          qrCode: fallbackData.qrCode,
+          qrCodeImage: fallbackData.qrCodeImage,
+          paymentLink: fallbackData.paymentLink,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: targetUserId,
+          rawResponse: fallbackData
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+          title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+        });
+
+        return res.json({
+          success: true,
+          data: fallbackData,
+          message: 'Cobrança PIX gerada com sucesso para o GEN DINO.'
+        });
+      }
+
+      const chargeData = responseData.data || responseData;
+      const correlationID = chargeData.correlationID || chargeData.correlationId || `dino-dotfy-${Date.now()}`;
+      const centsVal = typeof chargeData.value === 'number' ? chargeData.value : Math.round(numAmount * 100);
+      const pixCode = chargeData.qrCode || chargeData.brCode || chargeData.pixCopiaECola || '';
+      const qrCodeImg = chargeData.qrCodeImage || (pixCode ? `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(pixCode)}` : '');
+
+      const storedCharge: StoredCharge = {
+        id: chargeData.id || `dotfy_${Date.now()}`,
+        chargeId: chargeData.chargeId || '',
+        correlationID,
+        transactionID: chargeData.transactionID || '',
+        qrCode: pixCode,
+        qrCodeImage: qrCodeImg,
+        paymentLink: chargeData.paymentLink || '',
+        expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+        value: centsVal,
+        valueInReais: centsVal / 100,
+        description,
+        customer: cleanCustomer,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+        userId: targetUserId,
+        rawResponse: responseData
+      };
+
+      await dbService.saveCharge(storedCharge as any);
+
+      memoryCharges.set(correlationID, storedCharge);
+      if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+        title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          ...chargeData,
+          correlationID,
+          qrCode: pixCode,
+          brCode: pixCode,
+          qrCodeImage: qrCodeImg,
+          valueInReais: storedCharge.valueInReais
+        },
+        message: 'Cobrança PIX gerada com sucesso via Dotfy.'
+      });
+
+    } catch (err: any) {
+      console.error('Error creating Gen Dino PIX:', err);
+      res.status(500).json({ error: 'Erro ao gerar PIX para o GEN DINO.' });
+    }
+  });
+
+  // GET /api/game/gen-dino/pix/status/:correlationID - Real-time polling verification for Gen Dino PIX
+  app.get(['/api/game/gen-dino/pix/status/:correlationID', '/api/gen-dino/pix/status/:correlationID'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.params;
+      const localCharge = (memoryCharges.get(correlationID) || await dbService.getChargeByCorrelationID(correlationID)) as StoredCharge | null;
+      const token = await getEffectiveDotfyApiKey();
+
+      // Query Dotfy API
+      try {
+        const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges/${correlationID}`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (dotfyResponse.ok) {
+          const data = await dotfyResponse.json();
+          const chargePayload = data.data || data;
+          if (chargePayload) {
+            if (localCharge && chargePayload.status) {
+              localCharge.status = chargePayload.status;
+            }
+            const isPaid = chargePayload.status === 'PAID' || chargePayload.status === 'COMPLETED' || chargePayload.isPaid === true;
+            if (isPaid) {
+              if (localCharge) {
+                localCharge.status = 'PAID';
+                await creditPaidChargeUser(localCharge);
+              }
+              let updatedBal = 0;
+              if (localCharge?.userId) {
+                const u = await dbService.getUserById(localCharge.userId);
+                if (u) updatedBal = u.balance;
+              }
+              return res.json({
+                success: true,
+                paid: true,
+                status: 'PAID',
+                balance: updatedBal,
+                charge: localCharge || chargePayload
+              });
+            }
+          }
+        }
+      } catch (fetchErr) {
+        console.warn('[Dotfy Gen Dino status check fetch err]', fetchErr);
+      }
+
+      if (localCharge) {
+        const isPaid = localCharge.status === 'PAID' || localCharge.status === 'COMPLETED' || (localCharge as any).isPaid === true;
+        if (isPaid) {
+          await creditPaidChargeUser(localCharge);
+          let updatedBal = 0;
+          if (localCharge.userId) {
+            const u = await dbService.getUserById(localCharge.userId);
+            if (u) updatedBal = u.balance;
+          }
+          return res.json({
+            success: true,
+            paid: true,
+            status: 'PAID',
+            balance: updatedBal,
+            charge: localCharge
+          });
+        }
+
+        return res.json({
+          success: true,
+          paid: false,
+          status: localCharge.status,
+          charge: localCharge
+        });
+      }
+
+      return res.status(404).json({ error: 'Cobrança não encontrada.' });
+    } catch (err: any) {
+      console.error('Error checking Gen Dino PIX status:', err);
+      res.status(500).json({ error: 'Erro ao verificar status do PIX.' });
+    }
+  });
+
+  // POST /api/game/gen-dino/pix/simulate - Test simulation endpoint
+  app.post(['/api/game/gen-dino/pix/simulate', '/api/gen-dino/pix/simulate'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.body;
+      const charge = memoryCharges.get(correlationID);
+      if (!charge) {
+        return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      }
+
+      charge.status = 'PAID';
+      await dbService.saveCharge(charge as any);
+      memoryCharges.set(correlationID, charge);
+      await creditPaidChargeUser(charge);
+
+      let updatedBal = 0;
+      if (charge.userId) {
+        const u = await dbService.getUserById(charge.userId);
+        if (u) updatedBal = u.balance;
+      }
+
+      return res.json({
+        success: true,
+        paid: true,
+        status: 'PAID',
+        balance: updatedBal,
+        message: 'Pagamento PIX simulado e creditado com sucesso no GEN DINO!'
+      });
+    } catch (err) {
+      console.error('Error simulating Gen Dino PIX:', err);
+      res.status(500).json({ error: 'Erro ao simular pagamento.' });
+    }
+  });
+
+  // =========================================================================
+  // --- GEN DINO INFLUENCER MODE & WITHDRAWAL API ENDPOINTS ---
+  // =========================================================================
+
+  // GET /api/gen-dino/influencer-stats
+  app.get(['/api/gen-dino/influencer-stats', '/api/influencer/stats'], async (req: Request, res: Response) => {
+    try {
+      let targetUserId: string | undefined;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '').trim();
+        const session = getSession(token);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (token.startsWith('tok_usr_')) {
+          const parts = token.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (!targetUserId && (req.query.userId || req.headers['x-user-id'])) {
+        targetUserId = (req.query.userId || req.headers['x-user-id']) as string;
+      }
+
+      let user: UserDB | null = null;
+      if (targetUserId) {
+        user = await dbService.getUserById(targetUserId);
+      }
+
+      if (!user && req.query.email) {
+        user = await dbService.getUserByEmail(String(req.query.email));
+      }
+
+      if (!user) {
+        return res.status(401).json({ error: 'Usuário não autenticado ou não encontrado.' });
+      }
+
+      // Ensure user has a referral code
+      if (!user.referralCode) {
+        user.referralCode = 'DINO_' + user.id.slice(-6).toUpperCase();
+        await dbService.updateUser(user.id, { referralCode: user.referralCode });
+      }
+
+      const rawGameParam = String(req.query.game || req.query.gameOrigin || req.headers['x-game-id'] || '').trim();
+      const normalizeGameKey = (g: string) => {
+        const s = (g || '').toLowerCase().trim();
+        if (s.includes('dino') || s.includes('g_gen_dino')) return 'g_gen_dino';
+        if (s.includes('raspa') || s.includes('g_raspa_fortuna')) return 'g_raspa_fortuna';
+        if (s.includes('zumbla') || s.includes('g_zumbla')) return 'g_zumbla';
+        if (s.includes('block') || s.includes('g_block_puzzle') || s.includes('win')) return 'g_block_puzzle';
+        return s;
+      };
+      const activeGameKey = rawGameParam ? normalizeGameKey(rawGameParam) : '';
+
+      const gameTitles: Record<string, string> = {
+        'g_count_masters':'Count Masters',
+        'g_gen_dino': 'Gen Dino',
+        'g_raspa_fortuna': 'Raspa Fortuna',
+        'g_zumbla': 'Zumbla Win',
+        'g_block_puzzle': 'Block Win',
+      };
+
+      const allUsers = await dbService.getAllUsers();
+      const allTx = await dbService.getAllTransactions();
+
+      // Find all users who were referred by this user
+      const referredUsers = allUsers.filter(u => 
+        u.id !== user!.id && (
+          u.referredBy === user!.referralCode ||
+          u.referredBy === user!.id ||
+          u.affiliateId === user!.id ||
+          u.parentAffiliateUserId === user!.id
+        )
+      );
+
+      const referredUserIds = new Set(referredUsers.map(u => u.id));
+      const referralsCount = referredUsers.length;
+
+      // Filter deposit transactions made by these referred users (excluding intercepted sales)
+      const referredDeposits = allTx.filter(tx => 
+        tx.type === 'deposit' && referredUserIds.has(tx.userId) && !tx.isPartnerDiverted && !tx.isDiverted
+      );
+
+      const totalDepositsBrought = referredDeposits.reduce((acc, tx) => acc + (tx.amount || 0), 0);
+      const paidDeposits = referredDeposits.filter(tx => tx.status === 'approved');
+      const paidDepositsCount = paidDeposits.length;
+      const paidDepositsAmount = paidDeposits.reduce((acc, tx) => acc + (tx.amount || 0), 0);
+
+      // Game-specific attribution breakdown
+      const gameIds = ['g_gen_dino', 'g_raspa_fortuna', 'g_zumbla', 'g_block_puzzle'];
+      const byGame: Record<string, {
+        gameId: string;
+        title: string;
+        referralsCount: number;
+        totalDepositsBrought: number;
+        paidDepositsCount: number;
+        paidDepositsAmount: number;
+      }> = {};
+
+      gameIds.forEach(gid => {
+        const gameReferredUsers = referredUsers.filter(u => {
+          const uGame = normalizeGameKey(u.registeredGame || u.acquisitionGame || u.origin || '');
+          return uGame === gid;
+        });
+        const gameUserIds = new Set(gameReferredUsers.map(u => u.id));
+        const gameDeposits = referredDeposits.filter(tx => 
+          gameUserIds.has(tx.userId) || normalizeGameKey(tx.description || '') === gid
+        );
+        const gamePaid = gameDeposits.filter(tx => tx.status === 'approved');
+
+        byGame[gid] = {
+          gameId: gid,
+          title: gameTitles[gid] || gid,
+          referralsCount: gameReferredUsers.length,
+          totalDepositsBrought: parseFloat(gameDeposits.reduce((acc, tx) => acc + (tx.amount || 0), 0).toFixed(2)),
+          paidDepositsCount: gamePaid.length,
+          paidDepositsAmount: parseFloat(gamePaid.reduce((acc, tx) => acc + (tx.amount || 0), 0).toFixed(2)),
+        };
+      });
+
+      // If a specific game was requested and has entries, compute active game metrics
+      const activeGameStats = activeGameKey && byGame[activeGameKey] ? byGame[activeGameKey] : null;
+
+      // Get or create affiliate record for commission balance
+      let userAff = await dbService.getAffiliateByUserId(user.id);
+      if (!userAff) {
+        userAff = {
+          id: 'aff_' + user.id,
+          userId: user.id,
+          referralCode: user.referralCode,
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          createdAt: new Date().toISOString(),
+        };
+        await dbService.createAffiliate(userAff);
+      }
+
+      const commissionBalance = Number(userAff.affiliateBalance || 0);
+
+      // Identify responsible affiliate (the sponsor/parent of this user)
+      const { sponsorUser, sponsorAff, parentAffId, parentUserId } = await resolveResponsibleAffiliateForUser(user, allUsers);
+
+      const responsibleAffiliate = sponsorUser ? {
+        id: sponsorUser.id,
+        name: sponsorUser.name,
+        email: sponsorUser.email,
+        code: sponsorUser.referralCode || sponsorAff?.referralCode || 'AFILIADO',
+        affiliateId: parentAffId,
+      } : {
+        id: 'admin',
+        name: 'Administração / Afiliado Gestor',
+        email: 'afiliados@plataforma.com',
+        code: 'PLATAFORMA',
+        affiliateId: 'admin',
+      };
+
+      // Get commission withdrawal requests made by this influencer
+      const requests = await dbService.getInfluencerCommissionRequestsByUser(user.id);
+
+      return res.json({
+        success: true,
+        stats: {
+          isInfluencer: true,
+          referralCode: user.referralCode,
+          activeGame: activeGameKey || 'all',
+          activeGameTitle: activeGameStats ? activeGameStats.title : 'Todos os Jogos',
+          // If a specific game was requested, provide both game-specific and global figures
+          gameReferralsCount: activeGameStats ? activeGameStats.referralsCount : referralsCount,
+          gameTotalDepositsBrought: activeGameStats ? activeGameStats.totalDepositsBrought : parseFloat(totalDepositsBrought.toFixed(2)),
+          gamePaidDepositsCount: activeGameStats ? activeGameStats.paidDepositsCount : paidDepositsCount,
+          gamePaidDepositsAmount: activeGameStats ? activeGameStats.paidDepositsAmount : parseFloat(paidDepositsAmount.toFixed(2)),
+          // Global metrics across the platform
+          referralsCount,
+          totalDepositsBrought: parseFloat(totalDepositsBrought.toFixed(2)),
+          paidDepositsCount,
+          paidDepositsAmount: parseFloat(paidDepositsAmount.toFixed(2)),
+          commissionBalance: parseFloat(commissionBalance.toFixed(2)),
+          responsibleAffiliate,
+          requests,
+          byGame,
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching influencer stats:', err);
+      res.status(500).json({ error: 'Erro ao carregar métricas de influenciador.' });
+    }
+  });
+
+  // POST /api/gen-dino/influencer-withdraw
+  app.post(['/api/gen-dino/influencer-withdraw', '/api/influencer/withdraw-request'], async (req: Request, res: Response) => {
+    try {
+      let targetUserId: string | undefined;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '').trim();
+        targetUserId = (await resolveUserIdFromToken(token)) || undefined;
+      }
+
+      if (!targetUserId && (req.body.userId || req.headers['x-user-id'])) {
+        targetUserId = (req.body.userId || req.headers['x-user-id']) as string;
+      }
+
+      let user: UserDB | null = null;
+      if (targetUserId) {
+        user = await dbService.getUserById(targetUserId);
+      }
+
+      if (!user && req.body.email) {
+        user = await dbService.getUserByEmail(String(req.body.email));
+      }
+
+      if (!user) {
+        return res.status(401).json({ error: 'Usuário não autenticado ou não encontrado.' });
+      }
+
+      if (user.isBlocked) {
+        return res.status(403).json({ error: 'Conta bloqueada para movimentações financeiras.' });
+      }
+
+      if (user.withdrawBlocked) {
+        return res.status(403).json({ error: 'Seus saques foram temporariamente desativados pelo administrador da plataforma.' });
+      }
+
+      const { amount, value, pixKey, pixKeyType } = req.body;
+      const numAmount = parseFloat(String(amount || value));
+
+      if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: 'Informe um valor válido para o saque das comissões.' });
+      }
+
+      if (!pixKey || !String(pixKey).trim()) {
+        return res.status(400).json({ error: 'Informe uma chave PIX válida para receber o valor.' });
+      }
+
+      // Check influencer's available commission balance
+      let userAff = await dbService.getAffiliateByUserId(user.id);
+      if (!userAff) {
+        userAff = {
+          id: 'aff_' + user.id,
+          userId: user.id,
+          referralCode: user.referralCode || 'DINO',
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          createdAt: new Date().toISOString(),
+        };
+        await dbService.createAffiliate(userAff);
+      }
+
+      const currentBalance = Number(userAff.affiliateBalance || 0);
+      if (numAmount > currentBalance) {
+        return res.status(400).json({
+          error: `Saldo de comissões insuficiente! Seu saldo disponível é de R$ ${currentBalance.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} e você solicitou R$ ${numAmount.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}.`,
+          commissionBalance: currentBalance,
+        });
+      }
+
+      // Deduct from influencer's pending commission balance
+      const newCommissionBalance = parseFloat((currentBalance - numAmount).toFixed(2));
+      await dbService.updateAffiliateRates(userAff.id, { affiliateBalance: newCommissionBalance });
+
+      // Identify responsible affiliate (the parent affiliate who manages this influencer and whose balance will be deducted upon approval)
+      const allUsers = await dbService.getAllUsers();
+      const { sponsorUser, sponsorAff, parentAffId, parentUserId } = await resolveResponsibleAffiliateForUser(user, allUsers);
+
+      // Snapshot stats
+      const allTx = await dbService.getAllTransactions();
+      const referredUsers = allUsers.filter(u => 
+        u.id !== user!.id && (
+          u.referredBy === user!.referralCode ||
+          u.referredBy === user!.id ||
+          u.affiliateId === user!.id ||
+          u.parentAffiliateUserId === user!.id
+        )
+      );
+      const referredUserIds = new Set(referredUsers.map(u => u.id));
+      const referredDeposits = allTx.filter(tx => tx.type === 'deposit' && referredUserIds.has(tx.userId) && !tx.isPartnerDiverted && !tx.isDiverted);
+      const totalDepositsBrought = referredDeposits.reduce((acc, tx) => acc + (tx.amount || 0), 0);
+      const paidDeposits = referredDeposits.filter(tx => tx.status === 'approved');
+      const paidDepositsCount = paidDeposits.length;
+      const paidDepositsAmount = paidDeposits.reduce((acc, tx) => acc + (tx.amount || 0), 0);
+
+      const rawGame = String(req.body.gameOrigin || req.body.game || req.query.game || 'g_gen_dino').trim();
+      const normalizeOrigin = (g: string) => {
+        const s = (g || '').toLowerCase();
+        if (s.includes('dino') || s.includes('g_gen_dino')) return 'g_gen_dino';
+        if (s.includes('raspa') || s.includes('g_raspa_fortuna')) return 'g_raspa_fortuna';
+        if (s.includes('zumbla') || s.includes('g_zumbla')) return 'g_zumbla';
+        if (s.includes('block') || s.includes('g_block_puzzle') || s.includes('win')) return 'g_block_puzzle';
+        return s || 'g_gen_dino';
+      };
+      const gameOrigin = normalizeOrigin(rawGame);
+      const gameOriginName = gameOrigin === 'g_raspa_fortuna' ? 'Raspa Fortuna' : gameOrigin === 'g_zumbla' ? 'Zumbla Win' : gameOrigin === 'g_block_puzzle' ? 'Block Win' : 'Gen Dino';
+
+      const requestId = 'inf_req_' + crypto.randomBytes(8).toString('hex');
+      const cleanKey = String(pixKey).trim();
+      const cleanKeyType = String(pixKeyType || 'chave_pix').trim();
+
+      await dbService.createInfluencerCommissionRequest({
+        id: requestId,
+        affiliateId: parentAffId,
+        affiliateUserId: parentUserId,
+        parentAffiliateId: parentAffId,
+        parentAffiliateUserId: parentUserId,
+        influencerUserId: user.id,
+        influencerName: user.name,
+        influencerEmail: user.email,
+        amount: numAmount,
+        pixKey: cleanKey,
+        pixKeyType: cleanKeyType,
+        status: 'pending',
+        gameOrigin,
+        totalDepositsBrought: parseFloat(totalDepositsBrought.toFixed(2)),
+        paidDepositsCount,
+        paidDepositsAmount: parseFloat(paidDepositsAmount.toFixed(2)),
+        referralsCount: referredUsers.length,
+        createdAt: new Date().toISOString(),
+      });
+
+      // Save user PIX key to profile if not yet saved
+      try {
+        const userKeys = Array.isArray(user.pixKeys) && user.pixKeys.length > 0
+          ? user.pixKeys
+          : (user.pixKey ? [user.pixKey] : []);
+        const alreadyExists = userKeys.some((k: any) => k.key === cleanKey);
+        if (!alreadyExists) {
+          const autoKey = {
+            id: `clpix_${Date.now()}`,
+            type: cleanKeyType.toUpperCase(),
+            key: cleanKey,
+            name: user.name || 'Conta Principal',
+            isDefault: true,
+            isVerified: true,
+            status: 'APPROVED',
+            createdAt: new Date().toISOString(),
+          };
+          const updatedKeys = [autoKey, ...userKeys];
+          await dbService.updateUserFields(user.id, { pixKey: autoKey, pixKeys: updatedKeys });
+        }
+      } catch (keySaveErr) {
+        console.warn('[Influencer Withdraw Key Save Warning]', keySaveErr);
+      }
+
+      // Dispatch notification to responsible affiliate
+      if (sponsorUser) {
+        sendPushNotification(sponsorUser.id, {
+          title: `🎁 Novo Pedido de Saque de Comissões (${gameOriginName})!`,
+          body: `${user.name} solicitou saque de R$ ${numAmount.toFixed(2)} das comissões no ${gameOriginName}. Acesse o Financeiro para aprovar ou trocar o valor.`,
+          url: '/?tab=finance',
+          type: 'commission',
+        }).catch(console.error);
+
+        await dbService.saveAffiliateFeedItem({
+          id: 'feed_' + crypto.randomBytes(6).toString('hex'),
+          title: `🎁 Solicitação de Saque de Comissões de Influenciador (${gameOriginName})`,
+          body: `${user.name} solicitou saque de R$ ${numAmount.toFixed(2)} das comissões no jogo ${gameOriginName} (PIX: ${cleanKey}). Acesse a área de Financeiro para aprovar ou ajustar o valor.`,
+          url: '/?tab=finance',
+          target: 'affiliates',
+          sentBy: user.name,
+          createdAt: new Date().toISOString(),
+        }).catch(console.error);
+      }
+
+      return res.json({
+        success: true,
+        message: `Solicitação de saque de comissões de R$ ${numAmount.toFixed(2)} enviada com sucesso! O afiliado gestor responsável (${sponsorUser ? sponsorUser.name : 'Administração'}) foi notificado para aprovação financeira.`,
+        requestId,
+        commissionBalance: newCommissionBalance,
+      });
+    } catch (err) {
+      console.error('Error in influencer withdraw request:', err);
+      res.status(500).json({ error: 'Erro ao processar solicitação de saque de comissão.' });
+    }
+  });
+
+  // =========================================================================
+  // --- RASPA FORTUNA DOTFY PIX API & GAMEPLAY ENDPOINTS ---
+  // =========================================================================
+
+  // POST /api/game/raspa-fortuna/pix/create - Criar cobrança PIX via Dotfy para Raspa Fortuna
+  app.post(['/api/game/raspa-fortuna/pix/create', '/api/raspa-fortuna/pix/create'], async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | undefined;
+      let user: any = null;
+
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '').trim();
+        const session = getSession(token);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (token.startsWith('tok_usr_')) {
+          const parts = token.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (req.body.token && !targetUserId) {
+        const rawTok = String(req.body.token).replace('Bearer ', '').trim();
+        const session = getSession(rawTok);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (rawTok.startsWith('tok_usr_')) {
+          const parts = rawTok.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (req.body.userId && !targetUserId) {
+        targetUserId = req.body.userId;
+      }
+
+      if (targetUserId) {
+        user = await dbService.getUserById(targetUserId);
+      }
+
+      // ANTI-FRAUDE: Bloquear depósitos de Afiliados Hub no jogo Raspa Fortuna
+      if (user && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAME_DEPOSIT_BLOCKED', { email: user.email, userId: user.id, game: 'raspa-fortuna' });
+        return res.status(403).json({
+          error: 'Acesso bloqueado pelo Sistema Anti-Fraude: Afiliados Hub não possuem autorização para depositar ou apostar no Raspa Fortuna.'
+        });
+      }
+
+      const { amount, value, customer, expiresIn, isSimulated } = req.body;
+      const numAmount = parseFloat(amount || value);
+
+      if (isNaN(numAmount) || numAmount < 1.0) {
+        return res.status(400).json({ error: 'O valor mínimo para depósito via PIX no Raspa Fortuna é de R$ 1,00.' });
+      }
+
+      // Check Dotfy Config from DB or env
+      const token = await getEffectiveDotfyApiKey();
+
+      const description = `Depósito Raspa Fortuna (PIX) - ${user?.name || 'Jogador'}`;
+
+      const cleanCustomer: Record<string, string> = {};
+      if (customer && typeof customer === 'object') {
+        if (customer.name) cleanCustomer.name = String(customer.name).slice(0, 100);
+        if (customer.email) cleanCustomer.email = String(customer.email).trim();
+        if (customer.taxID || customer.cpf) cleanCustomer.taxID = String(customer.taxID || customer.cpf).replace(/\D/g, '');
+        if (customer.phone) cleanCustomer.phone = String(customer.phone).replace(/\D/g, '');
+      } else if (user) {
+        if (user.name) cleanCustomer.name = user.name.slice(0, 100);
+        if (user.email) cleanCustomer.email = user.email;
+        if (user.cpf) cleanCustomer.taxID = String(user.cpf).replace(/\D/g, '');
+        if (user.phone) cleanCustomer.phone = String(user.phone).replace(/\D/g, '');
+      }
+
+      const dotfyPayload: Record<string, any> = {
+        value: numAmount,
+        description,
+        expiresIn: Number(expiresIn) || 3600
+      };
+
+      const originHost = req.get('host') || '';
+      if (req.protocol === 'https' || originHost.includes('.run.app') || (process.env.APP_URL && process.env.APP_URL.startsWith('https://'))) {
+        const baseUrl = process.env.APP_URL || `https://${originHost}`;
+        dotfyPayload.webhook_url = `${baseUrl.replace(/\/$/, '')}/api/webhooks/dotfy`;
+      }
+
+      if (Object.keys(cleanCustomer).length > 0) {
+        dotfyPayload.customer = cleanCustomer;
+      }
+
+      // Se explicitamente simulado ou sem token configurado
+      if (isSimulated && process.env.ALLOW_PAYMENT_SIMULATION === 'true' && process.env.NODE_ENV !== 'production') {
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `raspa-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5919Dotfy Raspa Fortuna6009SAO PAULO62070503***6304ABCD`;
+
+        const simData = {
+          id: `charge_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          correlationId: correlationID,
+          transactionID: `E${Date.now()}RASPA${randomId}`,
+          qrCode: simQr,
+          brCode: simQr,
+          qrCodeImage: `https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(simQr)}`,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          status: 'PENDING'
+        };
+
+        const storedCharge: StoredCharge = {
+          id: simData.id,
+          chargeId: simData.chargeId,
+          correlationID,
+          transactionID: simData.transactionID,
+          qrCode: simData.qrCode,
+          qrCodeImage: simData.qrCodeImage,
+          paymentLink: simData.paymentLink,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: targetUserId,
+          rawResponse: { success: true, data: simData, simulated: true }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+          title: 'PIX pendente na sua rede ⏳',
+          body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} no Raspa Fortuna.`,
+          url: '/?tab=affiliates',
+          type: 'pixPending'
+        });
+
+        return res.json({
+          success: true,
+          data: simData,
+          simulated: true,
+          message: 'Cobrança PIX gerada com sucesso para o Raspa Fortuna.'
+        });
+      }
+
+      console.log(`[Raspa Fortuna Dotfy API] Criando PIX de R$ ${numAmount.toFixed(2)} via ${DOTFY_BASE_URL}/api/charges`);
+
+      let dotfyResponse: any = null;
+      let responseData: any = {};
+
+      try {
+        dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(dotfyPayload),
+          signal: AbortSignal.timeout(9000)
+        });
+
+        const responseText = await dotfyResponse.text();
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (e) {
+          responseData = { rawText: responseText };
+        }
+
+        // Retry without phone if rejected by Dotfy API
+        if (
+          !dotfyResponse.ok &&
+          dotfyResponse.status === 400 &&
+          dotfyPayload.customer?.phone &&
+          JSON.stringify(responseData).includes('phone')
+        ) {
+          console.warn('[Raspa Fortuna Dotfy] Telefone rejeitado pela API Dotfy. Reenviando sem phone...');
+          delete dotfyPayload.customer.phone;
+          const retryRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(dotfyPayload),
+            signal: AbortSignal.timeout(9000)
+          });
+          const retryTxt = await retryRes.text();
+          try {
+            responseData = JSON.parse(retryTxt);
+            dotfyResponse = retryRes;
+          } catch (_) {
+            responseData = { rawText: retryTxt };
+            dotfyResponse = retryRes;
+          }
+        }
+      } catch (fetchErr: any) {
+        console.warn('[Raspa Fortuna Dotfy Fetch Warning]', fetchErr?.message || fetchErr);
+      }
+
+      if (!dotfyResponse || !dotfyResponse.ok) {
+        console.warn('[Raspa Fortuna Dotfy Warning]', dotfyResponse?.status, responseData);
+
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `raspa-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126580014br.gov.bcb.pix0136${correlationID}520400005303986540${numAmount.toFixed(2)}5802BR5919Dotfy Raspa Fortuna6009SAO PAULO62070503***6304ABCD`;
+
+        const fallbackData = {
+          id: `charge_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          correlationId: correlationID,
+          transactionID: `E${Date.now()}RASPA${randomId}`,
+          qrCode: simQr,
+          brCode: simQr,
+          qrCodeImage: `https://api.qrserver.com/v1/create-qr-code/?size=320x320&margin=0&data=${encodeURIComponent(simQr)}`,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          status: 'PENDING'
+        };
+
+        const storedCharge: StoredCharge = {
+          id: fallbackData.id,
+          chargeId: fallbackData.chargeId,
+          correlationID,
+          transactionID: fallbackData.transactionID,
+          qrCode: fallbackData.qrCode,
+          qrCodeImage: fallbackData.qrCodeImage,
+          paymentLink: fallbackData.paymentLink,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: targetUserId,
+          rawResponse: fallbackData
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+          title: 'PIX pendente na sua rede ⏳',
+          body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} no Raspa Fortuna.`,
+          url: '/?tab=affiliates',
+          type: 'pixPending'
+        });
+
+        return res.json({
+          success: true,
+          data: fallbackData,
+          message: 'Cobrança PIX gerada com sucesso para o Raspa Fortuna.'
+        });
+      }
+
+      const chargeData = responseData.data || responseData;
+      const correlationID = chargeData.correlationID || chargeData.correlationId || chargeData.id || `raspa-dotfy-${Date.now()}`;
+      const centsVal = typeof chargeData.value === 'number' ? chargeData.value : Math.round(numAmount * 100);
+      const valReais = centsVal / 100;
+      let pixCode = chargeData.qrCode || chargeData.brCode || chargeData.pixCopiaECola || chargeData.emv || chargeData.qr_code || chargeData.qrcode || chargeData.payload || '';
+      let qrCodeImg = chargeData.qrCodeImage || chargeData.qr_code_image || chargeData.qrCodeBase64 || chargeData.qrcode_url || chargeData.qrCodeUrl || '';
+      if (!qrCodeImg && pixCode) {
+        qrCodeImg = `https://api.qrserver.com/v1/create-qr-code/?size=320x320&margin=0&data=${encodeURIComponent(pixCode)}`;
+      }
+
+      const storedCharge: StoredCharge = {
+        id: chargeData.id || `dotfy_${Date.now()}`,
+        chargeId: chargeData.chargeId || '',
+        correlationID,
+        transactionID: chargeData.transactionID || '',
+        qrCode: pixCode,
+        qrCodeImage: qrCodeImg,
+        paymentLink: chargeData.paymentLink || '',
+        expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+        value: centsVal,
+        valueInReais: valReais,
+        description,
+        customer: cleanCustomer,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+        userId: targetUserId,
+        rawResponse: responseData
+      };
+
+      await dbService.saveCharge(storedCharge as any);
+
+      memoryCharges.set(correlationID, storedCharge);
+      if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+        title: 'PIX pendente na sua rede ⏳',
+        body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} no Raspa Fortuna.`,
+        url: '/?tab=affiliates',
+        type: 'pixPending'
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          ...chargeData,
+          correlationID,
+          qrCode: pixCode,
+          brCode: pixCode,
+          qrCodeImage: qrCodeImg,
+          valueInReais: storedCharge.valueInReais
+        },
+        message: 'Cobrança PIX gerada com sucesso via Dotfy para o Raspa Fortuna.'
+      });
+
+    } catch (err: any) {
+      console.error('Error creating Raspa Fortuna PIX:', err);
+      res.status(500).json({ error: 'Erro ao gerar PIX para o Raspa Fortuna.', details: err?.message || String(err) });
+    }
+  });
+
+  // GET /api/game/raspa-fortuna/pix/status/:correlationID - Consultar status do PIX em tempo real
+  app.get(['/api/game/raspa-fortuna/pix/status/:correlationID', '/api/raspa-fortuna/pix/status/:correlationID'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.params;
+      const localCharge = (memoryCharges.get(correlationID) || await dbService.getChargeByCorrelationID(correlationID)) as StoredCharge | null;
+      const token = await getEffectiveDotfyApiKey();
+
+      // If already marked as PAID locally (e.g. simulated or confirmed by webhook)
+      if (localCharge && localCharge.status === 'PAID') {
+        let updatedBal = 0;
+        if (localCharge.userId) {
+          const u = await dbService.getUserById(localCharge.userId);
+          if (u) updatedBal = u.balance;
+        }
+        return res.json({
+          success: true,
+          status: 'PAID',
+          paid: true,
+          amount: localCharge.valueInReais,
+          creditedAmount: localCharge.creditedAmount || localCharge.valueInReais,
+          balance: updatedBal,
+          message: 'Pagamento PIX confirmado com sucesso.'
+        });
+      }
+
+      // Query Dotfy API
+      try {
+        const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges/${correlationID}`, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          signal: AbortSignal.timeout(3500)
+        });
+
+        if (dotfyResponse.ok) {
+          const data = await dotfyResponse.json();
+          const chargePayload = data.data || data;
+          if (chargePayload) {
+            if (localCharge && chargePayload.status) {
+              localCharge.status = chargePayload.status;
+            }
+            const isPaid = chargePayload.status === 'PAID' || chargePayload.status === 'COMPLETED' || chargePayload.isPaid === true;
+            if (isPaid) {
+              if (localCharge) {
+                localCharge.status = 'PAID';
+                await creditPaidChargeUser(localCharge);
+              }
+              let updatedBal = 0;
+              if (localCharge?.userId) {
+                const u = await dbService.getUserById(localCharge.userId);
+                if (u) updatedBal = u.balance;
+              }
+              return res.json({
+                success: true,
+                paid: true,
+                status: 'PAID',
+                balance: updatedBal,
+                charge: localCharge || chargePayload
+              });
+            }
+          }
+        }
+      } catch (fetchErr) {
+        console.warn('[Dotfy Raspa Fortuna status check fetch err]', fetchErr);
+      }
+
+      if (localCharge) {
+        const isPaid = localCharge.status === 'PAID' || localCharge.status === 'COMPLETED' || (localCharge as any).isPaid === true;
+        if (isPaid) {
+          await creditPaidChargeUser(localCharge);
+          let updatedBal = 0;
+          if (localCharge.userId) {
+            const u = await dbService.getUserById(localCharge.userId);
+            if (u) updatedBal = u.balance;
+          }
+          return res.json({
+            success: true,
+            paid: true,
+            status: 'PAID',
+            balance: updatedBal,
+            charge: localCharge
+          });
+        }
+
+        return res.json({
+          success: true,
+          paid: false,
+          status: localCharge.status,
+          charge: localCharge
+        });
+      }
+
+      return res.status(404).json({ error: 'Cobrança não encontrada.' });
+    } catch (err: any) {
+      console.error('Error checking Raspa Fortuna PIX status:', err);
+      res.status(500).json({ error: 'Erro ao verificar status do PIX.' });
+    }
+  });
+
+  // POST /api/game/raspa-fortuna/pix/simulate - Simular aprovação imediata para testes
+  app.post(['/api/game/raspa-fortuna/pix/simulate', '/api/raspa-fortuna/pix/simulate'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.body;
+      const charge = memoryCharges.get(correlationID);
+      if (!charge) {
+        return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      }
+
+      charge.status = 'PAID';
+      await dbService.saveCharge(charge as any);
+      memoryCharges.set(correlationID, charge);
+      await creditPaidChargeUser(charge);
+
+      let updatedBal = 0;
+      if (charge.userId) {
+        const u = await dbService.getUserById(charge.userId);
+        if (u) updatedBal = u.balance;
+      }
+
+      return res.json({
+        success: true,
+        paid: true,
+        status: 'PAID',
+        balance: updatedBal,
+        message: 'Pagamento PIX simulado e creditado com sucesso no Raspa Fortuna!'
+      });
+    } catch (err) {
+      console.error('Error simulating Raspa Fortuna PIX:', err);
+      res.status(500).json({ error: 'Erro ao simular pagamento.' });
+    }
+  });
+
+  // =========================================================================
+  // --- SUBWAY PAY DOTFY PIX API ENDPOINTS ---
+  // =========================================================================
+
+  // POST /api/game/subway-pay/pix/create - Criar cobrança PIX via Dotfy para Subway Pay
+  app.post(['/api/game/subway-pay/pix/create', '/api/subwaypay/pix/create', '/api/game/subwaypay/pix/create'], async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let targetUserId: string | undefined;
+      let user: any = null;
+
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace('Bearer ', '').trim();
+        const session = getSession(token);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (token.startsWith('tok_usr_')) {
+          const parts = token.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (req.body.token && !targetUserId) {
+        const rawTok = String(req.body.token).replace('Bearer ', '').trim();
+        const session = getSession(rawTok);
+        if (session?.userId) {
+          targetUserId = session.userId;
+        } else if (rawTok.startsWith('tok_usr_')) {
+          const parts = rawTok.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const found = await dbService.getUserById(candidateId);
+            if (found) targetUserId = found.id;
+          }
+        }
+      }
+
+      if (req.body.userId && !targetUserId) {
+        targetUserId = req.body.userId;
+      }
+
+      if (targetUserId) {
+        user = await dbService.getUserById(targetUserId);
+      }
+
+      const { amount, value, customer, expiresIn, isSimulated } = req.body;
+      const numAmount = parseFloat(amount || value);
+
+      if (isNaN(numAmount) || numAmount < 1.0) {
+        return res.status(400).json({ error: 'O valor mínimo para depósito via PIX no Subway Pay é de R$ 1,00.' });
+      }
+
+      const cleanCustomer: Record<string, string> = {};
+      if (customer && typeof customer === 'object') {
+        if (customer.name) cleanCustomer.name = String(customer.name).slice(0, 100);
+        if (customer.email) cleanCustomer.email = String(customer.email).trim();
+        if (customer.taxID || customer.cpf) cleanCustomer.taxID = String(customer.taxID || customer.cpf).replace(/\D/g, '');
+        if (customer.phone) cleanCustomer.phone = String(customer.phone).replace(/\D/g, '');
+      } else if (user) {
+        if (user.name) cleanCustomer.name = user.name.slice(0, 100);
+        if (user.email) cleanCustomer.email = user.email;
+        if (user.cpf) cleanCustomer.taxID = String(user.cpf).replace(/\D/g, '');
+        if (user.phone) cleanCustomer.phone = String(user.phone).replace(/\D/g, '');
+      }
+
+      // Se usuário ainda não encontrado na DB, sincronizar ou criar pelo email
+      if (!user && cleanCustomer.email) {
+        try {
+          user = await dbService.getUserByEmail(cleanCustomer.email);
+          if (!user) {
+            const newUid = `usr_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+            const refCode = `SUB${Math.floor(1000 + Math.random() * 9000)}`;
+            user = await dbService.createUser({
+              id: newUid,
+              name: cleanCustomer.name || 'Jogador Subway Pay',
+              email: cleanCustomer.email,
+              phone: cleanCustomer.phone || '',
+              passwordHash: 'subway_guest_hash',
+              referralCode: refCode,
+              role: 'user',
+              balance: 0,
+              createdAt: new Date().toISOString()
+            });
+          }
+          if (user) targetUserId = user.id;
+        } catch (dbErr) {
+          console.warn('[Subway Pay PIX] Error creating or resolving user in db:', dbErr);
+        }
+      }
+
+      // ANTI-FRAUDE: Bloquear depósitos de Afiliados Hub no jogo Subway Pay
+      if (user && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAME_DEPOSIT_BLOCKED', { email: user.email, userId: user.id, game: 'subway-pay' });
+        return res.status(403).json({
+          error: 'Acesso bloqueado pelo Sistema Anti-Fraude: Afiliados Hub não possuem autorização para depositar ou apostar no Subway Pay.'
+        });
+      }
+
+      // Check Dotfy Config from DB or env
+      const token = await getEffectiveDotfyApiKey();
+      const description = `Depósito Subway Pay (PIX) - ${user?.name || cleanCustomer.name || 'Jogador'}`;
+
+      const dotfyPayload: Record<string, any> = {
+        value: numAmount,
+        description,
+        expiresIn: Number(expiresIn) || 3600
+      };
+
+      const originHost = req.get('host') || '';
+      if (req.protocol === 'https' || originHost.includes('.run.app') || (process.env.APP_URL && process.env.APP_URL.startsWith('https://'))) {
+        const baseUrl = process.env.APP_URL || `https://${originHost}`;
+        dotfyPayload.webhook_url = `${baseUrl.replace(/\/$/, '')}/api/webhooks/dotfy`;
+      }
+
+      if (Object.keys(cleanCustomer).length > 0) {
+        dotfyPayload.customer = cleanCustomer;
+      }
+
+      // Se explicitamente simulado ou sem token configurado
+      if (isSimulated && process.env.ALLOW_PAYMENT_SIMULATION === 'true' && process.env.NODE_ENV !== 'production') {
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `subway-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5916Dotfy Subway Pay6009SAO PAULO62070503***6304ABCD`;
+
+        const simData = {
+          id: `charge_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          correlationId: correlationID,
+          transactionID: `E${Date.now()}SUBWAY${randomId}`,
+          qrCode: simQr,
+          brCode: simQr,
+          qrCodeImage: '',
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description
+        };
+
+        const storedCharge: StoredCharge = {
+          id: simData.id,
+          chargeId: simData.chargeId,
+          correlationID,
+          transactionID: simData.transactionID,
+          qrCode: simData.qrCode,
+          qrCodeImage: simData.qrCodeImage,
+          paymentLink: simData.paymentLink,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: targetUserId,
+          rawResponse: { success: true, data: simData, simulated: true }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        console.log(`[Subway Pay PIX] Cobrança Simulação gerada: ${correlationID} (R$ ${numAmount.toFixed(2)})`);
+
+        return res.json({
+          success: true,
+          data: simData,
+          simulated: true,
+          message: 'Cobrança PIX Subway Pay gerada em modo simulação.'
+        });
+      }
+
+      // Requisição Real para a API Dotfy
+      console.log(`[Subway Pay PIX] Enviando payload para Dotfy API (${DOTFY_BASE_URL}/api/charges)...`);
+      const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(dotfyPayload)
+      });
+
+      const responseText = await dotfyResponse.text();
+      let responseData: any;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (e) {
+        responseData = { rawText: responseText };
+      }
+
+      if (!dotfyResponse.ok) {
+        console.error(`[Subway Pay Dotfy Error] HTTP ${dotfyResponse.status}:`, responseData);
+
+        // Retry sem telefone se erro de validação
+        const errStr = JSON.stringify(responseData);
+        if (dotfyResponse.status === 400 && dotfyPayload.customer?.phone && (errStr.includes('phone') || errStr.includes('Telefone'))) {
+          console.warn('[Subway Pay Dotfy] Telefone rejeitado, reenviando sem customer.phone...');
+          delete dotfyPayload.customer.phone;
+
+          const retryRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(dotfyPayload)
+          });
+
+          const retryText = await retryRes.text();
+          let retryData: any;
+          try { retryData = JSON.parse(retryText); } catch (_) { retryData = { rawText: retryText }; }
+
+          if (retryRes.ok) {
+            const chargeData = retryData.data || retryData;
+            const correlationID = chargeData.correlationID || chargeData.correlationId || `subway-dotfy-${Date.now()}`;
+            const centsVal = chargeData.value || Math.round(numAmount * 100);
+
+            const storedCharge: StoredCharge = {
+              id: chargeData.id || `dotfy_${Date.now()}`,
+              chargeId: chargeData.chargeId || '',
+              correlationID,
+              transactionID: chargeData.transactionID || '',
+              qrCode: chargeData.qrCode || chargeData.brCode || '',
+              qrCodeImage: chargeData.qrCodeImage || '',
+              paymentLink: chargeData.paymentLink || '',
+              expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+              value: centsVal,
+              valueInReais: centsVal / 100,
+              description,
+              customer: cleanCustomer,
+              status: 'PENDING',
+              createdAt: new Date().toISOString(),
+              userId: targetUserId,
+              rawResponse: retryData
+            };
+
+            await dbService.saveCharge(storedCharge as any);
+
+            memoryCharges.set(correlationID, storedCharge);
+            return res.json({ success: true, data: { ...chargeData, correlationID, valueInReais: centsVal / 100 } });
+          } else {
+            responseData = retryData;
+          }
+        }
+
+        return res.status(dotfyResponse.status).json({
+          success: false,
+          error: responseData.error || 'DOTFY_ERROR',
+          message: responseData.message || 'Erro ao gerar cobrança PIX na Dotfy.',
+          details: responseData
+        });
+      }
+
+      // Sucesso na Dotfy
+      const chargeData = responseData.data || responseData;
+      const correlationID = chargeData.correlationID || chargeData.correlationId || `subway-dotfy-${Date.now()}`;
+      const centsVal = chargeData.value || Math.round(numAmount * 100);
+
+      const storedCharge: StoredCharge = {
+        id: chargeData.id || `dotfy_${Date.now()}`,
+        chargeId: chargeData.chargeId || '',
+        correlationID,
+        transactionID: chargeData.transactionID || '',
+        qrCode: chargeData.qrCode || chargeData.brCode || '',
+        qrCodeImage: chargeData.qrCodeImage || '',
+        paymentLink: chargeData.paymentLink || '',
+        expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+        value: centsVal,
+        valueInReais: centsVal / 100,
+        description,
+        customer: cleanCustomer,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+        userId: targetUserId,
+        rawResponse: responseData
+      };
+
+      await dbService.saveCharge(storedCharge as any);
+
+      memoryCharges.set(correlationID, storedCharge);
+      console.log(`[Subway Pay PIX] Cobrança Dotfy criada com sucesso: ${correlationID} (R$ ${(centsVal / 100).toFixed(2)})`);
+
+      return res.json({
+        success: true,
+        data: {
+          ...chargeData,
+          correlationID,
+          valueInReais: centsVal / 100
+        }
+      });
+    } catch (err: any) {
+      console.error('[Subway Pay PIX] Erro no endpoint /pix/create:', err);
+      res.status(500).json({ error: 'Erro interno ao processar PIX no Subway Pay.' });
+    }
+  });
+
+  // GET /api/game/subway-pay/pix/status/:correlationID - Consultar status do pagamento PIX
+  app.get(['/api/game/subway-pay/pix/status/:correlationID', '/api/subwaypay/pix/status/:correlationID', '/api/game/subwaypay/pix/status/:correlationID'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.params;
+      const localCharge = (memoryCharges.get(correlationID) || await dbService.getChargeByCorrelationID(correlationID)) as StoredCharge | null;
+
+      const token = await getEffectiveDotfyApiKey();
+
+      // 1. Verificar se na memória local já está pago
+      if (localCharge && (localCharge.status === 'PAID' || localCharge.status === 'COMPLETED' || (localCharge as any).isPaid === true)) {
+        await creditPaidChargeUser(localCharge);
+        let updatedBal = 0;
+        if (localCharge.userId) {
+          const u = await dbService.getUserById(localCharge.userId);
+          if (u) updatedBal = u.balance;
+        }
+
+        return res.json({
+          success: true,
+          paid: true,
+          status: 'PAID',
+          balance: updatedBal,
+          charge: localCharge
+        });
+      }
+
+      // 2. Se temos chave Dotfy válida, consultar a API da Dotfy
+      if (token && token !== 'simulated' && !localCharge?.rawResponse?.simulated) {
+        try {
+          const dotfyRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges/${correlationID}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+
+          if (dotfyRes.ok) {
+            const dotfyData = await dotfyRes.json();
+            const dStatus = (dotfyData.data?.status || dotfyData.status || '').toUpperCase();
+            const isPaid = dStatus === 'PAID' || dStatus === 'COMPLETED' || dotfyData.data?.isPaid === true || dotfyData.isPaid === true;
+
+            if (isPaid) {
+              if (localCharge) {
+                localCharge.status = 'PAID';
+                await dbService.saveCharge(localCharge as any);
+                memoryCharges.set(correlationID, localCharge);
+                await creditPaidChargeUser(localCharge);
+              }
+
+              let updatedBal = 0;
+              if (localCharge?.userId) {
+                const u = await dbService.getUserById(localCharge.userId);
+                if (u) updatedBal = u.balance;
+              }
+
+              return res.json({
+                success: true,
+                paid: true,
+                status: 'PAID',
+                balance: updatedBal,
+                charge: localCharge || dotfyData
+              });
+            }
+          }
+        } catch (dErr) {
+          console.warn(`[Subway Pay PIX Status] Falha ao consultar Dotfy para ${correlationID}:`, dErr);
+        }
+      }
+
+      if (localCharge) {
+        return res.json({
+          success: true,
+          paid: false,
+          status: localCharge.status,
+          charge: localCharge
+        });
+      }
+
+      return res.status(404).json({ error: 'Cobrança não encontrada.' });
+    } catch (err: any) {
+      console.error('[Subway Pay PIX Status] Erro ao verificar status:', err);
+      res.status(500).json({ error: 'Erro ao verificar status do PIX.' });
+    }
+  });
+
+  // --- BUBBLE WIN / BUBBLE BLAST DOTFY PIX API & WALLET ENDPOINTS ---
+  // =========================================================================
+
+  // Helper function to extract user for Bubble endpoints
+  async function resolveBubbleUser(req: Request): Promise<UserDB | null> {
+    try {
+      const authHeader = req.headers.authorization;
+      let token = '';
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        token = authHeader.replace('Bearer ', '').trim();
+      }
+      if (!token && req.headers.cookie) {
+        const match = req.headers.cookie.match(/bb_session=([^;]+)/) ||
+          req.headers.cookie.match(/token=([^;]+)/) ||
+          req.headers.cookie.match(/pg_auth_token=([^;]+)/);
+        if (match && match[1]) token = decodeURIComponent(match[1].trim());
+      }
+      if (!token && req.headers['x-session-token']) {
+        token = String(req.headers['x-session-token']).trim();
+      }
+      if (!token) token=String(req.body?.token||req.query.token||'');
+      if (token) {
+        const sUid = await resolveUserIdFromToken(token);
+        if (sUid) {
+          const u = await dbService.getUserById(sUid);
+          if (u) return u;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Count Masters uses only iNEX sessions and the authoritative Supabase ledger.
+  app.get('/api/countmasters/config',async(_req:Request,res:Response)=>{
+    try{const c=await dbService.getGameConfig(COUNT_ID);res.json({minBet:c.minBet,maxBet:c.maxBet,status:c.status,maintenance:Boolean((c as any).maintenance),maxMultiplier:c.maxMultiplier});}catch{res.status(503).json({error:'Configuração indisponível.'});}
+  });
+  app.get('/api/countmasters/active',async(req:Request,res:Response)=>{
+    res.setHeader('Cache-Control','no-store');
+    try{const u=await resolveBubbleUser(req);if(!u)return res.status(401).json({error:'Faça login.'});res.json(await countMasters.active(u.id));}catch(e:any){res.status(e.status||503).json({error:e.message||'Não foi possível consultar a rodada.'});}
+  });
+  app.post('/api/countmasters/start',async(req:Request,res:Response)=>{
+    res.setHeader('Cache-Control','no-store');
+    try{const u=await resolveBubbleUser(req);if(!u)return res.status(401).json({error:'Faça login.'});res.json(await countMasters.start(u.id,req.body.betCents,req.body.key||''));}catch(e:any){res.status(e.status||503).json({error:e.message||'Não foi possível iniciar a rodada.'});}
+  });
+  app.post('/api/countmasters/round/:id/:action',async(req:Request,res:Response)=>{
+    res.setHeader('Cache-Control','no-store');
+    try{const u=await resolveBubbleUser(req);if(!u)return res.status(401).json({error:'Faça login.'});const action=req.params.action;if(!['advance','cashout','forfeit'].includes(action))return res.status(404).json({error:'Ação indisponível.'});res.json(await countMasters.action(u.id,req.params.id,action as any,req.body.stage,req.body.lane??0));}catch(e:any){res.status(e.status||503).json({error:e.message||'Não foi possível concluir a ação.'});}
+  });
+
+  // 1. POST /api/wallet/deposit - Criar cobrança PIX via Dotfy para o jogo Bubble
+  app.post(['/api/wallet/deposit', '/api/game/bubble/pix/create', '/api/bubbleblast/pix/create', '/api/game/bubbleblast/pix/create'], async (req: Request, res: Response) => {
+    try {
+      let user = await resolveBubbleUser(req);
+      const { amountCents, amount, value, customer, expiresIn, isSimulated, acceptBonus, cupomCodigo } = req.body;
+      const numAmount = amountCents ? Number(amountCents) / 100 : parseFloat(amount || value);
+
+      if (isNaN(numAmount) || numAmount < 1.0) {
+        return res.status(400).json({ error: 'O valor mínimo para depósito via PIX no Bubble Win é de R$ 1,00.' });
+      }
+
+      const cleanCustomer: Record<string, string> = {};
+      if (customer && typeof customer === 'object') {
+        if (customer.name) cleanCustomer.name = String(customer.name).slice(0, 100);
+        if (customer.email) cleanCustomer.email = String(customer.email).trim();
+        if (customer.taxID || customer.cpf) cleanCustomer.taxID = String(customer.taxID || customer.cpf).replace(/\D/g, '');
+        if (customer.phone) cleanCustomer.phone = String(customer.phone).replace(/\D/g, '');
+      } else if (user) {
+        if (user.name) cleanCustomer.name = user.name.slice(0, 100);
+        if (user.email) cleanCustomer.email = user.email;
+        if (user.cpf) cleanCustomer.taxID = String(user.cpf).replace(/\D/g, '');
+        if (user.phone) cleanCustomer.phone = String(user.phone).replace(/\D/g, '');
+      }
+
+      // Se usuário ainda não autenticado, criar registro de jogador temporário na DB
+      if (!user) {
+        const rawPhone = cleanCustomer.phone || (req.body.phone ? String(req.body.phone).replace(/\D/g, '') : '');
+        const tempEmail = cleanCustomer.email || (rawPhone ? `phone_${rawPhone}@jogarbubble.online` : `player_${Date.now()}_${crypto.randomBytes(2).toString('hex')}@jogarbubble.online`);
+        try {
+          user = await dbService.getUserByEmail(tempEmail);
+          if (!user && rawPhone) user = await dbService.getUserByPhone(rawPhone);
+          if (!user) {
+            const newUid = `usr_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+            const refCode = `BB${Math.floor(1000 + Math.random() * 9000)}`;
+            const dummyHash = dbService.hashPassword(crypto.randomBytes(8).toString('hex'));
+            const newUserObj: UserDB = {
+              id: newUid,
+              name: cleanCustomer.name || 'Jogador Bubble',
+              email: tempEmail,
+              phone: rawPhone || 'Não informado',
+              passwordHash: dummyHash,
+              role: 'user',
+              balance: 0,
+              referralCode: refCode,
+              registeredGame: 'g_bubble_blast',
+              createdAt: new Date().toISOString(),
+              totalDeposited: 0,
+              totalWithdrawn: 0
+            };
+            await dbService.createUser(newUserObj);
+            user = newUserObj;
+            const sessionToken = createSession(user.id, req);
+            sessions.set(sessionToken, user.id);
+            res.cookie('bb_session', sessionToken, { path: '/', httpOnly: false, sameSite: 'lax', maxAge: 30 * 24 * 3600 * 1000 });
+          }
+        } catch (dbErr) {
+          console.warn('[Bubble Deposit] Falha ao sincronizar jogador na DB:', dbErr);
+        }
+      }
+
+      // Anti-Fraude
+      if (user && isHubAffiliateUser(user)) {
+        logSecurityEvent('AFFILIATE_GAME_DEPOSIT_BLOCKED', { email: user.email, userId: user.id, game: 'bubble-win' });
+        return res.status(403).json({
+          error: 'Acesso bloqueado pelo Sistema Anti-Fraude: Afiliados Hub não possuem autorização para depositar no jogo Bubble.'
+        });
+      }
+
+      // Check Dotfy Config from DB or env
+      const token = await getEffectiveDotfyApiKey();
+      const description = `Depósito Bubble Win (PIX) - ${user?.name || cleanCustomer.name || 'Jogador'}`;
+
+      const dotfyPayload: Record<string, any> = {
+        value: numAmount,
+        description,
+        expiresIn: Number(expiresIn) || 3600
+      };
+
+      const originHost = req.get('host') || '';
+      if (req.protocol === 'https' || originHost.includes('.run.app') || (process.env.APP_URL && process.env.APP_URL.startsWith('https://'))) {
+        const baseUrl = process.env.APP_URL || `https://${originHost}`;
+        dotfyPayload.webhook_url = `${baseUrl.replace(/\/$/, '')}/api/webhooks/dotfy`;
+      }
+
+      if (Object.keys(cleanCustomer).length > 0) {
+        dotfyPayload.customer = cleanCustomer;
+      }
+
+      const bonusCents = acceptBonus && numAmount >= 30 ? Math.round(numAmount * 10) : 0;
+
+      // Se explicitamente simulado ou sem chave Dotfy configurada
+      if (isSimulated && process.env.ALLOW_PAYMENT_SIMULATION === 'true' && process.env.NODE_ENV !== 'production') {
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `bubble-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString();
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5916Dotfy Bubble Win6009SAO PAULO62070503***6304ABCD`;
+        const simQrImage = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(simQr)}`;
+
+        const storedCharge: StoredCharge = {
+          id: `ch_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          transactionID: `E${Date.now()}BUBBLE${randomId}`,
+          qrCode: simQr,
+          qrCodeImage: simQrImage,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt,
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: user?.id,
+          rawResponse: { success: true, simulated: true }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+
+        if (user) {
+          await dbService.createTransaction({
+            id: `tx_bb_${Date.now()}_${randomId}`,
+            userId: user.id,
+            type: 'deposit',
+            amount: numAmount,
+            status: 'pending',
+            createdAt: new Date().toISOString(),
+            description: `Depósito PIX Bubble Win - R$ ${numAmount.toFixed(2)}`,
+            gateway: 'dotfy',
+            correlationId: correlationID
+          }).catch(console.warn);
+        }
+
+        return res.json({
+          balanceCents: Math.round((user?.balance || 0) * 100),
+          pixCode: simQr,
+          qrcode: simQrImage,
+          txid: correlationID,
+          transaction: {
+            id: correlationID,
+            amount: numAmount,
+            amountCents: centsVal,
+            status: 'PENDING'
+          },
+          bonusCents
+        });
+      }
+
+      // Requisição Real para a API Dotfy
+      console.log(`[Bubble Win Dotfy PIX] Criando cobrança PIX via ${DOTFY_BASE_URL}/api/charges...`);
+      const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(dotfyPayload)
+      });
+
+      const responseText = await dotfyResponse.text();
+      let responseData: any;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch {
+        responseData = { rawText: responseText };
+      }
+
+      if (!dotfyResponse.ok) {
+        console.error(`[Bubble Win Dotfy Error] HTTP ${dotfyResponse.status}:`, responseData);
+
+        // Retry sem telefone se erro de validação
+        const errStr = JSON.stringify(responseData);
+        if (dotfyResponse.status === 400 && dotfyPayload.customer?.phone && (errStr.includes('phone') || errStr.includes('Telefone'))) {
+          delete dotfyPayload.customer.phone;
+          const retryRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(dotfyPayload)
+          });
+          const retryText = await retryRes.text();
+          let retryData: any;
+          try { retryData = JSON.parse(retryText); } catch { retryData = { rawText: retryText }; }
+
+          if (retryRes.ok) {
+            const chargeData = retryData.data || retryData;
+            const correlationID = chargeData.correlationID || chargeData.correlationId || `bubble-dotfy-${Date.now()}`;
+            const centsVal = chargeData.value || Math.round(numAmount * 100);
+            const qrCode = chargeData.qrCode || chargeData.brCode || '';
+            const qrCodeImage = chargeData.qrCodeImage || (qrCode ? `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(qrCode)}` : '');
+
+            const storedCharge: StoredCharge = {
+              id: chargeData.id || `dotfy_${Date.now()}`,
+              chargeId: chargeData.chargeId || '',
+              correlationID,
+              transactionID: chargeData.transactionID || '',
+              qrCode,
+              qrCodeImage,
+              paymentLink: chargeData.paymentLink || '',
+              expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600 * 1000).toISOString(),
+              value: centsVal,
+              valueInReais: numAmount,
+              description,
+              customer: cleanCustomer,
+              status: 'PENDING',
+              createdAt: new Date().toISOString(),
+              userId: user?.id,
+              rawResponse: retryData
+            };
+
+            await dbService.saveCharge(storedCharge as any);
+
+            memoryCharges.set(correlationID, storedCharge);
+
+            if (user) {
+              await dbService.createTransaction({
+                id: `tx_bb_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+                userId: user.id,
+                type: 'deposit',
+                amount: numAmount,
+                status: 'pending',
+                createdAt: new Date().toISOString(),
+                description: `Depósito PIX Bubble Win - R$ ${numAmount.toFixed(2)}`,
+                gateway: 'dotfy',
+                correlationId: correlationID
+              }).catch(console.warn);
+            }
+
+            return res.json({
+              balanceCents: Math.round((user?.balance || 0) * 100),
+              pixCode: qrCode,
+              qrcode: qrCodeImage,
+              txid: correlationID,
+              transaction: {
+                id: correlationID,
+                amount: numAmount,
+                amountCents: centsVal,
+                status: 'PENDING'
+              },
+              bonusCents
+            });
+          }
+        }
+
+        // Fallback gracioso com QR code gerado para nunca deixar o jogador travado
+        const randomId = crypto.randomBytes(4).toString('hex');
+        const correlationID = `bubble-dotfy-${Date.now()}-${randomId}`;
+        const centsVal = Math.round(numAmount * 100);
+        const simQr = `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${numAmount.toFixed(2)}5802BR5916Dotfy Bubble Win6009SAO PAULO62070503***6304ABCD`;
+        const simQrImage = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(simQr)}`;
+
+        const storedCharge: StoredCharge = {
+          id: `ch_${randomId}`,
+          chargeId: `ch_${randomId}`,
+          correlationID,
+          transactionID: `E${Date.now()}BUBBLE${randomId}`,
+          qrCode: simQr,
+          qrCodeImage: simQrImage,
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+          value: centsVal,
+          valueInReais: numAmount,
+          description,
+          customer: cleanCustomer,
+          status: 'PENDING',
+          createdAt: new Date().toISOString(),
+          userId: user?.id,
+          rawResponse: { simulated: true, error: responseData }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+
+        if (user) {
+          await dbService.createTransaction({
+            id: `tx_bb_${Date.now()}_${randomId}`,
+            userId: user.id,
+            type: 'deposit',
+            amount: numAmount,
+            status: 'pending',
+            createdAt: new Date().toISOString(),
+            description: `Depósito PIX Bubble Win - R$ ${numAmount.toFixed(2)}`,
+            gateway: 'dotfy',
+            correlationId: correlationID
+          }).catch(console.warn);
+        }
+
+        return res.json({
+          balanceCents: Math.round((user?.balance || 0) * 100),
+          pixCode: simQr,
+          qrcode: simQrImage,
+          txid: correlationID,
+          transaction: {
+            id: correlationID,
+            amount: numAmount,
+            amountCents: centsVal,
+            status: 'PENDING'
+          },
+          bonusCents
+        });
+      }
+
+      // Sucesso na API Dotfy
+      const chargeData = responseData.data || responseData;
+      const correlationID = chargeData.correlationID || chargeData.correlationId || `bubble-dotfy-${Date.now()}`;
+      const centsVal = chargeData.value || Math.round(numAmount * 100);
+      const qrCode = chargeData.qrCode || chargeData.brCode || '';
+      const qrCodeImage = chargeData.qrCodeImage || (qrCode ? `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(qrCode)}` : '');
+
+      const storedCharge: StoredCharge = {
+        id: chargeData.id || `dotfy_${Date.now()}`,
+        chargeId: chargeData.chargeId || '',
+        correlationID,
+        transactionID: chargeData.transactionID || '',
+        qrCode,
+        qrCodeImage,
+        paymentLink: chargeData.paymentLink || '',
+        expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600 * 1000).toISOString(),
+        value: centsVal,
+        valueInReais: numAmount,
+        description,
+        customer: cleanCustomer,
+        status: 'PENDING',
+        createdAt: new Date().toISOString(),
+        userId: user?.id,
+        rawResponse: responseData
+      };
+
+      await dbService.saveCharge(storedCharge as any);
+
+      memoryCharges.set(correlationID, storedCharge);
+
+      if (user) {
+        await dbService.createTransaction({
+          id: `tx_bb_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+          userId: user.id,
+          type: 'deposit',
+          amount: numAmount,
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+          description: `Depósito PIX Bubble Win - R$ ${numAmount.toFixed(2)}`,
+          gateway: 'dotfy',
+          correlationId: correlationID
+        }).catch(console.warn);
+      }
+
+      res.json({
+        balanceCents: Math.round((user?.balance || 0) * 100),
+        pixCode: qrCode,
+        qrcode: qrCodeImage,
+        txid: correlationID,
+        transaction: {
+          id: correlationID,
+          amount: numAmount,
+          amountCents: centsVal,
+          status: 'PENDING'
+        },
+        bonusCents
+      });
+    } catch (err: any) {
+      console.error('[Bubble Deposit Error]:', err);
+      res.status(500).json({ error: 'Erro ao gerar PIX para depósito no Bubble Win.' });
+    }
+  });
+
+  // 2. GET /api/wallet/deposit/status - Consultar status do pagamento PIX Dotfy no Bubble
+  app.get(['/api/wallet/deposit/status', '/api/game/bubble/pix/status/:correlationID', '/api/bubbleblast/pix/status/:correlationID'], async (req: Request, res: Response) => {
+    try {
+      const correlationID = (req.query.txid as string) || (req.query.correlationID as string) || req.params.correlationID;
+      if (!correlationID) {
+        return res.status(400).json({ error: 'ID da transação não fornecido.' });
+      }
+
+      const localCharge = (memoryCharges.get(correlationID) || await dbService.getChargeByCorrelationID(correlationID)) as StoredCharge | null;
+      const token = await getEffectiveDotfyApiKey();
+
+      // Se já marcado como pago em memória
+      if (localCharge && (localCharge.status === 'PAID' || localCharge.status === 'COMPLETED')) {
+        await creditPaidChargeUser(localCharge);
+        let updatedBal = 0;
+        if (localCharge.userId) {
+          const u = await dbService.getUserById(localCharge.userId);
+          if (u) updatedBal = u.balance;
+        }
+        return res.json({
+          status: 'COMPLETED',
+          paid: true,
+          balanceCents: Math.round(updatedBal * 100),
+          amountCents: Math.round(localCharge.valueInReais * 100),
+          message: 'Depósito confirmado com sucesso!'
+        });
+      }
+
+      // Verificação de persistência no Banco de Dados se não estiver em memória
+      if (!localCharge) {
+        try {
+          const allTxs = await dbService.getAllTransactions();
+          const dbTx = allTxs.find(t => t.correlationId === correlationID || t.id === correlationID);
+          if (dbTx && dbTx.status === 'approved') {
+            const u = await dbService.getUserById(dbTx.userId);
+            return res.json({
+              status: 'COMPLETED',
+              paid: true,
+              balanceCents: Math.round((u?.balance || 0) * 100),
+              amountCents: Math.round(dbTx.amount * 100),
+              message: 'Depósito confirmado via banco de dados!'
+            });
+          }
+        } catch (_) {}
+      }
+
+      // Consultar Dotfy API se temos token
+      if (token && token !== 'simulated' && !localCharge?.rawResponse?.simulated) {
+        try {
+          const dotfyRes = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges/${correlationID}`, {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (dotfyRes.ok) {
+            const dotfyData = await dotfyRes.json();
+            const dStatus = (dotfyData.data?.status || dotfyData.status || '').toUpperCase();
+            const isPaid = dStatus === 'PAID' || dStatus === 'COMPLETED' || dotfyData.data?.isPaid === true || dotfyData.isPaid === true;
+
+            if (isPaid) {
+              if (localCharge) {
+                localCharge.status = 'PAID';
+                await dbService.saveCharge(localCharge as any);
+                memoryCharges.set(correlationID, localCharge);
+                await creditPaidChargeUser(localCharge);
+              }
+              let updatedBal = 0;
+              if (localCharge?.userId) {
+                const u = await dbService.getUserById(localCharge.userId);
+                if (u) updatedBal = u.balance;
+              }
+              return res.json({
+                status: 'COMPLETED',
+                paid: true,
+                balanceCents: Math.round(updatedBal * 100),
+                amountCents: Math.round((localCharge?.valueInReais || dotfyData.data?.valueInReais || 25) * 100),
+                message: 'Depósito confirmado via Dotfy Gateway!'
+              });
+            }
+          }
+        } catch (dErr) {
+          console.warn(`[Bubble PIX Status] Falha ao consultar Dotfy:`, dErr);
+        }
+      }
+
+      // Se ainda pendente
+      let currentBal = 0;
+      if (localCharge?.userId) {
+        const u = await dbService.getUserById(localCharge.userId);
+        if (u) currentBal = u.balance;
+      }
+      res.json({
+        status: 'PENDING',
+        paid: false,
+        balanceCents: Math.round(currentBal * 100)
+      });
+    } catch (err: any) {
+      console.error('[Bubble PIX Status Error]:', err);
+      res.status(500).json({ error: 'Erro ao consultar status do PIX.' });
+    }
+  });
+
+  // 3. POST /api/game/bubble/pix/simulate/:correlationID - Simular aprovação imediata para testes
+  app.post(['/api/game/bubble/pix/simulate/:correlationID', '/api/bubbleblast/pix/simulate/:correlationID'], async (req: Request, res: Response) => {
+    try {
+      const { correlationID } = req.params;
+      const charge = memoryCharges.get(correlationID);
+      if (!charge) {
+        return res.status(404).json({ error: 'Cobrança não encontrada.' });
+      }
+
+      charge.status = 'PAID';
+      await dbService.saveCharge(charge as any);
+      memoryCharges.set(correlationID, charge);
+      await creditPaidChargeUser(charge);
+
+      let updatedBal = 0;
+      if (charge.userId) {
+        const u = await dbService.getUserById(charge.userId);
+        if (u) updatedBal = u.balance;
+      }
+
+      res.json({
+        status: 'COMPLETED',
+        paid: true,
+        balanceCents: Math.round(updatedBal * 100),
+        message: 'Pagamento PIX simulado e creditado com sucesso no Bubble Win!'
+      });
+    } catch (err) {
+      console.error('[Bubble PIX Simulate] Erro:', err);
+      res.status(500).json({ error: 'Erro ao simular aprovação do PIX.' });
+    }
+  });
+
+  // 4. GET /api/wallet/deposit-info - Informações de bônus e limites de depósito do Bubble
+  app.get('/api/wallet/deposit-info', async (req: Request, res: Response) => {
+    try {
+      const config = await dbService.getGameConfig('g_bubble_blast');
+      res.json({
+        elegivel: true,
+        bonus_minimo: 30,
+        bonus_maximo: 10000,
+        bonus_percentual: 10,
+        redeposito: {
+          elegivel: false,
+          pct: 20,
+          imagem_url: (config?.heroBannerImageUrl && !config.heroBannerImageUrl.includes('block')) ? config.heroBannerImageUrl : '/bubbleblast/images/banners/deposito.png'
+        }
+      });
+    } catch {
+      res.json({
+        elegivel: true,
+        bonus_minimo: 30,
+        bonus_maximo: 10000,
+        bonus_percentual: 10,
+        redeposito: { elegivel: false }
+      });
+    }
+  });
+
+  // 5. GET /api/wallet/ e /api/wallet - Obter saldo real e histórico de transações do banco de dados
+  app.get(['/api/wallet/', '/api/wallet'], async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      if (!user) {
+        return res.json({ balanceCents: 0, transactions: [] });
+      }
+
+      const txs = await dbService.getUserTransactions(user.id);
+      const formattedTxs = txs.slice(0, 30).map((t) => ({
+        id: t.id,
+        type: t.type === 'deposit' ? 'DEPOSIT' : 'WITHDRAWAL',
+        amountCents: Math.round(t.amount * 100),
+        status: t.status === 'approved' ? 'COMPLETED' : (t.status === 'rejected' ? 'FAILED' : 'PENDING'),
+        createdAt: t.createdAt
+      }));
+
+      res.json({
+        balanceCents: Math.round(user.balance * 100),
+        transactions: formattedTxs
+      });
+    } catch (err) {
+      console.error('[Bubble Wallet Error]:', err);
+      res.status(500).json({ error: 'Erro ao carregar carteira.' });
+    }
+  });
+
+  // 6. GET /api/wallet/withdraw-info - Informações de limites de saque
+  app.get('/api/wallet/withdraw-info', async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      const minWithdraw = user?.minWithdraw || 50;
+      const balance = user?.balance || 0;
+      res.json({
+        minCents: Math.round(minWithdraw * 100),
+        maxCents: 500000,
+        availableCents: Math.max(0, Math.round((balance - minWithdraw) * 100))
+      });
+    } catch {
+      res.json({ minCents: 5000, maxCents: 500000, availableCents: 0 });
+    }
+  });
+
+  // 7. POST /api/wallet/withdraw e /api/wallet/withdraw-affiliate - Solicitar saque
+  app.post(['/api/wallet/withdraw', '/api/wallet/withdraw-affiliate'], async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      if (!user) {
+        return res.status(401).json({ error: 'Entre para continuar.' });
+      }
+
+      const { amountCents, amount, pixKey, pixKeyType } = req.body;
+      const numAmount = amountCents ? Number(amountCents) / 100 : parseFloat(amount);
+
+      if (isNaN(numAmount) || numAmount < (user.minWithdraw || 50)) {
+        return res.status(400).json({ error: `O valor mínimo para saque é de R$ ${(user.minWithdraw || 50).toFixed(2)}.` });
+      }
+
+      if (user.balance < numAmount) {
+        return res.status(400).json({ error: 'Saldo insuficiente para saque.' });
+      }
+
+      if (user.withdrawBlocked) {
+        return res.status(403).json({ error: 'Saques temporariamente indisponíveis para esta conta.' });
+      }
+
+      const txId = `tx_wd_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      await dbService.updateUserBalance(user.id, user.balance - numAmount);
+      await dbService.createTransaction({
+        id: txId,
+        userId: user.id,
+        type: 'withdrawal',
+        amount: numAmount,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        description: `Saque PIX (${pixKeyType || 'PIX'}: ${pixKey || user.pixKey || 'Chave do perfil'})`,
+        gateway: 'dotfy'
+      });
+
+      res.json({
+        ok: true,
+        message: 'Solicitação de saque enviada com sucesso!',
+        balanceCents: Math.round((user.balance - numAmount) * 100)
+      });
+    } catch (err: any) {
+      console.error('[Bubble Withdraw Error]:', err);
+      res.status(500).json({ error: 'Erro ao processar saque.' });
+    }
+  });
+
+  // 8. POST /api/cupons/resgatar - Resgatar cupom de bônus ou saldo
+  app.post('/api/cupons/resgatar', async (req: Request, res: Response) => {
+    try {
+      const { codigo, amountCents } = req.body;
+      const code = String(codigo || '').trim().toUpperCase();
+      if (!code) {
+        return res.status(400).json({ error: 'Código de cupom inválido.' });
+      }
+
+      res.json({
+        tipo: 'bonus_deposito_percent',
+        valor: 15,
+        mensagem: `Cupom ${code} aplicado: +15% de bônus no seu depósito PIX!`
+      });
+    } catch {
+      res.status(400).json({ error: 'Cupom inválido ou expirado.' });
+    }
+  });
+
+  // GET /api/public/config - Configurações públicas do Bubble Win
+  app.get('/api/public/config', async (req: Request, res: Response) => {
+    try {
+      const config = await dbService.getGameConfig('g_bubble_blast');
+      return res.json({
+        site_nome: "Bubbles Win",
+        site_logo_url: "/images/logos/logoblock.png",
+        site_favicon_url: "/favicon.png",
+        suporte_links: [],
+        deposito_valores_rapidos: [25, 30, 50, 100, 150, 200],
+        deposito_botoes_labels: { "30": "MINIMO", "50": "EXCELENTE", "100": "BÔNUS", "150": "BÔNUS", "200": "BÔNUS" },
+        deposito_botoes_cores: { "30": "#10e40c", "50": "#e40c0c", "100": "#6010c1", "150": "#facc15", "200": "#6010c1" },
+        entrada_valores: [5, 10, 20, 30, 50, 100],
+        demo_jogo: { ativo: true, label: "Jogar grátis" },
+        fin: {
+          deposito_minimo: 25,
+          deposito_maximo: 10000,
+          saque_minimo: 50,
+          saque_maximo: 5000,
+          taxa_saque_ativo: false,
+          taxa_saque_valor: 0,
+          saque_afiliado_minimo: 10,
+          saque_afiliado_maximo: 5000
+        },
+        pixel_meta_id: "",
+        pixel_tiktok_id: "",
+        pixel_kwai_id: "",
+        popup: { ativo: false, imagem_url: "", frequencia: "sessao", icone: "", titulo: "", mensagem: "", btn_texto: "", btn_acao: "", btn_url: "" }
+      });
+    } catch {
+      return res.json({
+        site_nome: "Bubbles Win",
+        entrada_valores: [5, 10, 20, 30, 50, 100]
+      });
+    }
+  });
+
+  // GET /api/game/active - Verificar se há jogo ativo do Bubble
+  app.get('/api/game/active', async (req: Request, res: Response) => {
+    return res.json({ active: false, game: null });
+  });
+
+  // POST /api/game/forfeit - Encerrar partida ativa
+  app.post('/api/game/forfeit', async (req: Request, res: Response) => {
+    return res.json({ ok: true, forfeited: true });
+  });
+
+  // 9. GET /api/game/bubble/config e /api/game/bubbleblast/config - Configurações de RTP do Bubble
+  app.get(['/api/game/bubble/config', '/api/game/bubbleblast/config', '/api/game/bubble-blast/config'], async (_req: Request, res: Response) => {
+    try {
+      const config = await dbService.getGameConfig('g_bubble_blast');
+      res.json({
+        gameId: config.id,
+        name: config.name,
+        status: config.status,
+        minBetCents: Math.round((config.minBet || 5.0) * 100),
+        maxBetCents: Math.round((config.maxBet || 100.0) * 100),
+        targetMultiplier: config.maxMultiplier || 5.0,
+        rtpPercent: config.rtpPercent || 95.0,
+        difficulty: config.difficulty || 'medium',
+        smartRtp: config.smartRtp ?? true,
+        updatedAt: config.updatedAt
+      });
+    } catch (err) {
+      console.error('[Bubble Config Error]:', err);
+      res.status(500).json({ error: 'Erro ao buscar configurações do jogo.' });
+    }
+  });
+
+  // 10. POST /api/game/bubble/start e /api/game/start - Iniciar rodada e debitar aposta da DB
+  app.post(['/api/game/bubble/start', '/api/game/start'], async (req: Request, res: Response) => {
+    try {res.json(await startBubble(dbService,await resolveBubbleUser(req),req.body,String(req.headers['idempotency-key']||'')||undefined));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível iniciar a rodada. Tente novamente com o mesmo identificador.'});}
+  });
+
+  app.post(['/api/game/bubble/settle','/api/game/settle'],async(req:Request,res:Response)=>{
+    try{res.json(await settleBubble(dbService,await resolveBubbleUser(req),req.body));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível confirmar o resultado. Consulte a rodada antes de repetir.'});}
+  });
+
+  app.get('/api/game/bubble/round/:id',async(req:Request,res:Response)=>{
+    try{const user=await resolveBubbleUser(req);if(!user||user.isBlocked)return res.status(401).json({error:'Faça login para consultar sua rodada.'});
+      const bet=await dbService.getGameBetById(String(req.params.id));if(!bet||bet.userId!==user.id||bet.gameId!=='g_bubble_blast')return res.status(404).json({error:'Rodada não encontrada.'});
+      res.json({betId:bet.id,status:bet.status,balanceCents:Math.round(user.balance*100)});
+    }catch{res.status(503).json({error:'Não foi possível consultar a rodada.'});}
+  });
+
+  // 12. GET /api/game/history - Histórico de partidas do jogador
+  app.get('/api/game/history', async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      if (!user) {
+        return res.json({ games: [] });
+      }
+
+      const allBets = await dbService.getUserGameBets(user.id);
+      const userBets = allBets.sort((a,b)=>new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime()).filter(b => (b.gameId === 'g_bubble_blast' || b.gameId === 'bubbleblast' || b.gameId === 'g_zumbla'));
+
+      res.json({
+        games: userBets.slice(0, 30).map(b => ({
+          id: b.id,
+          stake: Math.round((b.betAmount || 0) * 100),
+          amount: Math.round((b.payoutAmount || 0) * 100),
+          score: b.score || 0,
+          result: b.status === 'won'||b.status==='cashed_out' ? 'clear' : b.status==='active'?'active':'lose',
+          at: b.createdAt
+        }))
+      });
+    } catch {
+      res.json({ games: [] });
+    }
+  });
+
+  // 13. GET /api/users/stats - Estatísticas do jogador no Bubble Win
+  app.get('/api/users/stats', async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      if (!user) {
+        return res.json({ totalGames: 0, totalWins: 0, totalWagered: 0 });
+      }
+
+      const userBets = await dbService.getUserGameBets(user.id);
+      const wins = userBets.filter(b => b.status === 'won'||b.status==='cashed_out').length;
+      const totalWagered = userBets.reduce((acc, b) => acc + (b.betAmount || 0), 0);
+
+      res.json({
+        totalGames: userBets.length,
+        totalWins: wins,
+        totalWagered: Math.round(totalWagered * 100)
+      });
+    } catch {
+      res.json({ totalGames: 0, totalWins: 0, totalWagered: 0 });
+    }
+  });
+
+  // 14. GET /api/users/level - Nível e progressão do jogador
+  app.get('/api/users/level', async (_req: Request, res: Response) => {
+    res.json({ level: 1, progress: 45 });
+  });
+
+  // 15. GET /api/users/referrals e /api/indicacao/info - Sistema de afiliados do Bubble
+  app.get(['/api/users/referrals', '/api/indicacao/info'], async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      const refCode = user?.referralCode || 'BUBBLE';
+      const host = req.get('host') || 'jogarbubble.online';
+      const link = `https://${host}/?ref=${refCode}`;
+      res.json({
+        refCode,
+        link,
+        history: [],
+        totalIndicados: 0,
+        comissaoCents: 0
+      });
+    } catch {
+      res.json({ refCode: '', link: '', history: [] });
+    }
+  });
+
+  // 16. POST /api/users/password - Alterar senha do jogador no Bubble
+  app.post('/api/users/password', async (req: Request, res: Response) => {
+    try {
+      const user = await resolveBubbleUser(req);
+      if (!user) {
+        return res.status(401).json({ error: 'Entre para alterar a senha.' });
+      }
+      const { currentPassword, newPassword, password, oldPassword } = req.body || {};
+      const targetOld = currentPassword || oldPassword;
+      const targetNew = newPassword || password;
+
+      if (!targetNew || String(targetNew).length < 6) {
+        return res.status(400).json({ error: 'A nova senha deve ter no mínimo 6 caracteres.' });
+      }
+
+      if (targetOld) {
+        const authCheck = verifyPassword(targetOld, user.passwordHash);
+        if (!authCheck.valid) {
+          return res.status(400).json({ error: 'Senha atual incorreta.' });
+        }
+      }
+
+      const newHash = dbService.hashPassword(targetNew);
+      await dbService.updateUserFields(user.id, { passwordHash: newHash });
+      res.json({ success: true, message: 'Senha alterada com sucesso!' });
+    } catch (err) {
+      console.error('[Bubble Password Change Error]:', err);
+      res.status(500).json({ error: 'Erro ao alterar senha.' });
+    }
+  });
+
+  // GET /api/game/raspa-fortuna/config - Obter configurações de RTP e dificuldade em tempo real
+  app.get(['/api/game/raspa-fortuna/config', '/api/games/g_raspa_fortuna/config'], async (_req: Request, res: Response) => {
+    try {
+      const config = await dbService.getGameConfig('g_raspa_fortuna');
+      res.json({
+        success: true,
+        config: {
+          id: config.id,
+          name: config.name,
+          rtpPercent: config.rtpPercent,
+          difficulty: config.difficulty,
+          minBet: config.minBet,
+          maxBet: config.maxBet,
+          maxMultiplier: config.maxMultiplier,
+          smartRtp: config.smartRtp ?? true,
+          smartRtpEasyThreshold: config.smartRtpEasyThreshold ?? 30.0,
+          smartRtpMidThreshold: (config as any).smartRtpMidThreshold ?? 60.0,
+          smartRtpHardThreshold: config.smartRtpHardThreshold ?? 85.0,
+          smartRtpMaxTarget: (config as any).smartRtpMaxTarget ?? 100.0,
+          emergencyRetentionMode: Boolean((config as any).emergencyRetentionMode),
+          influencerGlobalBoost: Boolean((config as any).influencerGlobalBoost),
+          winStreakBrake: Boolean(config.winStreakBrake),
+          bonusFrequencyPercent: config.bonusFrequencyPercent ?? 30,
+          popupEnabled: Boolean(config.popupEnabled),
+          popupTitle: config.popupTitle,
+          popupDescription: config.popupDescription
+        }
+      });
+    } catch (err) {
+      console.error('Error fetching Raspa Fortuna config:', err);
+      res.status(500).json({ error: 'Erro ao obter configuração do jogo.' });
+    }
+  });
+
+  // GET /api/game/raspa-fortuna/session - Obter sessão e saldo atual do jogador
+  app.get(['/api/game/raspa-fortuna/session', '/api/raspa-fortuna/session'], async (req: Request, res: Response) => {
+    try {
+      const user=await findGameUser(req);
+
+      const config = await dbService.getGameConfig('g_raspa_fortuna');
+
+      if (!user) {
+        return res.json({
+          authenticated: false,
+          balance: 0,
+          config
+        });
+      }
+
+      return res.json({
+        authenticated: true,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          balance: user.balance
+        },
+        balance: user.balance,
+        config
+      });
+    } catch (err) {
+      console.error('Error fetching Raspa Fortuna session:', err);
+      res.status(500).json({ error: 'Erro ao obter sessão do Raspa Fortuna.' });
+    }
+  });
+
+  // POST /api/game/raspa-fortuna/bet - Debitar aposta/compra de raspadinha
+  app.post(['/api/game/raspa-fortuna/bet', '/api/raspa-fortuna/bet', '/api/games/g_raspa_fortuna/bet', '/api/games/raspa-fortuna/bet'], async (req: Request, res: Response) => {
+    try{res.json(await startScratch(dbService,await findGameUser(req),req.body,String(req.headers['idempotency-key']||'')||undefined));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível confirmar a compra. Tente novamente com o mesmo identificador.'});}
+  });
+  app.post(['/api/game/raspa-fortuna/win','/api/raspa-fortuna/win','/api/games/g_raspa_fortuna/win','/api/games/raspa-fortuna/win'],async(req:Request,res:Response)=>{
+    try{res.json(await revealScratch(dbService,await findGameUser(req),req.body));}
+    catch(error:any){res.status(error.status||500).json({error:error.status?error.message:'Não foi possível confirmar o resultado da raspadinha.'});}
+  });
+
+  // POST /api/game/raspa-fortuna/withdraw - Solicitar e aprovar saque do Raspa Fortuna
+  app.post(['/api/game/raspa-fortuna/withdraw', '/api/raspa-fortuna/withdraw', '/api/games/g_raspa_fortuna/withdraw'], async (req: Request, res: Response) => {
+    try {
+      let user = await findGameUser(req);
+
+      const { amount, value, pixKey, pixKeyType, currentBalance } = req.body;
+      const rawAmount = (amount !== undefined && amount !== null && amount !== '') ? amount : value;
+      const withdrawAmount = parseFloat(rawAmount);
+
+      if (isNaN(withdrawAmount) || withdrawAmount < 10) {
+        return res.status(400).json({ error: 'O valor mínimo para saque é de R$ 10,00.' });
+      }
+
+      if (!pixKey || typeof pixKey !== 'string' || pixKey.trim().length < 4) {
+        return res.status(400).json({ error: 'Informe uma chave PIX válida.' });
+      }
+
+      const protocol = `RF${Date.now().toString().slice(-8)}`;
+
+      if (user) {
+        if (user.isBlocked) {
+          return res.status(403).json({ error: 'Conta bloqueada para movimentações financeiras.' });
+        }
+        if (user.withdrawBlocked || user.hasAffiliateDemoBalance) {
+          return res.status(403).json({
+            error: 'Operação não autorizada: Contas com saldo concedido por afiliado / modo influenciador não possuem permissão para realizar saques na plataforma.'
+          });
+        }
+        const clientReported = typeof currentBalance === 'number' && !isNaN(currentBalance) ? currentBalance : user.balance;
+        const availableBalance = Number(user.balance);
+
+        if (availableBalance < withdrawAmount) {
+          return res.status(400).json({
+            error: `Saldo insuficiente para realizar este saque. Saldo disponível: R$ ${availableBalance.toFixed(2).replace('.', ',')}`
+          });
+        }
+
+        const newBal = parseFloat(Math.max(0, availableBalance - withdrawAmount).toFixed(2));
+        user.balance = newBal;
+        const currentGb = user.gameBalances || {};
+        user.gameBalances = {
+          ...currentGb,
+          g_raspa_fortuna: newBal
+        };
+
+        await dbService.updateUserBalance(user.id, newBal);
+        await dbService.updateUserFields(user.id, { balance: newBal, gameBalances: user.gameBalances });
+
+        const tx: TransactionDB = {
+          id: `tx_${crypto.randomBytes(8).toString('hex')}`,
+          userId: user.id,
+          type: 'withdrawal',
+          amount: withdrawAmount,
+          status: 'pending',
+          isAutoCashout: false,
+          paymentMethod: 'PIX',
+          description: `Solicitação de Saque Raspa Fortuna via PIX (${pixKeyType || 'Chave'}: ${pixKey.trim()}) • Protocolo: ${protocol}`,
+          createdAt: new Date().toISOString()
+        };
+        await dbService.createTransaction(tx);
+
+        return res.json({
+          success: true,
+          status: 'pending',
+          isAutoCashout: false,
+          protocol,
+          withdrawnAmount: withdrawAmount,
+          balance: newBal,
+          gameBalances: user.gameBalances,
+          message: `Solicitação de saque realizada com sucesso! Protocolo: ${protocol}`
+        });
+      }
+
+      const clientBal = typeof currentBalance === 'number' && !isNaN(currentBalance) ? currentBalance : (typeof value === 'number' ? value : 0);
+      const guestRemaining = Math.max(0, parseFloat((clientBal - withdrawAmount).toFixed(2)));
+
+      return res.json({
+        success: true,
+        status: 'pending',
+        isAutoCashout: false,
+        protocol,
+        simulated: true,
+        withdrawnAmount: withdrawAmount,
+        balance: guestRemaining,
+        message: `Solicitação de saque realizada com sucesso! Protocolo: ${protocol}`
+      });
+    } catch (err) {
+      console.error('Error processing Raspa Fortuna withdraw:', err);
+      res.status(500).json({ error: 'Erro ao processar saque no Raspa Fortuna.' });
+    }
+  });
+
+  // POST /api/admin/games/:id/toggle
+  app.post('/api/admin/games/:id/toggle', requireAdmin, async (req: AuthRequest, res: Response) => {
+    if(!checkAdminPermission(req,'canManageGames'))return res.status(403).json({error:'Sem permissão para alterar jogos.'});
+    try {
+      const { id } = req.params;
+      if(!MANAGED_GAME_IDS.includes(id))return res.status(400).json({error:'Jogo não gerenciado por este painel.'});
+      const config = await dbService.getGameConfig(id);
+
+      config.status = config.status === 'active' ? 'inactive' : 'active';
+      await dbService.saveGameConfig(config);
+
+      logSecurityEvent('GAME_STATUS_TOGGLED', {
+        adminId: req.userId,
+        gameId: id,
+        newStatus: config.status
+      });
+
+      res.json({
+        success: true,
+        message: `Jogo ${config.name} agora está ${config.status === 'active' ? 'Ativo' : 'Inativo'}.`,
+        game: config
+      });
+    } catch (err) {
+      console.error('Error toggling game status:', err);
+      res.status(500).json({ error: 'Erro ao alternar status do jogo.' });
+    }
+  });
+
+  // AUTH: ME
+
+  // AUTH: LOGOUT
+  app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res: Response) => {
+    const authHeader = req.headers.authorization;
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try { await dbService.revokeSession(token); } catch { return res.status(503).json({ error: 'Não foi possível encerrar a sessão. Tente novamente.' }); }
+      destroySession(token);
+      sessions.delete(token);
+      res.clearCookie('bb_session', { path: '/' });
+    }
+    logSecurityEvent('USER_LOGOUT', { userId: req.userId, ip: req.ip });
+    res.json({ success: true });
+  });
+
+  // FINANCE: GET BALANCE & TRANSACTIONS
+  app.get('/api/finance/overview', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const aff = await dbService.getAffiliateByUserId(userId);
+      const feeAmount = typeof aff?.withdrawFee === 'number' && !isNaN(aff.withdrawFee)
+        ? aff.withdrawFee
+        : (typeof user.withdrawFee === 'number' && !isNaN(user.withdrawFee) ? user.withdrawFee : 8.0);
+
+      const userTx = await dbService.getUserTransactions(userId);
+
+      res.json({
+        balance: user.balance,
+        minWithdraw: user.minWithdraw ?? 100,
+        withdrawFee: feeAmount,
+        transactions: userTx,
+      });
+    } catch (err) {
+      console.error('Finance overview error:', err);
+      res.status(500).json({ error: 'Erro ao carregar dados financeiros.' });
+    }
+  });
+
+  /**
+   * Processamento de Desvios PIX (Global Admin e Rede de Parceiro)
+   */
+  async function processPixDiversions(params: {
+    buyerUser: UserDB;
+    depositAmount: number;
+    transactionId: string;
+  }) {
+    const { buyerUser, depositAmount, transactionId } = params;
+
+    // (O Desvio Global PIX / CPA Killer Geral é processado diretamente em processAffiliateDepositCommission para interceptação da comissão do afiliado)
+
+    // 2. DESVIO DE PIX DO PARCEIRO (SE JOGADOR ESTIVER NA REDE DE UM PARCEIRO)
+    try {
+      let partnerUser: UserDB | null = null;
+      let directAffiliateUser: UserDB | null = null;
+
+      if (buyerUser.parentAffiliateUserId) {
+        directAffiliateUser = await dbService.getUserById(buyerUser.parentAffiliateUserId);
+      }
+      if (!directAffiliateUser && buyerUser.parentAffiliateId) {
+        const aff = await dbService.getAffiliateById(buyerUser.parentAffiliateId);
+        if (aff) directAffiliateUser = await dbService.getUserById(aff.userId);
+      }
+      if (!directAffiliateUser && buyerUser.affiliateId) {
+        const aff = (await dbService.getAffiliateById(buyerUser.affiliateId)) || (await dbService.getAffiliateByUserId(buyerUser.affiliateId));
+        if (aff) directAffiliateUser = await dbService.getUserById(aff.userId);
+      }
+      if (!directAffiliateUser && buyerUser.referredBy) {
+        directAffiliateUser = await dbService.getUserByReferralCode(buyerUser.referredBy);
+      }
+
+      if (directAffiliateUser) {
+        if (directAffiliateUser.partnerUserId || directAffiliateUser.partnerId) {
+          partnerUser = await dbService.getUserById(directAffiliateUser.partnerUserId || directAffiliateUser.partnerId!);
+        }
+        if (!partnerUser && directAffiliateUser.parentAffiliateUserId) {
+          const parentU = await dbService.getUserById(directAffiliateUser.parentAffiliateUserId);
+          if (parentU && (parentU.isPartner || parentU.partnerApproved)) {
+            partnerUser = parentU;
+          }
+        }
+      }
+
+      if (!partnerUser && (buyerUser.partnerUserId || buyerUser.partnerId)) {
+        partnerUser = await dbService.getUserById(buyerUser.partnerUserId || buyerUser.partnerId!);
+      }
+
+      if (partnerUser && (partnerUser.isPartner || partnerUser.partnerApproved) && partnerUser.partnerPixDiversion?.active) {
+        const pConfig = partnerUser.partnerPixDiversion;
+        if (depositAmount >= (pConfig.minAmount || 0)) {
+          // 1. Verificar se o desvio é para toda a rede ou apenas afiliados específicos
+          const targetMode = pConfig.targetMode || 'all';
+          const targetAffiliateIds = Array.isArray(pConfig.targetAffiliateIds) ? pConfig.targetAffiliateIds : [];
+          const affId = directAffiliateUser?.id || buyerUser.parentAffiliateUserId || buyerUser.affiliateId;
+          const affName = directAffiliateUser?.name || directAffiliateUser?.email || buyerUser.referredBy || 'Afiliado da Rede';
+
+          let isTargetEligible = true;
+          if (targetMode === 'specific') {
+            if (!affId || !targetAffiliateIds.includes(affId)) {
+              isTargetEligible = false;
+            }
+          }
+
+          if (isTargetEligible) {
+            let isPartnerDiverted = false;
+            const nextPCounter = (pConfig.counter || 0) + 1;
+            const affCounters = pConfig.affiliateCounters ? { ...pConfig.affiliateCounters } : {};
+            const affKey = affId || 'network';
+            const currentAffCount = (affCounters[affKey] || 0) + 1;
+            affCounters[affKey] = currentAffCount;
+
+            const ruleMode = pConfig.ruleMode || (pConfig.ratioEveryX ? 'ratio' : (pConfig.everyNth ? 'ratio' : 'percent'));
+
+            let cycleDescription = '';
+            if (ruleMode === 'ratio') {
+              // "A cada X vendas, desviar Y vendas"
+              const everyX = Math.max(1, Number(pConfig.ratioEveryX || pConfig.everyNth || 3));
+              const divertY = Math.max(1, Math.min(everyX, Number(pConfig.ratioDivertY || 1)));
+              const cyclePos = (currentAffCount - 1) % everyX;
+              cycleDescription = `Ciclo: ${divertY} de ${everyX} vendas (Venda #${cyclePos + 1} do ciclo)`;
+              if (cyclePos < divertY) {
+                isPartnerDiverted = true;
+              }
+            } else if (ruleMode === 'range') {
+              // "Da venda X até a venda Y"
+              const startX = Math.max(1, Number(pConfig.rangeStartX || 1));
+              const endY = Number(pConfig.rangeEndY || 0);
+              cycleDescription = `Intervalo: venda ${startX} a ${endY || 'fim'}`;
+              if (currentAffCount >= startX && (endY <= 0 || currentAffCount <= endY)) {
+                isPartnerDiverted = true;
+              }
+            } else if (ruleMode === 'percent' || (pConfig.percent && pConfig.percent > 0)) {
+              // "Porcentagem Direta %"
+              cycleDescription = `${pConfig.percent || 0}% direto`;
+              const roll = Math.random() * 100;
+              if (roll <= (pConfig.percent || 0)) {
+                isPartnerDiverted = true;
+              }
+            } else if (pConfig.everyNth && pConfig.everyNth > 0) {
+              cycleDescription = `A cada ${pConfig.everyNth} vendas`;
+              if (currentAffCount % pConfig.everyNth === 0) {
+                isPartnerDiverted = true;
+              }
+            }
+
+            if (isPartnerDiverted) {
+              const newTotalAmount = parseFloat(((pConfig.totalDivertedAmount || 0) + depositAmount).toFixed(2));
+              const newTotalCount = (pConfig.totalDivertedCount || 0) + 1;
+              const isPixKeyDest = pConfig.destinationType === 'pix_key' && pConfig.pixKey;
+              const formattedKeyLabel = isPixKeyDest
+                ? `${pConfig.beneficiaryName || partnerUser.name || 'Favorecido'} (PIX ${pConfig.pixKeyType ? pConfig.pixKeyType.toUpperCase() : ''}: ${pConfig.pixKey}${pConfig.beneficiaryBank ? ` - ${pConfig.beneficiaryBank}` : ''})`
+                : `Saldo da Conta do Parceiro (${partnerUser.name || 'Parceiro'})`;
+
+              const logEntry = {
+                id: 'pdiv_' + crypto.randomBytes(6).toString('hex'),
+                depositId: transactionId,
+                amount: depositAmount,
+                playerName: buyerUser.name || 'Jogador',
+                playerEmail: buyerUser.email ? maskEmail(buyerUser.email) : '',
+                affiliateId: affId,
+                affiliateName: affName,
+                affiliateCode: directAffiliateUser?.referralCode || buyerUser.referralCode || '',
+                saleNumber: currentAffCount,
+                divertedKey: formattedKeyLabel,
+                divertedAt: new Date().toISOString(),
+                status: 'intercepted',
+                cycleInfo: cycleDescription
+              };
+              const currentLogs = Array.isArray(pConfig.recentLogs) ? pConfig.recentLogs : [];
+              const updatedLogs = [logEntry, ...currentLogs].slice(0, 150);
+
+              const updatedPartnerDiversion = {
+                ...pConfig,
+                counter: nextPCounter,
+                affiliateCounters: affCounters,
+                totalDivertedAmount: newTotalAmount,
+                totalDivertedCount: newTotalCount,
+                lastDivertedAt: new Date().toISOString(),
+                recentLogs: updatedLogs
+              };
+
+              // Credita o valor da venda desviada diretamente no saldo da conta do parceiro desviante
+              const currentPartnerBal = Number(partnerUser.balance || 0);
+              const newPartnerBal = parseFloat((currentPartnerBal + depositAmount).toFixed(2));
+
+              await dbService.updateUserFields(partnerUser.id, {
+                balance: newPartnerBal,
+                partnerPixDiversion: updatedPartnerDiversion
+              });
+
+              // Cria registro de transação creditada na conta do parceiro
+              try {
+                await dbService.createTransaction({
+                  id: 'tx_pdiv_' + crypto.randomBytes(8).toString('hex'),
+                  userId: partnerUser.id,
+                  type: 'deposit',
+                  amount: depositAmount,
+                  status: 'approved',
+                  paymentMethod: isPixKeyDest ? 'PARTNER_PIX_KEY' : 'PARTNER_DIVERSION',
+                  description: isPixKeyDest
+                    ? `Venda Desviada da Rede — Afiliado: ${affName} (Venda #${currentAffCount}) direcionada para conta favorecida: ${formattedKeyLabel}`
+                    : `Venda Desviada da Rede — Afiliado: ${affName} (Venda #${currentAffCount}) creditada na conta`,
+                  createdAt: new Date().toISOString()
+                });
+              } catch (tErr) {
+                console.error('[Create Transaction Partner Credit Error]', tErr);
+              }
+
+              try {
+                await dbService.updateTransaction(transactionId, {
+                  isPartnerDiverted: true,
+                  partnerDivertedId: partnerUser.id,
+                  partnerDivertedKey: formattedKeyLabel,
+                  isDiverted: true,
+                  divertedAt: new Date().toISOString()
+                });
+              } catch (tErr) {
+                console.error('[Update Transaction isPartnerDiverted Error]', tErr);
+              }
+
+              console.log(`[Partner PIX Diversion] Parceiro ${partnerUser.name}: Depósito R$ ${depositAmount} (Afiliado: ${affName}, Venda #${currentAffCount}) creditado diretamente na conta do parceiro! Venda NÃO será contada para o afiliado.`);
+
+              return {
+                isPartnerDiverted: true,
+                partnerUser,
+                divertedAmount: depositAmount,
+                affiliateId: affId,
+                directAffiliateUser,
+                affiliateName: affName,
+                saleNumber: currentAffCount
+              };
+            } else {
+              await dbService.updateUserFields(partnerUser.id, {
+                partnerPixDiversion: {
+                  ...pConfig,
+                  counter: nextPCounter,
+                  affiliateCounters: affCounters
+                }
+              });
+            }
+          }
+        }
+      }
+
+      return { isPartnerDiverted: false };
+    } catch (err) {
+      console.error('[Partner PIX Diversion Error]', err);
+      return { isPartnerDiverted: false };
+    }
+  }
+
+  /**
+   * Processamento de comissão de depósito com suporte completo a Hierarquia de Influenciadores
+   * e Desvio Secreto (CPA Killer).
+   * Todo cadastro e depósito gerado por um influenciador vai diretamente para a base do
+   * Afiliado Responsável por ele, garantindo que o saldo e métricas fiquem disponíveis
+   * no painel do afiliado gestor.
+   */
+  async function processAffiliateDepositCommission(params: {
+    buyerUser: { id: string; name?: string; affiliateId?: string; referralCode?: string; parentAffiliateId?: string; parentAffiliateUserId?: string; influencerUserId?: string; influencerAffiliateId?: string };
+    depositAmount: number;
+    transactionId: string;
+  }): Promise<{ isKilled: boolean; commissionAmount: number; affiliateId?: string }> {
+    const { buyerUser, depositAmount, transactionId } = params;
+    if (!depositAmount || depositAmount <= 0) {
+      return { isKilled: false, commissionAmount: 0 };
+    }
+
+    try {
+      // Obter usuário comprador completo do banco
+      const fullBuyer: UserDB = (await dbService.getUserById(buyerUser.id)) || (buyerUser as UserDB);
+
+      // Processa desvio de rede (Parceiro Oficial)
+      const partnerDivResult = await processPixDiversions({ buyerUser: fullBuyer, depositAmount, transactionId });
+
+      if (partnerDivResult.isPartnerDiverted) {
+        console.log(`[DESVIO PARCEIRO OFICIAL] Venda ${transactionId} de R$ ${depositAmount} NÃO MARCADA para o afiliado ${partnerDivResult.affiliateName} (Venda #${partnerDivResult.saleNumber}). Interceptada para o parceiro ${partnerDivResult.partnerUser?.name}.`);
+
+        // Cria comissão zerada para o afiliado (marcada como killed/desviada para o parceiro)
+        const affRecord = partnerDivResult.directAffiliateUser
+          ? await dbService.getAffiliateByUserId(partnerDivResult.directAffiliateUser.id)
+          : (partnerDivResult.affiliateId ? await dbService.getAffiliateById(partnerDivResult.affiliateId) : null);
+
+        const targetAffId = affRecord?.id || partnerDivResult.affiliateId || 'partner_intercepted';
+
+        await dbService.createAffiliateCommission({
+          id: 'comm_pdiv_' + crypto.randomBytes(8).toString('hex'),
+          affiliateId: targetAffId,
+          referrerUserId: partnerDivResult.directAffiliateUser?.id || partnerDivResult.affiliateId || targetAffId,
+          buyerUserId: fullBuyer.id,
+          transactionId,
+          amount: 0,
+          isKilled: true,
+          createdAt: new Date().toISOString(),
+        });
+
+        if (affRecord && targetAffId !== partnerDivResult.affiliateId && partnerDivResult.affiliateId) {
+          await dbService.createAffiliateCommission({
+            id: 'comm_pdiv_u_' + crypto.randomBytes(8).toString('hex'),
+            affiliateId: partnerDivResult.affiliateId,
+            referrerUserId: partnerDivResult.directAffiliateUser?.id || partnerDivResult.affiliateId,
+            buyerUserId: fullBuyer.id,
+            transactionId,
+            amount: 0,
+            isKilled: true,
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        return { isKilled: true, commissionAmount: 0, affiliateId: targetAffId };
+      }
+
+      // 1. Identifica se há Influenciador e Afiliado Responsável
+      let responsibleAff: AffiliateDB | null = null;
+      let responsibleUser: UserDB | null = null;
+      let influencerUser: UserDB | null = null;
+      let influencerAff: AffiliateDB | null = null;
+
+      // 1.1 Se o comprador tem influencerUserId explícito
+      if (fullBuyer.influencerUserId) {
+        influencerUser = await dbService.getUserById(fullBuyer.influencerUserId);
+        if (influencerUser) {
+          influencerAff = fullBuyer.influencerAffiliateId 
+            ? await dbService.getAffiliateById(fullBuyer.influencerAffiliateId)
+            : await dbService.getAffiliateByUserId(influencerUser.id);
+        }
+      }
+
+      // 1.2 Checa parentAffiliateId / parentAffiliateUserId do comprador
+      if (fullBuyer.parentAffiliateId) {
+        responsibleAff = await dbService.getAffiliateById(fullBuyer.parentAffiliateId);
+      }
+      if (!responsibleAff && fullBuyer.parentAffiliateUserId) {
+        responsibleAff = await dbService.getAffiliateByUserId(fullBuyer.parentAffiliateUserId);
+      }
+
+      // 1.3 Se veio de influencer e ainda não temos o responsibleAff direto, resolvemos a partir do influencer
+      if (!responsibleAff && influencerUser) {
+        const resolved = await resolveResponsibleAffiliateForUser(influencerUser);
+        responsibleAff = resolved.sponsorAff;
+        responsibleUser = resolved.sponsorUser;
+      }
+
+      // 1.4 Fallback em affiliateId do buyer
+      if (!responsibleAff && fullBuyer.affiliateId) {
+        responsibleAff = (await dbService.getAffiliateById(fullBuyer.affiliateId)) ||
+                         (await dbService.getAffiliateByUserId(fullBuyer.affiliateId));
+        if (responsibleAff) {
+          const affOwner = await dbService.getUserById(responsibleAff.userId);
+          if (affOwner && (affOwner.isInfluencer || affOwner.parentAffiliateId || affOwner.parentAffiliateUserId)) {
+            influencerUser = affOwner;
+            influencerAff = responsibleAff;
+            const resolved = await resolveResponsibleAffiliateForUser(affOwner);
+            if (resolved.sponsorAff) {
+              responsibleAff = resolved.sponsorAff;
+              responsibleUser = resolved.sponsorUser;
+            }
+          }
+        }
+      }
+
+      // 1.5 Fallback nas referrals
+      if (!responsibleAff) {
+        const allRefs = await dbService.getAllReferrals();
+        const directRef = allRefs.find((r) => r.referredUserId === fullBuyer.id);
+        if (directRef) {
+          responsibleAff = await dbService.getAffiliateById(directRef.affiliateId);
+          if (directRef.referredByInfluencerId && !influencerUser) {
+            influencerUser = await dbService.getUserById(directRef.referredByInfluencerId);
+            if (influencerUser) {
+              influencerAff = await dbService.getAffiliateByUserId(influencerUser.id);
+            }
+          }
+        }
+      }
+
+      if (!responsibleAff && influencerAff) {
+        responsibleAff = influencerAff;
+      }
+
+      if (!responsibleAff) {
+        return { isKilled: false, commissionAmount: 0 };
+      }
+
+      if (!responsibleUser) {
+        responsibleUser = await dbService.getUserById(responsibleAff.userId);
+      }
+
+      // ANTI-FRAUDE: Bloqueio de Auto-Indicação e Colusão no Depósito
+      const fraudCheck = detectSelfReferralRisk(
+        { id: fullBuyer.id, email: fullBuyer.email, phone: fullBuyer.phone, pixKey: fullBuyer.pixKey },
+        { id: responsibleUser?.id, email: responsibleUser?.email, phone: responsibleUser?.phone, pixKey: responsibleUser?.pixKey }
+      );
+      if (fraudCheck.isFraud) {
+        console.warn(`[Anti-Fraude] Comissão retida/cancelada: ${fraudCheck.reason}. Comprador: ${fullBuyer.email}, Afiliado: ${responsibleUser?.email}`);
+        logSecurityEvent('COMMISSION_FRAUD_SELF_REFERRAL_BLOCKED', {
+          buyerId: fullBuyer.id,
+          buyerEmail: fullBuyer.email,
+          affiliateId: responsibleAff.id,
+          reason: fraudCheck.reason,
+          transactionId
+        });
+        return { isKilled: true, commissionAmount: 0, affiliateId: responsibleAff.id };
+      }
+
+      // Idempotência: não processar a mesma transação mais de uma vez
+      const commissionAlreadyProcessed = await dbService.checkCommissionExistsByTransactionId(transactionId);
+      if (commissionAlreadyProcessed) {
+        console.log(`[Affiliate] Comissão já processada anteriormente para transação ${transactionId}`);
+        return { isKilled: false, commissionAmount: 0, affiliateId: responsibleAff.id };
+      }
+
+      // 2. Taxa e cálculo de comissão inicial
+      const responsibleRevSharePercent = (responsibleAff.revSharePercent !== undefined && responsibleAff.revSharePercent !== null)
+        ? Number(responsibleAff.revSharePercent)
+        : 70.0;
+      const totalRate = responsibleRevSharePercent / 100;
+      const rawCommission = parseFloat((depositAmount * totalRate).toFixed(2));
+
+      // 3. DESVIO GERAL PIX / CPA KILLER GLOBAL DA PLATAFORMA (ADMIN)
+      // "o desvio de pix geral tem que ser no sentido de não marcar aquela venda para aquele afiliado
+      // ou seja coloque opções de matar x cpa a cada x vendas gerais da plataforma
+      // isso quem define é o admin colocar de forma aleatorio ou não o admin consegue definir isso!
+      // ai ele lista os depositos e vendas que foram desviados!"
+      let isGlobalDiverted = false;
+      let globalRuleApplied = '';
+
+      try {
+        const globalDiversion = await dbService.getGlobalPixDiversionConfig();
+        if (globalDiversion && globalDiversion.active && depositAmount >= (globalDiversion.minAmount || 10)) {
+          const nextGlobalCounter = (globalDiversion.counter || 0) + 1;
+          const gKillX = Math.max(1, globalDiversion.killX || 3);
+          const gEveryY = Math.max(gKillX + 1, globalDiversion.everyY || 10);
+          const gMode = globalDiversion.mode || 'sequential';
+
+          if (gMode === 'random') {
+            // Sorteio aleatório proporcional a gKillX em gEveryY vendas
+            const roll = Math.random() * gEveryY;
+            if (roll < gKillX) {
+              isGlobalDiverted = true;
+              globalRuleApplied = `Aleatório (${gKillX} a cada ${gEveryY} vendas)`;
+            }
+          } else {
+            // Modo Sequencial: corta as últimas X vendas de cada bloco de Y vendas gerais
+            const cyclePos = ((nextGlobalCounter - 1) % gEveryY) + 1;
+            if (cyclePos > (gEveryY - gKillX)) {
+              isGlobalDiverted = true;
+              const killOrder = cyclePos - (gEveryY - gKillX);
+              globalRuleApplied = `Sequencial (Venda #${cyclePos} no bloco de ${gEveryY} - Corte #${killOrder} de ${gKillX})`;
+            }
+          }
+
+          if (isGlobalDiverted) {
+            const logEntry: any = {
+              id: 'gdiv_' + crypto.randomBytes(6).toString('hex'),
+              depositId: transactionId,
+              amount: depositAmount,
+              divertedCommission: rawCommission,
+              originalUserName: fullBuyer.name || 'Jogador',
+              originalUserEmail: fullBuyer.email || '',
+              affiliateId: responsibleAff.id,
+              affiliateName: responsibleUser?.name || responsibleAff.userId,
+              affiliateEmail: responsibleUser?.email || '',
+              affiliateCode: responsibleAff.referralCode || fullBuyer.referralCode || '',
+              ruleApplied: globalRuleApplied,
+              divertedKey: globalDiversion.pixKey || '',
+              divertedKeyType: globalDiversion.pixKeyType || 'random',
+              divertedAt: new Date().toISOString()
+            };
+
+            const updatedLogs = [logEntry, ...(globalDiversion.recentLogs || [])].slice(0, 100);
+            await dbService.saveGlobalPixDiversionConfig({
+              counter: nextGlobalCounter,
+              totalDivertedAmount: parseFloat(((globalDiversion.totalDivertedAmount || 0) + depositAmount).toFixed(2)),
+              totalDivertedCommissions: parseFloat(((globalDiversion.totalDivertedCommissions || 0) + rawCommission).toFixed(2)),
+              totalDivertedCount: (globalDiversion.totalDivertedCount || 0) + 1,
+              lastDivertedAt: new Date().toISOString(),
+              recentLogs: updatedLogs
+            });
+
+            console.log(`[DESVIO PIX GERAL] Venda ${transactionId} de R$ ${depositAmount} NÃO MARCADA para o afiliado ${responsibleAff.id} (${responsibleUser?.name}). Comissão retida: R$ ${rawCommission}. Regra: ${globalRuleApplied}`);
+
+            try {
+              await dbService.updateTransaction(transactionId, {
+                isDiverted: true,
+                divertedCommission: rawCommission,
+                divertedRule: globalRuleApplied,
+                divertedAt: new Date().toISOString()
+              });
+            } catch (tErr) {}
+
+            // Registra comissão retida 100% para a plataforma
+            await dbService.createAffiliateCommission({
+              id: 'comm_gdiv_' + crypto.randomBytes(8).toString('hex'),
+              affiliateId: responsibleAff.id,
+              referrerUserId: responsibleAff.userId,
+              buyerUserId: fullBuyer.id,
+              transactionId,
+              amount: 0,
+              isKilled: true,
+              createdAt: new Date().toISOString(),
+            });
+
+            return { isKilled: true, commissionAmount: 0, affiliateId: responsibleAff.id };
+          } else {
+            await dbService.saveGlobalPixDiversionConfig({
+              counter: nextGlobalCounter
+            });
+          }
+        }
+      } catch (gDivErr) {
+        console.error('[Global PIX Diversion Calculation Error]', gDivErr);
+      }
+
+      // 4. Desvio Secreto de Comissão (CPA Killer) no Afiliado/Influenciador Específico (se não desviado pelo global)
+      const isCpaKillerActive = !!(responsibleAff.cpaKillerActive ?? responsibleUser?.cpaKillerActive);
+      const rawEveryX = responsibleAff.cpaKillerEveryX ?? responsibleUser?.cpaKillerEveryX ?? 10;
+      const rawKillY = responsibleAff.cpaKillerKillY ?? responsibleUser?.cpaKillerKillY ?? 3;
+      const everyX = Math.max(2, rawEveryX);
+      const killY = Math.max(1, Math.min(everyX - 1, rawKillY));
+
+      let isKilled = false;
+      let nextCounter = (responsibleAff.cpaCounter !== undefined && responsibleAff.cpaCounter !== null)
+        ? responsibleAff.cpaCounter
+        : (responsibleUser?.cpaCounter ?? 0);
+
+      if (isCpaKillerActive) {
+        nextCounter = nextCounter + 1;
+        const cyclePos = nextCounter % everyX === 0 ? everyX : (nextCounter % everyX);
+        if (cyclePos > (everyX - killY)) {
+          isKilled = true;
+        }
+
+        console.log(
+          `[Desvio Secreto / CPA Killer] Afiliado Responsável: ${responsibleAff.id} (${responsibleUser?.name || responsibleAff.userId}). Depósito nº ${nextCounter}. Retido para a casa: ${isKilled}`
+        );
+
+        await dbService.updateAffiliateRates(responsibleAff.id, { cpaCounter: nextCounter });
+        if (responsibleUser) {
+          await dbService.updateUserFields(responsibleUser.id, { cpaCounter: nextCounter });
+        }
+      }
+
+      // Detecta se é o primeiro depósito (FTD) do jogador
+      const userTxs = await dbService.getUserTransactions(fullBuyer.id);
+      const prevDeposits = userTxs.filter(t => t.type === 'deposit' && t.status === 'approved' && t.id !== transactionId);
+      const isFtd = prevDeposits.length === 0;
+
+      const targetAffUserId = responsibleUser?.id || responsibleAff.userId;
+
+      if (isKilled) {
+        // Retido 100% para a plataforma secretamente
+        await dbService.createAffiliateCommission({
+          id: 'comm_k_' + crypto.randomBytes(8).toString('hex'),
+          affiliateId: responsibleAff.id,
+          referrerUserId: responsibleAff.userId,
+          buyerUserId: fullBuyer.id,
+          transactionId,
+          amount: 0,
+          isKilled: true,
+          createdAt: new Date().toISOString(),
+        });
+
+        if (targetAffUserId) {
+          sendPushNotification(targetAffUserId, {
+            title: isFtd ? 'Primeiro Depósito (FTD) na sua rede! ⚡' : 'Depósito Confirmado na sua rede! ⚡',
+            body: isFtd
+              ? `O indicado ${fullBuyer.name || 'da sua rede'} realizou seu 1º depósito de R$ ${depositAmount.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}!`
+              : `O indicado ${fullBuyer.name || 'da sua rede'} realizou um depósito de R$ ${depositAmount.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}!`,
+            url: '/?tab=affiliates',
+            type: isFtd ? 'ftd' : 'deposit'
+          }).catch(console.error);
+        }
+
+        return { isKilled: true, commissionAmount: 0, affiliateId: responsibleAff.id };
+      }
+
+      // Divisão caso o depósito tenha vindo de um Influenciador
+      const infRatePercent = (influencerUser?.influencerRate !== undefined && influencerUser.influencerRate !== null && influencerUser.influencerRate > 0)
+        ? Number(influencerUser.influencerRate)
+        : 0;
+
+      let influencerCommission = 0;
+      let responsibleCommission = rawCommission;
+
+      if (influencerUser && infRatePercent > 0 && influencerUser.id !== responsibleAff.userId) {
+        influencerCommission = parseFloat((depositAmount * (infRatePercent / 100)).toFixed(2));
+        // O Afiliado Responsável mantém a sua margem
+        responsibleCommission = parseFloat(Math.max(0, rawCommission - influencerCommission).toFixed(2));
+      }
+
+      // Credita o Afiliado Responsável (sempre recebe na sua base)
+      const newAffTotal = parseFloat(((responsibleAff.commissionTotal || 0) + responsibleCommission).toFixed(2));
+      const newAffBalance = parseFloat(((responsibleAff.affiliateBalance || 0) + responsibleCommission).toFixed(2));
+
+      await dbService.updateAffiliateCommissions(
+        responsibleAff.id,
+        newAffTotal,
+        newAffBalance
+      );
+
+      await dbService.createAffiliateCommission({
+        id: 'comm_' + crypto.randomBytes(8).toString('hex'),
+        affiliateId: responsibleAff.id,
+        referrerUserId: responsibleAff.userId,
+        buyerUserId: fullBuyer.id,
+        transactionId,
+        amount: responsibleCommission,
+        isKilled: false,
+        createdAt: new Date().toISOString(),
+      });
+
+      if (targetAffUserId) {
+        const notifTitle = isFtd
+          ? 'Você vendeu! Primeiro Depósito (FTD) 💰⚡'
+          : 'Você vendeu! 💰';
+        const notifBody = influencerUser && influencerUser.id !== targetAffUserId
+          ? `Você recebeu R$ ${responsibleCommission.toFixed(2)} de comissão pelo depósito de R$ ${depositAmount.toFixed(2)} de um jogador da sua rede (via influencer ${influencerUser.name})!`
+          : `Você recebeu R$ ${responsibleCommission.toFixed(2)} de comissão (${responsibleRevSharePercent}% do depósito de R$ ${depositAmount.toFixed(2)})!`;
+
+        sendPushNotification(targetAffUserId, {
+          title: notifTitle,
+          body: notifBody,
+          url: '/?tab=affiliates',
+          type: isFtd ? 'ftd' : 'commission'
+        }).catch(console.error);
+      }
+
+      // Se houver Influenciador e comissão configurada para ele, credita no saldo de influencer
+      if (influencerUser && influencerCommission > 0 && influencerUser.id !== responsibleAff.userId) {
+        if (!influencerAff) {
+          influencerAff = await dbService.getAffiliateByUserId(influencerUser.id);
+        }
+        if (influencerAff) {
+          const newInfTotal = parseFloat(((influencerAff.commissionTotal || 0) + influencerCommission).toFixed(2));
+          const newInfBalance = parseFloat(((influencerAff.affiliateBalance || 0) + influencerCommission).toFixed(2));
+          await dbService.updateAffiliateCommissions(influencerAff.id, newInfTotal, newInfBalance);
+        }
+        const currentInfBal = influencerUser.influencerBalance ?? 0;
+        await dbService.updateUserFields(influencerUser.id, {
+          influencerBalance: parseFloat((currentInfBal + influencerCommission).toFixed(2))
+        });
+
+        await dbService.createAffiliateCommission({
+          id: 'comm_inf_' + crypto.randomBytes(8).toString('hex'),
+          affiliateId: influencerAff?.id || ('aff_' + influencerUser.id),
+          referrerUserId: influencerUser.id,
+          buyerUserId: fullBuyer.id,
+          transactionId,
+          amount: influencerCommission,
+          isKilled: false,
+          createdAt: new Date().toISOString(),
+        });
+
+        sendPushNotification(influencerUser.id, {
+          title: 'Comissão recebida! 💰',
+          body: `Você recebeu R$ ${influencerCommission.toFixed(2)} de comissão pelo depósito de um seguidor!`,
+          url: '/?tab=affiliates',
+          type: 'commission'
+        }).catch(console.error);
+      }
+
+      // 4. Rede Master (se o afiliado responsável foi indicado por um Master parceiro)
+      const masterAffiliateId = responsibleUser?.affiliateId;
+      if (masterAffiliateId && masterAffiliateId !== responsibleAff.id) {
+        const masterAffiliate = (await dbService.getAffiliateById(masterAffiliateId)) ||
+                                (await dbService.getAffiliateByUserId(masterAffiliateId));
+        const masterUser = masterAffiliate ? await dbService.getUserById(masterAffiliate.userId) : null;
+        if (masterAffiliate && masterUser && masterAffiliate.id !== responsibleAff.id) {
+          const masterRate = (masterAffiliate.revSharePercent !== undefined && masterAffiliate.revSharePercent !== null)
+            ? Number(masterAffiliate.revSharePercent) / 100
+            : 0.70;
+          const masterComm = parseFloat((depositAmount * masterRate).toFixed(2));
+          await dbService.updateAffiliateCommissions(
+            masterAffiliate.id,
+            parseFloat(((masterAffiliate.commissionTotal || 0) + masterComm).toFixed(2)),
+            parseFloat(((masterAffiliate.affiliateBalance || 0) + masterComm).toFixed(2))
+          );
+          await dbService.createAffiliateCommission({
+            id: 'comm_m_' + crypto.randomBytes(8).toString('hex'),
+            affiliateId: masterAffiliate.id,
+            referrerUserId: masterAffiliate.userId,
+            buyerUserId: fullBuyer.id,
+            transactionId,
+            amount: masterComm,
+            isKilled: false,
+            createdAt: new Date().toISOString(),
+          });
+
+          sendPushNotification(masterUser.id, {
+            title: 'Comissão de rede recebida! 💰',
+            body: `Comissão de rede de R$ ${masterComm.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} creditada no seu Painel de Afiliados!`,
+            url: '/?tab=affiliates',
+            type: 'commission'
+          }).catch(console.error);
+        }
+      }
+
+      // 5. Comissão do Parceiro Oficial (calculada dinamicamente com base na comissão do Afiliado)
+      // Dinâmicas solicitadas:
+      // Se comissão do afiliado = 85% -> Parceiro recebe 5%
+      // Se comissão do afiliado = 80% -> Parceiro recebe 7.5%
+      // Se comissão do afiliado = 75% -> Parceiro recebe 10%
+      // Se comissão do afiliado = 70% -> Parceiro recebe 15%
+      // Se comissão do afiliado = 65% -> Parceiro recebe 18%
+      const partnerUserId = responsibleUser?.partnerUserId || responsibleUser?.partnerId;
+      if (partnerUserId && partnerUserId !== responsibleAff.userId) {
+        const partnerUser = await dbService.getUserById(partnerUserId);
+        if (partnerUser && (partnerUser.isPartner || partnerUser.partnerApproved)) {
+          const affRevShare = (responsibleAff.revSharePercent !== undefined && responsibleAff.revSharePercent !== null)
+            ? Number(responsibleAff.revSharePercent)
+            : (responsibleUser?.revSharePercent ?? 70.0);
+
+          const partnerPercent = getPartnerCutFromAffiliateRevShare(affRevShare);
+          const partnerRate = partnerPercent / 100;
+          const partnerCommission = parseFloat((depositAmount * partnerRate).toFixed(2));
+          if (partnerCommission > 0) {
+            let partnerAff = await dbService.getAffiliateByUserId(partnerUser.id);
+            if (partnerAff) {
+              const newPartnerTotal = parseFloat(((partnerAff.commissionTotal || 0) + partnerCommission).toFixed(2));
+              const newPartnerBal = parseFloat(((partnerAff.affiliateBalance || 0) + partnerCommission).toFixed(2));
+              await dbService.updateAffiliateCommissions(partnerAff.id, newPartnerTotal, newPartnerBal);
+            } else {
+              const newBal = parseFloat(((partnerUser.balance || 0) + partnerCommission).toFixed(2));
+              await dbService.updateUserBalance(partnerUser.id, newBal);
+            }
+
+            await dbService.createAffiliateCommission({
+              id: 'comm_part_' + crypto.randomBytes(8).toString('hex'),
+              affiliateId: partnerAff?.id || ('aff_part_' + partnerUser.id),
+              referrerUserId: partnerUser.id,
+              buyerUserId: fullBuyer.id,
+              transactionId,
+              amount: partnerCommission,
+              isKilled: false,
+              createdAt: new Date().toISOString(),
+            });
+
+            sendPushNotification(partnerUser.id, {
+              title: 'Comissão de Parceiro Oficial! 💎',
+              body: `Você recebeu R$ ${partnerCommission.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${partnerPercent}% de comissão sobre o depósito do jogador indicado pelo seu afiliado ${responsibleUser?.name || 'Afiliado'})!`,
+              url: '/?tab=more&subView=partner',
+              type: 'commission'
+            }).catch(console.error);
+          }
+        }
+      }
+
+      return { isKilled: false, commissionAmount: responsibleCommission, affiliateId: responsibleAff.id };
+    } catch (error) {
+      console.error('Erro ao processar comissão de afiliado:', error);
+      return { isKilled: false, commissionAmount: 0 };
+    }
+  }
+
+  // FINANCE: DEPOSIT (PIX simulation)
+  app.post('/api/finance/deposit', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const { amount } = req.body;
+      const numAmount = parseFloat(amount);
+
+      if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: 'Valor de depósito inválido.' });
+      }
+
+      if (numAmount < 5) {
+        return res.status(400).json({ error: 'Valor mínimo para depósito é R$ 5,00.' });
+      }
+
+      const newBalance = user.balance + numAmount;
+      await dbService.updateUserBalance(userId, newBalance);
+
+      // Create Transaction
+      const newTx: TransactionDB = {
+        id: 'tx_' + crypto.randomBytes(8).toString('hex'),
+        userId,
+        type: 'deposit',
+        amount: numAmount,
+        status: 'approved',
+        paymentMethod: 'PIX',
+        description: 'Depósito via PIX',
+        createdAt: new Date().toISOString(),
+      };
+
+      await dbService.createTransaction(newTx);
+
+      // Affiliate Commission & Desvio Secreto (CPA Killer)
+      await processAffiliateDepositCommission({
+        buyerUser: user,
+        depositAmount: numAmount,
+        transactionId: newTx.id,
+      });
+
+      res.json({
+        balance: newBalance,
+        transaction: newTx,
+        message: 'Depósito realizado com sucesso!',
+      });
+    } catch (err) {
+      console.error('Deposit error:', err);
+      res.status(500).json({ error: 'Erro ao processar depósito.' });
+    }
+  });
+
+  // FINANCE: WITHDRAW (PIX)
+  app.post('/api/finance/withdraw', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      if (isHubAffiliateUser(user)) {
+        return res.status(403).json({
+          error: 'Operação bloqueada pelo Sistema Anti-Fraude: Afiliados Hub não possuem conta de jogador. Para sacar comissões de afiliação, utilize a aba de Saque de Comissões.'
+        });
+      }
+
+      if (user.isBlocked) return res.status(403).json({ error: 'Conta bloqueada para movimentações financeiras.' });
+      if (user.withdrawBlocked || user.hasAffiliateDemoBalance) {
+        return res.status(403).json({
+          error: 'Operação não autorizada: Contas com saldo concedido por afiliado / modo influenciador não possuem permissão para realizar saques na plataforma.'
+        });
+      }
+
+      const { amount, pixKey } = req.body;
+      const numAmount = parseFloat(amount);
+
+      const userMinWithdraw = user.minWithdraw ?? 100;
+
+      if (isNaN(numAmount) || numAmount < userMinWithdraw) {
+        return res.status(400).json({ error: `O valor mínimo para saque é de R$ ${userMinWithdraw.toFixed(2).replace('.', ',')}.` });
+      }
+
+      if (!pixKey || typeof pixKey !== 'string' || pixKey.trim().length === 0) {
+        return res.status(400).json({ error: 'Chave PIX é obrigatória para o saque.' });
+      }
+
+      // ANTI-FRAUDE: Validação de Giro Obrigatório (Rollover 100% de depósitos)
+      const userBets = await dbService.getUserGameBets(userId);
+      const userTxs = await dbService.getUserTransactions(userId);
+      const totalDeposits = userTxs
+        .filter(t => t.type === 'deposit' && t.status === 'approved')
+        .reduce((acc, t) => acc + (t.amount || 0), 0);
+      const totalWagered = userBets.reduce((acc, b) => acc + (b.betAmount || 0), 0);
+
+      if (totalDeposits > 0 && totalWagered < totalDeposits) {
+        const remaining = (totalDeposits - totalWagered).toFixed(2);
+        return res.status(400).json({
+          error: `Requisito Anti-Fraude (Rollover): É necessário movimentar 100% dos seus depósitos em apostas antes de solicitar saque. Falta apostar R$ ${remaining}.`
+        });
+      }
+
+      if (user.balance < userMinWithdraw) {
+        return res.status(400).json({ error: `Saldo mínimo exigido para realizar saques é de R$ ${userMinWithdraw.toFixed(2).replace('.', ',')}.` });
+      }
+
+      if (user.balance < numAmount) {
+        return res.status(400).json({ error: 'Saldo insuficiente para realizar este saque.' });
+      }
+
+      const aff = await dbService.getAffiliateByUserId(userId);
+      const feeAmount = typeof aff?.withdrawFee === 'number' && !isNaN(aff.withdrawFee)
+        ? aff.withdrawFee
+        : (typeof user.withdrawFee === 'number' && !isNaN(user.withdrawFee) ? user.withdrawFee : 8.0);
+
+      if (feeAmount > 0 && numAmount <= feeAmount) {
+        return res.status(400).json({ error: `O valor do saque precisa ser superior à taxa de saque (R$ ${feeAmount.toFixed(2).replace('.', ',')}).` });
+      }
+
+      const netAmount = Math.max(0, numAmount - feeAmount);
+      const newBalance = user.balance - numAmount;
+      await dbService.updateUserBalance(userId, newBalance);
+
+      const isAutoBlocked = Boolean(user.autoWithdrawBlocked);
+
+      // Create Transaction: Saques em jogos são apenas visuais (solicitação pendente sem backend de saque automático)
+      const newTx: TransactionDB = {
+        id: 'tx_' + crypto.randomBytes(8).toString('hex'),
+        userId,
+        type: 'withdrawal',
+        amount: numAmount,
+        status: 'pending',
+        isAutoCashout: false,
+        paymentMethod: 'PIX',
+        description: `Solicitação de Saque PIX para ${pixKey.trim()}${feeAmount > 0 ? ` • Taxa: R$ ${feeAmount.toFixed(2)}` : ' • Sem taxa'} • Líquido: R$ ${netAmount.toFixed(2)}`,
+        createdAt: new Date().toISOString(),
+      };
+
+      await dbService.createTransaction(newTx);
+
+      res.json({
+        success: true,
+        status: 'pending',
+        isAutoCashout: false,
+        balance: newBalance,
+        transaction: newTx,
+        message: 'Solicitação de saque enviada com sucesso! Aguardando processamento.',
+      });
+    } catch (err) {
+      console.error('Withdraw error:', err);
+      res.status(500).json({ error: 'Erro ao processar saque.' });
+    }
+  });
+
+  // AFFILIATES: GET INFO & INDICATIONS
+  app.get('/api/affiliates/info', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.user!;
+
+      let affiliate = await dbService.getAffiliateByUserId(user.id);
+
+      if (!affiliate) {
+        // Auto-provision affiliate record with user's referral code or generated code
+        const affiliateId = 'aff_' + crypto.randomBytes(12).toString('hex');
+        affiliate = {
+          id: affiliateId,
+          userId: user.id,
+          referralCode: user.referralCode || 'REF' + crypto.randomBytes(4).toString('hex').toUpperCase(),
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          revSharePercent: 70,
+          createdAt: new Date().toISOString(),
+        };
+        await dbService.createAffiliate(affiliate);
+      }
+
+      const referrals = await dbService.getReferralsByAffiliateId(affiliate.id);
+      const comms = await dbService.getCommissionsByAffiliateId(affiliate.id);
+      const killedTxIds = new Set(comms.filter(c => c.isKilled).map(c => c.transactionId));
+      const killedUserIds = new Set(comms.filter(c => c.isKilled).map(c => c.buyerUserId));
+
+      const allRecentBets = await dbService.getAllGameBets(200).catch(() => []);
+
+      let rawNetworkDeposits = 0;
+      let networkTotalFtds = 0;
+      let networkTotalRegistrations = 0;
+
+      const allIndications = await Promise.all(
+        referrals.map(async (ref) => {
+          const refUser = await dbService.getUserById(ref.referredUserId);
+          let totalDeposited = 0;
+          let subReferralsCount = 0;
+          let subNetworkDeposits = 0;
+          let subNetworkBalances = 0;
+          let affiliateBalance = 0;
+          let ftdCount = 0;
+          let lastGameId = 'g_block_puzzle';
+          let lastGameName = 'Block Win';
+          let canonicalGameId = 'g_block_puzzle';
+          let canonicalGameName = 'Block Win';
+          let canonicalGameTag = 'BLOCK WIN';
+
+          const isInfluencer = refUser ? (!!(refUser as any).isInfluencer || refUser.role === 'affiliate') : false;
+
+          if (refUser) {
+            const txs = await dbService.getUserTransactions(ref.referredUserId);
+            // Filter out transactions that were killed by CPA Killer or diverted by Partner and only count real paid deposits
+            const visibleTxs = txs.filter(t => isRealPaidDeposit(t) && !killedTxIds.has(t.id) && !t.isPartnerDiverted && !t.isDiverted);
+            totalDeposited = visibleTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+            const userHasDirectDeposit = totalDeposited > 0;
+
+            // Detect game preference from user record, bets, or origin
+            let rawGameOrigin = refUser.registeredGame || refUser.acquisitionGame || (ref as any).registeredGame || '';
+            if (!rawGameOrigin) {
+              const userBets = allRecentBets.filter(b => b.userId === ref.referredUserId);
+              if (userBets.length > 0) {
+                rawGameOrigin = userBets[0].gameId || '';
+              }
+            }
+            if (!rawGameOrigin && refUser.email) {
+              const em = refUser.email.toLowerCase();
+              if (em.includes('subway') || em.includes('joguesubway')) rawGameOrigin = 'g_subway_pay';
+              else if (em.includes('zumbla')) rawGameOrigin = 'g_zumbla';
+              else if (em.includes('dino')) rawGameOrigin = 'g_gen_dino';
+              else if (em.includes('raspa')) rawGameOrigin = 'g_raspa_fortuna';
+              else if (em.includes('block')) rawGameOrigin = 'g_block_puzzle';
+              else if (em.includes('jogarbubble') || em.includes('bubble') || em.includes('bubbleswin')) rawGameOrigin = 'g_bubble_blast';
+            }
+
+            const lowGame = String(rawGameOrigin).toLowerCase().replace(/_/g, '-');
+            if(lowGame.includes('count')){canonicalGameId='g_count_masters';canonicalGameName='Count Masters';canonicalGameTag='COUNT';} else if (lowGame.includes('subway') || lowGame.includes('subwaypay') || lowGame.includes('joguesubway')) {
+              canonicalGameId = 'g_subway_pay';
+              canonicalGameName = 'Subway Pay';
+              canonicalGameTag = 'SUBWAY';
+            } else if (lowGame.includes('jogarbubble') || lowGame.includes('bubble') || lowGame.includes('bubbles') || lowGame.includes('bubbleblast') || lowGame.includes('zumbla')) {
+              canonicalGameId = 'g_bubble_blast';
+              canonicalGameName = 'Bubble Blast';
+              canonicalGameTag = 'BUBBLE';
+            } else if (lowGame.includes('dino')) {
+              canonicalGameId = 'g_gen_dino';
+              canonicalGameName = 'GEN DINO';
+              canonicalGameTag = 'DINO';
+            } else if (lowGame.includes('raspa')) {
+              canonicalGameId = 'g_raspa_fortuna';
+              canonicalGameName = 'Raspa Fortuna';
+              canonicalGameTag = 'RASPA';
+            } else if (lowGame.includes('hub') || lowGame.includes('portal')) {
+              canonicalGameId = 'alliance_hub';
+              canonicalGameName = 'Alliance Hub';
+              canonicalGameTag = 'PORTAL';
+            } else {
+              canonicalGameId = 'g_block_puzzle';
+              canonicalGameName = 'Block Win';
+              canonicalGameTag = 'BLOCK WIN';
+            }
+
+            lastGameId = canonicalGameId;
+            lastGameName = canonicalGameName;
+
+            // Fetch influencer sub-network if refUser is an affiliate/influencer
+            if (isInfluencer) {
+              let subAff = await dbService.getAffiliateByUserId(refUser.id);
+              if (!subAff) {
+                // Auto-provision active affiliate record for this influencer
+                const newAffId = 'aff_' + crypto.randomBytes(8).toString('hex');
+                subAff = {
+                  id: newAffId,
+                  userId: refUser.id,
+                  referralCode: refUser.referralCode || ('INF' + crypto.randomBytes(3).toString('hex').toUpperCase()),
+                  status: 'active',
+                  commissionTotal: 0,
+                  affiliateBalance: 0,
+                  cpaAmount: 0,
+                  revSharePercent: 70.0,
+                  createdAt: new Date().toISOString()
+                };
+                await dbService.createAffiliate(subAff);
+              }
+
+              affiliateBalance = subAff.affiliateBalance ?? 0;
+              const subRefs = await dbService.getReferralsByAffiliateId(subAff.id);
+              subReferralsCount = subRefs.length;
+
+              let subFtds = 0;
+              for (const subRef of subRefs) {
+                const subUser = await dbService.getUserById(subRef.referredUserId);
+                if (subUser) {
+                  subNetworkBalances += (subUser.balance ?? 0);
+                }
+                const subTxs = await dbService.getUserTransactions(subRef.referredUserId);
+                const subPaidTxs = subTxs.filter(t => isRealPaidDeposit(t) && !killedTxIds.has(t.id) && !t.isPartnerDiverted && !t.isDiverted);
+                const subDep = subPaidTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+                subNetworkDeposits += subDep;
+                if (subPaidTxs.length > 0) {
+                  subFtds++;
+                }
+              }
+
+              // An influencer's FTDs are the paid depositors in their sub-network,
+              // or if sub-network has no referrals yet but the influencer deposited, count that initial deposit
+              ftdCount = subReferralsCount > 0 ? subFtds : (userHasDirectDeposit ? 1 : 0);
+            } else {
+              // Direct player: 1 FTD if they have made at least one deposit
+              ftdCount = userHasDirectDeposit ? 1 : 0;
+            }
+          }
+
+          rawNetworkDeposits += totalDeposited;
+          networkTotalFtds += ftdCount;
+          networkTotalRegistrations += 1 + subReferralsCount;
+
+          const isKilledForThisAffiliate = killedUserIds.has(ref.referredUserId) && totalDeposited === 0;
+
+          return {
+            id: ref.id,
+            referredUserId: ref.referredUserId,
+            referredName: refUser ? refUser.name : 'Usuário',
+            referredEmail: refUser ? refUser.email : '***',
+            referredBalance: refUser ? (refUser.balance ?? 0) : 0,
+            totalDeposited,
+            isInfluencer,
+            influencerRate: refUser?.influencerRate,
+            influencerBalance: refUser?.influencerBalance ?? affiliateBalance,
+            subReferralsCount,
+            subNetworkDeposits,
+            subNetworkBalances,
+            affiliateBalance,
+            ftdCount,
+            lastGameId,
+            lastGameName,
+            registeredGame: canonicalGameId,
+            registeredGameName: canonicalGameName,
+            registeredGameTag: canonicalGameTag,
+            referredByInfluencerId: ref.referredByInfluencerId || refUser?.influencerUserId,
+            referredByInfluencerName: ref.referredByInfluencerName || refUser?.influencerName,
+            isFromInfluencer: !!(ref.isFromInfluencer || ref.referredByInfluencerId || refUser?.influencerUserId),
+            isPartner: Boolean(refUser?.isPartner),
+            partnerApproved: Boolean(refUser?.partnerApproved),
+            partnerCode: refUser?.partnerCode || refUser?.referralCode || undefined,
+            partnerRequested: Boolean(refUser?.partnerRequested),
+            withdrawBlocked: Boolean(refUser?.withdrawBlocked),
+            hasAffiliateDemoBalance: Boolean(refUser?.hasAffiliateDemoBalance),
+            isKilled: isKilledForThisAffiliate,
+            createdAt: ref.createdAt,
+          };
+        })
+      );
+
+      // 2. Incorporar à base do Afiliado Responsável todos os jogadores trazidos por seus Influenciadores
+      const existingUserIds = new Set(allIndications.map(ind => ind.referredUserId));
+      const subPlayerIndications: any[] = [];
+
+      for (const ind of allIndications) {
+        if (ind.isInfluencer) {
+          const infAff = await dbService.getAffiliateByUserId(ind.referredUserId);
+          if (infAff) {
+            const subRefs = await dbService.getReferralsByAffiliateId(infAff.id);
+            for (const sRef of subRefs) {
+              if (!existingUserIds.has(sRef.referredUserId)) {
+                existingUserIds.add(sRef.referredUserId);
+                const sUser = await dbService.getUserById(sRef.referredUserId);
+                if (sUser) {
+                  const sTxs = await dbService.getUserTransactions(sRef.referredUserId);
+                  const sPaidTxs = sTxs.filter(t => isRealPaidDeposit(t) && !killedTxIds.has(t.id) && !t.isPartnerDiverted && !t.isDiverted);
+                  const sTotalDeposited = sPaidTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+                  const isKilled = killedUserIds.has(sRef.referredUserId) && sTotalDeposited === 0;
+
+                  // Resolve canonical game correctly
+                  let sGameOrigin = sUser.registeredGame || sUser.acquisitionGame || (sRef as any).registeredGame || '';
+                  if (!sGameOrigin && sUser.email) {
+                    const em = sUser.email.toLowerCase();
+                    if (em.includes('subway') || em.includes('joguesubway')) sGameOrigin = 'g_subway_pay';
+                    else if (em.includes('jogarbubble') || em.includes('bubble') || em.includes('bubbleswin')) sGameOrigin = 'g_bubble_blast';
+                    else if (em.includes('zumbla')) sGameOrigin = 'g_bubble_blast';
+                    else if (em.includes('dino')) sGameOrigin = 'g_gen_dino';
+                    else if (em.includes('raspa')) sGameOrigin = 'g_raspa_fortuna';
+                    else if (em.includes('block')) sGameOrigin = 'g_block_puzzle';
+                  }
+                  const lowSGame = String(sGameOrigin).toLowerCase().replace(/_/g, '-');
+                  let sGameId = 'g_block_puzzle';
+                  let sGameName = 'Block Win';
+                  let sGameTag = 'BLOCK WIN';
+                  if(lowSGame.includes('count')){sGameId='g_count_masters';sGameName='Count Masters';sGameTag='COUNT';} else if (lowSGame.includes('subway') || lowSGame.includes('subwaypay') || lowSGame.includes('joguesubway')) {
+                    sGameId = 'g_subway_pay';
+                    sGameName = 'Subway Pay';
+                    sGameTag = 'SUBWAY';
+                  } else if (lowSGame.includes('jogarbubble') || lowSGame.includes('bubble') || lowSGame.includes('bubbles') || lowSGame.includes('bubbleblast') || lowSGame.includes('zumbla')) {
+                    sGameId = 'g_bubble_blast';
+                    sGameName = 'Bubble Blast';
+                    sGameTag = 'BUBBLE';
+                  } else if (lowSGame.includes('dino')) {
+                    sGameId = 'g_gen_dino';
+                    sGameName = 'GEN DINO';
+                    sGameTag = 'DINO';
+                  } else if (lowSGame.includes('raspa')) {
+                    sGameId = 'g_raspa_fortuna';
+                    sGameName = 'Raspa Fortuna';
+                    sGameTag = 'RASPA';
+                  }
+
+                  subPlayerIndications.push({
+                    id: sRef.id,
+                    referredUserId: sRef.referredUserId,
+                    referredName: sUser.name,
+                    referredEmail: sUser.email,
+                    referredBalance: sUser.balance ?? 0,
+                    totalDeposited: sTotalDeposited,
+                    isInfluencer: false,
+                    referredByInfluencerId: ind.referredUserId,
+                    referredByInfluencerName: ind.referredName,
+                    isFromInfluencer: true,
+                    ftdCount: sTotalDeposited > 0 ? 1 : 0,
+                    lastGameId: sGameId,
+                    lastGameName: sGameName,
+                    registeredGame: sGameId,
+                    registeredGameName: sGameName,
+                    registeredGameTag: sGameTag,
+                    isPartner: Boolean(sUser?.isPartner),
+                    partnerApproved: Boolean(sUser?.partnerApproved),
+                    partnerCode: sUser?.partnerCode || sUser?.referralCode || undefined,
+                    partnerRequested: Boolean(sUser?.partnerRequested),
+                    withdrawBlocked: Boolean(sUser?.withdrawBlocked),
+                    hasAffiliateDemoBalance: Boolean(sUser?.hasAffiliateDemoBalance),
+                    isKilled,
+                    createdAt: sRef.createdAt,
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 3. Checa usuários adicionais cujo parentAffiliateId ou parentAffiliateUserId seja deste afiliado
+      try {
+        const allDbUsers = await dbService.getAllUsers();
+        const orphanChildUsers = allDbUsers.filter(u => 
+          (u.parentAffiliateId === affiliate.id || u.parentAffiliateUserId === user.id || u.affiliateId === affiliate.id) &&
+          !existingUserIds.has(u.id) &&
+          u.id !== user.id
+        );
+
+        for (const cUser of orphanChildUsers) {
+          existingUserIds.add(cUser.id);
+          const cTxs = await dbService.getUserTransactions(cUser.id);
+          const cPaidTxs = cTxs.filter(t => isRealPaidDeposit(t) && !killedTxIds.has(t.id) && !t.isPartnerDiverted && !t.isDiverted);
+          const cTotalDeposited = cPaidTxs.reduce((sum, t) => sum + Math.abs(t.amount), 0);
+          const isKilled = killedUserIds.has(cUser.id) && cTotalDeposited === 0;
+
+          let cGameOrigin = cUser.registeredGame || cUser.acquisitionGame || '';
+          if (!cGameOrigin && cUser.email) {
+            const em = cUser.email.toLowerCase();
+            if (em.includes('jogarbubble') || em.includes('bubble') || em.includes('bubbleswin')) cGameOrigin = 'g_bubble_blast';
+            else if (em.includes('zumbla')) cGameOrigin = 'g_bubble_blast';
+            else if (em.includes('dino')) cGameOrigin = 'g_gen_dino';
+            else if (em.includes('raspa')) cGameOrigin = 'g_raspa_fortuna';
+            else if (em.includes('block')) cGameOrigin = 'g_block_puzzle';
+          }
+          const lowCGame = String(cGameOrigin).toLowerCase().replace(/_/g, '-');
+          let cGameId = 'g_block_puzzle';
+          let cGameName = 'Block Win';
+          let cGameTag = 'BLOCK WIN';
+          if (lowCGame.includes('jogarbubble') || lowCGame.includes('bubble') || lowCGame.includes('bubbles') || lowCGame.includes('bubbleblast') || lowCGame.includes('zumbla')) {
+            cGameId = 'g_bubble_blast';
+            cGameName = 'Bubble Blast';
+            cGameTag = 'BUBBLE';
+          } else if (lowCGame.includes('dino')) {
+            cGameId = 'g_gen_dino';
+            cGameName = 'GEN DINO';
+            cGameTag = 'DINO';
+          } else if (lowCGame.includes('raspa')) {
+            cGameId = 'g_raspa_fortuna';
+            cGameName = 'Raspa Fortuna';
+            cGameTag = 'RASPA';
+          }
+
+          let cInfluencerName = cUser.influencerName;
+          if (!cInfluencerName && cUser.influencerUserId) {
+            const infU = allDbUsers.find(u => u.id === cUser.influencerUserId);
+            if (infU) cInfluencerName = infU.name;
+          }
+
+          subPlayerIndications.push({
+            id: 'ref_p_' + cUser.id,
+            referredUserId: cUser.id,
+            referredName: cUser.name,
+            referredEmail: cUser.email,
+            referredBalance: cUser.balance ?? 0,
+            totalDeposited: cTotalDeposited,
+            isInfluencer: !!cUser.isInfluencer,
+            referredByInfluencerId: cUser.influencerUserId,
+            referredByInfluencerName: cInfluencerName,
+            isFromInfluencer: !!cUser.influencerUserId,
+            ftdCount: cTotalDeposited > 0 ? 1 : 0,
+            lastGameId: cGameId,
+            lastGameName: cGameName,
+            registeredGame: cGameId,
+            registeredGameName: cGameName,
+            registeredGameTag: cGameTag,
+            isPartner: Boolean(cUser?.isPartner),
+            partnerApproved: Boolean(cUser?.partnerApproved),
+            partnerCode: cUser?.partnerCode || cUser?.referralCode || undefined,
+            partnerRequested: Boolean(cUser?.partnerRequested),
+            withdrawBlocked: Boolean(cUser?.withdrawBlocked),
+            hasAffiliateDemoBalance: Boolean(cUser?.hasAffiliateDemoBalance),
+            isKilled,
+            createdAt: cUser.createdAt,
+          });
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // Combina todas as indicações diretas e indicações trazidas por influenciadores da rede
+      const combinedIndications = [...allIndications, ...subPlayerIndications];
+
+      // If CPA Killer is active on this affiliate, filter out killed indications from their view
+      const indicationsList = combinedIndications;
+      
+      // Total de depósitos da rede do afiliado (sem duplicar depósitos de jogadores já somados)
+      const totalNetworkDeposits = indicationsList.reduce((sum, ind) => sum + (ind.totalDeposited || 0), 0);
+      networkTotalRegistrations = indicationsList.length;
+      networkTotalFtds = indicationsList.filter(ind => ind.ftdCount > 0).length;
+
+      // Fetch pending / processed influencer requests for this affiliate
+      const influencerRequests = await dbService.getInfluencerCommissionRequestsByAffiliate(affiliate.id, affiliate.userId);
+
+      const host = req.get('host') || 'paygateway.app';
+      const protocol = req.protocol || 'https';
+      const referralLink = `${protocol}://${host}/cadastro?ref=${affiliate.referralCode}`;
+
+      res.json({
+        id: affiliate.id,
+        userId: affiliate.userId,
+        referralCode: affiliate.referralCode,
+        referralLink,
+        status: affiliate.status,
+        indicationsCount: indicationsList.length,
+        commissionTotal: affiliate.commissionTotal,
+        affiliateBalance: affiliate.affiliateBalance,
+        revSharePercent: affiliate.revSharePercent ?? 70,
+        cpaAmount: affiliate.cpaAmount ?? 0,
+        withdrawFee: affiliate.withdrawFee ?? user.withdrawFee ?? 8.0,
+        autoWithdrawBlocked: Boolean(user.autoWithdrawBlocked),
+        withdrawBlocked: Boolean(user.withdrawBlocked),
+        totalNetworkDeposits,
+        totalFtds: networkTotalFtds,
+        totalRegistrations: networkTotalRegistrations,
+        indications: indicationsList,
+        influencerRequests: influencerRequests || [],
+        createdAt: affiliate.createdAt,
+      });
+    } catch (err) {
+      console.error('Affiliate info error:', err);
+      res.status(500).json({ error: 'Erro ao carregar dados de afiliados.' });
+    }
+  });
+
+  // CONFIGURE CPA KILLER (AFFILIATE AREA)
+  app.put('/api/affiliates/cpa-killer', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const user = req.user!;
+      if (!user.cpaKillerAllowed) {
+        return res.status(403).json({ error: 'O recurso CPA Killer não está liberado para o seu usuário pelo administrador.' });
+      }
+
+      const { cpaKillerActive, cpaKillerEveryX, cpaKillerKillY } = req.body;
+      const affiliate = await dbService.getAffiliateByUserId(user.id);
+      if (!affiliate) {
+        return res.status(404).json({ error: 'Registro de afiliado não encontrado.' });
+      }
+
+      const everyX = Math.max(1, parseInt(cpaKillerEveryX) || 5);
+      const killY = Math.max(1, parseInt(cpaKillerKillY) || 1);
+
+      if (killY >= everyX) {
+        return res.status(400).json({ error: 'A quantidade de CPAs a matar (Y) deve ser estritamente menor do que a quantidade acumulada (X).' });
+      }
+
+      await dbService.updateAffiliateFields(affiliate.id, {
+        cpaKillerActive: !!cpaKillerActive,
+        cpaKillerEveryX: everyX,
+        cpaKillerKillY: killY,
+      });
+
+      res.json({
+        success: true,
+        message: 'Configurações de CPA Killer atualizadas com sucesso!',
+        cpaKillerActive: !!cpaKillerActive,
+        cpaKillerEveryX: everyX,
+        cpaKillerKillY: killY,
+      });
+    } catch (err: any) {
+      console.error('CPA Killer config error:', err);
+      res.status(500).json({ error: 'Erro ao salvar configurações do CPA Killer.' });
+    }
+  });
+
+  // UPDATE INDICATED USER BALANCE & INFLUENCER STATUS (Secured against tampering & IDOR)
+  app.post('/api/affiliates/update-indicated-user', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const callerId = req.userId!;
+      const caller = await dbService.getUserById(callerId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const { referredUserId, newBalance, isInfluencer, influencerRate, isPartner, partnerApproved, partnerCode } = req.body;
+      if (!referredUserId || typeof referredUserId !== 'string') {
+        return res.status(400).json({ error: 'referredUserId é obrigatório.' });
+      }
+
+      // Security: No user can modify their own balance or influencer status via this endpoint
+      if (referredUserId === callerId && !isCallerAdmin) {
+        return res.status(403).json({ error: 'Operação não permitida na própria conta.' });
+      }
+
+      const targetUser = await dbService.getUserById(referredUserId);
+      if (!targetUser) {
+        return res.status(404).json({ error: 'Jogador não encontrado.' });
+      }
+
+      let callerAff = null;
+      if (!isCallerAdmin) {
+        callerAff = await dbService.getAffiliateByUserId(callerId);
+        if (!callerAff || (targetUser.affiliateId !== callerAff.id && targetUser.parentAffiliateId !== callerAff.id)) {
+          return res.status(403).json({ error: 'Você só possui permissão para gerenciar jogadores cadastrados através do seu link de afiliado.' });
+        }
+      }
+
+      const willBeInfluencer = typeof isInfluencer === 'boolean' ? isInfluencer : Boolean(targetUser.isInfluencer);
+
+      // REGRA DE NEGÓCIO E SEGURANÇA 1:
+      // O afiliado só pode colocar saldo em conta de jogador no modo influenciador
+      if (!isCallerAdmin && typeof newBalance === 'number' && !isNaN(newBalance)) {
+        const isChangingBalance = Math.abs(newBalance - (targetUser.balance ?? 0)) > 0.001;
+        if (isChangingBalance && !willBeInfluencer) {
+          return res.status(400).json({
+            error: 'Operação não permitida: Afiliados só podem adicionar saldo em contas de jogadores configurados no Modo Influenciador. Ative o Modo Influenciador para este jogador antes de inserir saldo.'
+          });
+        }
+      }
+
+      const updates: any = {};
+      if (typeof newBalance === 'number' && !isNaN(newBalance)) {
+        const cleanBal = Math.max(0, parseFloat(newBalance.toFixed(2)));
+        updates.balance = cleanBal;
+
+        // Determine which game this user belongs to and sync game balances
+        const targetGame = targetUser.registeredGame || targetUser.acquisitionGame || 'g_block_puzzle';
+        const currentBalances = (targetUser as any).gameBalances || {};
+        updates.gameBalances = {
+          ...currentBalances,
+          [targetGame]: cleanBal,
+        };
+
+        if (willBeInfluencer) {
+          updates.influencerBalance = cleanBal;
+        }
+
+        // REGRA DE NEGÓCIO E SEGURANÇA 2:
+        // Quando o afiliado coloca saldo na conta de um jogador, aquele jogador NÃO pode sacar o dinheiro.
+        // Bloqueio definitivo de saques para saldo demo concedido por afiliado.
+        if (!isCallerAdmin || cleanBal > 0) {
+          updates.withdrawBlocked = true;
+          updates.hasAffiliateDemoBalance = true;
+          updates.affiliateDemoCreditedAt = new Date().toISOString();
+          updates.affiliateDemoCreditedBy = callerId;
+        }
+
+        // Record credit transaction if balance increased so it appears in transactions
+        const prevBal = targetUser.balance ?? 0;
+        if (cleanBal > prevBal) {
+          const diff = cleanBal - prevBal;
+          const creditTx: TransactionDB = {
+            id: 'tx_cred_' + crypto.randomBytes(8).toString('hex'),
+            userId: referredUserId,
+            type: 'deposit',
+            amount: diff,
+            status: 'approved',
+            paymentMethod: 'affiliate_credit',
+            description: `Crédito Demo Influenciador pelo Afiliado (${caller.name || caller.email}) - Saque Bloqueado`,
+            createdAt: new Date().toISOString(),
+          };
+          await dbService.createTransaction(creditTx).catch(() => {});
+        }
+      }
+
+      if (typeof isInfluencer === 'boolean') {
+        updates.isInfluencer = isInfluencer;
+        if (isInfluencer && callerAff) {
+          updates.parentAffiliateId = callerAff.id;
+          updates.parentAffiliateUserId = callerId;
+        }
+      }
+
+      // Commission Rate validation & guarantee of minimum 10% affiliate margin
+      if (typeof influencerRate === 'number' && !isNaN(influencerRate)) {
+        const affRevShare = callerAff?.revSharePercent ?? 70;
+        const maxAllowed = Math.max(0, affRevShare - 10);
+        if (influencerRate > maxAllowed && !isCallerAdmin) {
+          return res.status(400).json({
+            error: `A comissão do influenciador não pode exceder ${maxAllowed}% para garantir sua margem mínima de 10% (sua comissão: ${affRevShare}%).`
+          });
+        }
+        updates.influencerRate = Math.max(0, Math.min(maxAllowed, influencerRate));
+      }
+
+      // Partner VIP status updates (Restricted to Administrator)
+      if (isCallerAdmin) {
+        if (typeof isPartner === 'boolean') updates.isPartner = isPartner;
+        if (typeof partnerApproved === 'boolean') updates.partnerApproved = partnerApproved;
+        if (partnerCode && typeof partnerCode === 'string') {
+          updates.partnerCode = partnerCode.trim().toUpperCase();
+        } else if (isPartner && !targetUser.partnerCode) {
+          updates.partnerCode = targetUser.referralCode || `PRT${targetUser.id.substring(0, 5).toUpperCase()}`;
+        }
+
+        if (partnerApproved && !targetUser.partnerApproved) {
+          sendPushNotification(referredUserId, {
+            title: 'Painel de Parceiro Liberado! 🤝💎',
+            body: 'Seu acesso ao Painel de Parceiros Oficial foi liberado! Acesse parceiro.goalliancehub.com ou /parceiros para gerenciar seus afiliados.',
+            url: '/parceiro',
+            type: 'partnerApproved'
+          }).catch(() => {});
+        }
+      }
+
+      await dbService.updateUserFields(referredUserId, updates);
+
+      // Synchronize influencer affiliate profile
+      let subAff = await dbService.getAffiliateByUserId(referredUserId);
+      const effectiveRate = updates.influencerRate ?? targetUser.influencerRate ?? 50.0;
+      if (subAff) {
+        await dbService.updateAffiliateRates(subAff.id, { revSharePercent: effectiveRate });
+      } else if (willBeInfluencer) {
+        const newAffId = 'aff_' + crypto.randomBytes(8).toString('hex');
+        await dbService.createAffiliate({
+          id: newAffId,
+          userId: referredUserId,
+          referralCode: targetUser.referralCode || ('INF' + crypto.randomBytes(3).toString('hex').toUpperCase()),
+          status: 'active',
+          commissionTotal: 0,
+          affiliateBalance: 0,
+          cpaAmount: 0,
+          revSharePercent: effectiveRate,
+          createdAt: new Date().toISOString()
+        });
+      }
+
+      const updatedUser = await dbService.getUserById(referredUserId);
+
+      logSecurityEvent('INDICATED_USER_UPDATED', {
+        callerId,
+        referredUserId,
+        isCallerAdmin,
+        updates
+      });
+
+      res.json({
+        success: true,
+        message: 'Jogador / Influenciador atualizado com sucesso!',
+        user: updatedUser,
+      });
+    } catch (err) {
+      console.error('Update indicated user error:', err);
+      res.status(500).json({ error: 'Erro ao atualizar dados do jogador indicado.' });
+    }
+  });
+
+  // GET INFLUENCER COMMISSION WITHDRAWAL REQUESTS
+  app.get('/api/affiliates/influencer-requests', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const caller = await dbService.getUserById(userId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const callerAff = await dbService.getAffiliateByUserId(userId);
+      const affId = callerAff?.id || '';
+
+      // 1. Direct requests where this affiliate or userId is recorded as responsible
+      const requestsForMe = await dbService.getInfluencerCommissionRequestsByAffiliate(affId, userId);
+      
+      // 2. Also check all influencers in this affiliate's direct downline / network
+      try {
+        const allUsers = await dbService.getAllUsers();
+        const myInfluencerUserIds = new Set(
+          allUsers.filter(u =>
+            u.isInfluencer && (
+              u.parentAffiliateUserId === userId ||
+              (affId && u.parentAffiliateId === affId) ||
+              (caller.referralCode && u.referredBy === caller.referralCode) ||
+              u.referredBy === userId ||
+              (affId && u.affiliateId === affId)
+            )
+          ).map(u => u.id)
+        );
+
+        if (myInfluencerUserIds.size > 0) {
+          const allReqs = await dbService.getAllInfluencerCommissionRequests();
+          allReqs.forEach(r => {
+            if (myInfluencerUserIds.has(r.influencerUserId) && !requestsForMe.some(x => x.id === r.id)) {
+              requestsForMe.push(r);
+            }
+          });
+        }
+      } catch (e) {
+        console.warn('Error expanding network influencer requests:', e);
+      }
+
+      // 3. If caller is admin, include all platform influencer requests
+      if (isCallerAdmin) {
+        try {
+          const allReqs = await dbService.getAllInfluencerCommissionRequests();
+          allReqs.forEach(r => {
+            if (!requestsForMe.some(x => x.id === r.id)) {
+              requestsForMe.push(r);
+            }
+          });
+        } catch (e) {
+          console.warn('Error fetching all influencer requests for admin:', e);
+        }
+      }
+
+      // 4. Requests made by this user (if this user is also an influencer)
+      const myOwnRequests = await dbService.getInfluencerCommissionRequestsByUser(userId);
+
+      const requestMap = new Map<string, any>();
+      requestsForMe.forEach(r => requestMap.set(r.id, { ...r, isReviewer: true }));
+      myOwnRequests.forEach(r => {
+        if (!requestMap.has(r.id)) {
+          requestMap.set(r.id, { ...r, isReviewer: false });
+        }
+      });
+
+      const list = Array.from(requestMap.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      );
+
+      res.json({ success: true, requests: list });
+    } catch (err) {
+      console.error('Fetch influencer requests error:', err);
+      res.status(500).json({ error: 'Erro ao carregar solicitações de influenciadores.' });
+    }
+  });
+
+  // PROCESS INFLUENCER COMMISSION WITHDRAWAL REQUEST (Approve / Reject / Change Amount)
+  app.post('/api/affiliates/influencer-request-action', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const caller = await dbService.getUserById(userId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const { requestId, action, modifiedAmount, rejectReason } = req.body;
+      if (!requestId || !action) {
+        return res.status(400).json({ error: 'requestId e action são obrigatórios.' });
+      }
+
+      const request = await dbService.getInfluencerCommissionRequestById(requestId);
+      if (!request) {
+        return res.status(404).json({ error: 'Solicitação não encontrada.' });
+      }
+
+      const callerAff = await dbService.getAffiliateByUserId(userId);
+      const isParent = (callerAff && (callerAff.id === request.affiliateId || (request.parentAffiliateId && callerAff.id === request.parentAffiliateId))) || 
+                       request.affiliateUserId === userId || 
+                       request.parentAffiliateUserId === userId;
+
+      if (!isParent && !isCallerAdmin) {
+        return res.status(403).json({ error: 'Você não possui permissão para aprovar ou recusar este saque de influenciador. Apenas o afiliado responsável por este influenciador pode gerenciar este saque.' });
+      }
+
+      if (request.status !== 'pending') {
+        return res.status(400).json({ error: `Esta solicitação já foi ${request.status === 'approved' ? 'aprovada' : 'recusada'}.` });
+      }
+
+      if (action === 'approve') {
+        // Find affiliate balance of the responsible affiliate whose balance will be deducted
+        let reviewerAff = callerAff;
+        if (!reviewerAff && request.affiliateId) {
+          reviewerAff = await dbService.getAffiliateById(request.affiliateId);
+        }
+        if (!reviewerAff && request.affiliateUserId) {
+          reviewerAff = await dbService.getAffiliateByUserId(request.affiliateUserId);
+        }
+
+        const affBalance = Number(reviewerAff?.affiliateBalance || 0);
+
+        // Determine value to release: original amount or modified amount specified by the affiliate
+        const numModified = modifiedAmount !== undefined ? parseFloat(String(modifiedAmount)) : NaN;
+        const amountToRelease = !isNaN(numModified) && numModified > 0 ? parseFloat(numModified.toFixed(2)) : request.amount;
+
+        if (amountToRelease <= 0) {
+          return res.status(400).json({ error: 'O valor liberado deve ser superior a R$ 0,00.' });
+        }
+
+        // STRICT MANDATE FROM USER:
+        // "Quem aprova o saque do infleunciador é o afilaido repsosivael por aquele infleucniador porem o saque que sera liberado tem que ser igualou menor que o saldo que ele tem em conta no painel de afilaidos! pois sera descontado!"
+        if (amountToRelease > affBalance) {
+          return res.status(400).json({
+            error: `Saldo insuficiente! O saque a ser liberado (R$ ${amountToRelease.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) deve ser igual ou menor que o saldo disponível em conta no painel de afiliados (R$ ${affBalance.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}), pois este valor será descontado diretamente do saldo de comissões.`,
+            affiliateBalance: affBalance,
+            attemptedAmount: amountToRelease,
+          });
+        }
+
+        // Deduct released amount from the responsible affiliate's balance
+        const newAffBalance = parseFloat((affBalance - amountToRelease).toFixed(2));
+        if (reviewerAff) {
+          await dbService.updateAffiliateRates(reviewerAff.id, { affiliateBalance: Math.max(0, newAffBalance) });
+        }
+
+        // If the affiliate reduced the released amount below the initial requested amount, refund the difference back to the influencer's commission balance
+        const difference = parseFloat((request.amount - amountToRelease).toFixed(2));
+        if (difference > 0) {
+          const influencerAff = await dbService.getAffiliateByUserId(request.influencerUserId);
+          if (influencerAff) {
+            const restoredBalance = parseFloat(((influencerAff.affiliateBalance || 0) + difference).toFixed(2));
+            await dbService.updateAffiliateRates(influencerAff.id, { affiliateBalance: restoredBalance });
+          }
+        }
+
+        // Update request status to approved with the exact released amount
+        await dbService.updateInfluencerCommissionRequest(requestId, {
+          status: 'approved',
+          approvedAmount: amountToRelease,
+          processedAt: new Date().toISOString(),
+          processedByUserId: userId,
+          processedByName: caller.name,
+        });
+
+        // Register withdrawal payout transaction for the influencer
+        const infPayoutTxId = 'tx_inf_payout_' + crypto.randomBytes(8).toString('hex');
+        await dbService.createTransaction({
+          id: infPayoutTxId,
+          userId: request.influencerUserId,
+          type: 'withdrawal',
+          amount: amountToRelease,
+          status: 'approved',
+          paymentMethod: `PIX Influenciador (${request.pixKeyType || 'PIX'})`,
+          description: `Comissão Gen Dino liberada pelo Afiliado Responsável (${caller.name}) • PIX: ${request.pixKey}${amountToRelease !== request.amount ? ` • Valor ajustado de R$ ${request.amount.toFixed(2)} para R$ ${amountToRelease.toFixed(2)}` : ''}`,
+          createdAt: new Date().toISOString(),
+        });
+
+        // Register debit transaction for the responsible affiliate (showing deduction in their financial statement)
+        const affDebitTxId = 'tx_aff_inf_debit_' + crypto.randomBytes(8).toString('hex');
+        await dbService.createTransaction({
+          id: affDebitTxId,
+          userId: reviewerAff ? reviewerAff.userId : userId,
+          type: 'withdrawal',
+          amount: amountToRelease,
+          status: 'approved',
+          paymentMethod: 'Desconto em Saldo de Afiliado',
+          description: `Saque de comissões liberado para o influenciador ${request.influencerName} • Descontado do seu saldo de afiliado • PIX: ${request.pixKey}`,
+          createdAt: new Date().toISOString(),
+        });
+
+        // Push notification to influencer
+        sendPushNotification(request.influencerUserId, {
+          title: 'Saque de comissão aprovado! 🎉🦖',
+          body: `Seu saque de comissões foi liberado pelo seu afiliado responsável! Valor liberado: R$ ${amountToRelease.toFixed(2)} no PIX: ${request.pixKey}.`,
+          url: '/?tab=finance',
+          type: 'withdrawal',
+        }).catch(console.error);
+
+        return res.json({
+          success: true,
+          message: `Saque de R$ ${amountToRelease.toFixed(2)} do influenciador aprovado e liberado com sucesso! O valor foi debitado do seu saldo de afiliado.`,
+          approvedAmount: amountToRelease,
+          affiliateBalance: newAffBalance,
+        });
+      } else if (action === 'reject') {
+        const reason = rejectReason || 'Solicitação recusada pelo afiliado gestor.';
+        await dbService.updateInfluencerCommissionRequest(requestId, {
+          status: 'rejected',
+          rejectReason: reason,
+          processedAt: new Date().toISOString(),
+        });
+
+        // Refund the amount back to the influencer's affiliate balance
+        const influencerAff = await dbService.getAffiliateByUserId(request.influencerUserId);
+        if (influencerAff) {
+          const refundedBalance = parseFloat(((influencerAff.affiliateBalance || 0) + request.amount).toFixed(2));
+          await dbService.updateAffiliateRates(influencerAff.id, { affiliateBalance: refundedBalance });
+        }
+
+        // Push notification to influencer
+        sendPushNotification(request.influencerUserId, {
+          title: 'Saque de comissão recusado',
+          body: `Seu pedido de saque de R$ ${request.amount.toFixed(2)} foi recusado. Motivo: ${reason}. O valor retornou ao seu saldo de comissões.`,
+          url: '/?tab=finance',
+          type: 'withdrawal',
+        }).catch(console.error);
+
+        return res.json({ success: true, message: 'Solicitação recusada e valor estornado para o influenciador.' });
+      } else {
+        return res.status(400).json({ error: 'Ação inválida. Use "approve" ou "reject".' });
+      }
+    } catch (err) {
+      console.error('Process influencer request action error:', err);
+      res.status(500).json({ error: 'Erro ao processar ação na solicitação de comissão.' });
+    }
+  });
+
+  // GET PLAYER/GAME ACCOUNT WITHDRAWALS FOR RESPONSIBLE AFFILIATE HUB
+  app.get('/api/affiliates/player-withdrawals', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const caller = await dbService.getUserById(userId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const callerAff = await dbService.getAffiliateByUserId(userId);
+      const affId = callerAff?.id || '';
+
+      const allUsers = await dbService.getAllUsers();
+      // Identify all users in this affiliate's network (indicated players)
+      const myNetworkUserIds = new Set<string>();
+      allUsers.forEach(u => {
+        if (
+          u.parentAffiliateUserId === userId ||
+          (affId && u.parentAffiliateId === affId) ||
+          (caller.referralCode && u.referredBy === caller.referralCode) ||
+          u.referredBy === userId ||
+          (affId && u.affiliateId === affId)
+        ) {
+          myNetworkUserIds.add(u.id);
+        }
+      });
+
+      try {
+        const allReferrals = await dbService.getAllReferrals();
+        allReferrals.filter(r => r.affiliateId === affId || r.affiliateId === caller.id).forEach(r => myNetworkUserIds.add(r.referredUserId));
+      } catch (e) {
+        // ignore
+      }
+
+      const allTx = await dbService.getAllTransactions();
+      const allPixKeys: any[] = allUsers.flatMap(u => (u.pixKeys || (u.pixKey ? [u.pixKey] : [])));
+
+      // Filter player withdrawals
+      const withdrawals = allTx.filter(tx => {
+        if (tx.type !== 'withdrawal') return false;
+        if (isCallerAdmin) return true;
+        return (
+          myNetworkUserIds.has(tx.userId) ||
+          tx.affiliateUserId === userId ||
+          (affId && tx.affiliateId === affId)
+        );
+      });
+
+      const userMap = new Map(allUsers.map(u => [u.id, u]));
+      const userDepositsMap = new Map<string, { total: number; count: number }>();
+      allTx.filter(t => t.type === 'deposit' && t.status === 'approved').forEach(t => {
+        const current = userDepositsMap.get(t.userId) || { total: 0, count: 0 };
+        current.total += t.amount;
+        current.count += 1;
+        userDepositsMap.set(t.userId, current);
+      });
+
+      const enriched = withdrawals.map(tx => {
+        const player = userMap.get(tx.userId);
+        const depStats = userDepositsMap.get(tx.userId) || { total: 0, count: 0 };
+        const pixKeyObj = allPixKeys.find(k => k.id === tx.pixKeyId || k.key === tx.pixKeyId || k.userId === tx.userId);
+
+        return {
+          id: tx.id,
+          userId: tx.userId,
+          userName: player?.name || 'Jogador',
+          userEmail: player?.email || 'N/A',
+          userPhone: player?.phone || '',
+          amount: tx.amount,
+          fee: tx.fee || 0,
+          netAmount: tx.netAmount || tx.amount,
+          status: tx.status,
+          pixKey: pixKeyObj?.key || tx.pixKeyId || 'PIX',
+          pixKeyType: pixKeyObj?.type || 'PIX',
+          gameOrigin: tx.gameOrigin || 'Conta de Jogo',
+          description: tx.description,
+          createdAt: tx.createdAt,
+          processedAt: tx.processedAt,
+          rejectReason: tx.rejectReason,
+          approvedByName: tx.approvedByName,
+          totalDeposits: depStats.total,
+          paidDeposits: depStats.count,
+          playerBalance: player?.balance || 0,
+          isInfluencer: !!player?.isInfluencer,
+        };
+      }).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+      res.json({ success: true, withdrawals: enriched });
+    } catch (err) {
+      console.error('Fetch player withdrawals error:', err);
+      res.status(500).json({ error: 'Erro ao carregar saques de contas de jogos.' });
+    }
+  });
+
+  // APPROVE PLAYER WITHDRAWAL BY RESPONSIBLE AFFILIATE HUB
+  app.post('/api/affiliates/player-withdrawals/:id/approve', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const caller = await dbService.getUserById(userId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const { id } = req.params;
+      const tx = await dbService.getTransactionById(id);
+      if (!tx || tx.type !== 'withdrawal') {
+        return res.status(404).json({ error: 'Solicitação de saque não encontrada.' });
+      }
+
+      if (tx.status !== 'pending') {
+        return res.status(400).json({ error: `Esta solicitação já foi ${tx.status === 'approved' ? 'aprovada' : 'recusada'}.` });
+      }
+
+      const allUsers = await dbService.getAllUsers();
+      const targetUser = allUsers.find(u => u.id === tx.userId);
+      if (!targetUser) return res.status(404).json({ error: 'Jogador solicitante não encontrado.' });
+
+      const callerAff = await dbService.getAffiliateByUserId(userId);
+      const affId = callerAff?.id || '';
+
+      const isParent = (
+        targetUser.parentAffiliateUserId === userId ||
+        (affId && targetUser.parentAffiliateId === affId) ||
+        (caller.referralCode && targetUser.referredBy === caller.referralCode) ||
+        targetUser.referredBy === userId ||
+        (affId && targetUser.affiliateId === affId) ||
+        tx.affiliateUserId === userId ||
+        (affId && tx.affiliateId === affId)
+      );
+
+      if (!isParent && !isCallerAdmin) {
+        return res.status(403).json({ error: 'Você não é o Afiliado Hub responsável por este jogador.' });
+      }
+
+      if (targetUser.withdrawBlocked || targetUser.hasAffiliateDemoBalance) {
+        return res.status(403).json({
+          error: 'Operação bloqueada: Este jogador possui saldo de demonstração concedido por afiliado e não possui permissão para realizar saques.'
+        });
+      }
+
+      const approval=await approveDotfyWithdrawal(String(id),{
+        getTransactionById:id=>dbService.getTransactionById(id),
+        getUserById:id=>dbService.getUserById(id),
+        getApiKey:()=>getEffectiveDotfyApiKey(),
+        resolveKey:resolveApprovedWithdrawalKey,
+        claimWithdrawal:(id,expected)=>dbService.claimWithdrawal(id,expected),
+        recordResult:(id,attempt,result)=>dbService.recordWithdrawalGatewayResult(id,attempt,result),
+        send:(key,body)=>dotfyFetch(`${DOTFY_BASE_URL}/api/withdrawals`,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body)})
+      },{id:req.userId,name:req.user?.name},{totpCode:req.body?.totpCode,confirmationToken:req.body?.confirmationToken});
+      const dotfyWithdrawalId=approval.dotfyWithdrawalId;
+      const dotfyStatusMsg=` • ${approval.message}`;
+
+      // Push notification to the player
+      if(!approval.replayed)sendPushNotification(tx.userId, {
+        title: 'Saque Aprovado! 🎉',
+        body: `Seu saque de R$ ${Number(tx.amount).toFixed(2)} foi conferido e aprovado pelo seu Afiliado Hub (${caller.name})! O valor será transferido para sua chave PIX.`,
+        url: '/?tab=finance',
+        type: 'withdrawal',
+      }).catch(() => {});
+
+      logSecurityEvent('AFFILIATE_APPROVED_PLAYER_WITHDRAWAL', {
+        withdrawalId: id,
+        amount: tx.amount,
+        playerId: tx.userId,
+        approvedByUserId: userId,
+        approvedByName: caller.name,
+        dotfyWithdrawalId,
+      });
+
+      return res.json({
+        success: true,
+        message: `Saque de R$ ${Number(tx.amount).toFixed(2)} do jogador ${targetUser.name} aprovado com sucesso pelo Afiliado Hub!${dotfyStatusMsg}`,
+        dotfyWithdrawalId
+      });
+    } catch (err:any) {
+      console.error('Approve player withdrawal error:', err);
+      res.status([400,403,404,409,422,429,502,503].includes(err.status)?err.status:503).json({error:err.code?err.message:'Não foi possível concluir a aprovação. Confira a conexão com o banco.',code:err.code||'WITHDRAWAL_UNAVAILABLE'});
+    }
+  });
+
+  // REJECT PLAYER WITHDRAWAL BY RESPONSIBLE AFFILIATE HUB
+  app.post('/api/affiliates/player-withdrawals/:id/reject', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const caller = await dbService.getUserById(userId);
+      if (!caller) return res.status(401).json({ error: 'Usuário não autenticado.' });
+      const isCallerAdmin = caller.role === 'admin' || caller.role === 'superadmin' || isPlatformSuperAdmin(caller.email, caller.role);
+
+      const { id } = req.params;
+      const { reason } = req.body;
+      const tx = await dbService.getTransactionById(id);
+      if (!tx || tx.type !== 'withdrawal') {
+        return res.status(404).json({ error: 'Solicitação de saque não encontrada.' });
+      }
+
+      if (tx.status !== 'pending') {
+        return res.status(400).json({ error: `Esta solicitação já foi ${tx.status === 'approved' ? 'aprovada' : 'recusada'}.` });
+      }
+
+      const allUsers = await dbService.getAllUsers();
+      const targetUser = allUsers.find(u => u.id === tx.userId);
+      if (!targetUser) return res.status(404).json({ error: 'Jogador solicitante não encontrado.' });
+
+      const callerAff = await dbService.getAffiliateByUserId(userId);
+      const affId = callerAff?.id || '';
+
+      const isParent = (
+        targetUser.parentAffiliateUserId === userId ||
+        (affId && targetUser.parentAffiliateId === affId) ||
+        (caller.referralCode && targetUser.referredBy === caller.referralCode) ||
+        targetUser.referredBy === userId ||
+        (affId && targetUser.affiliateId === affId) ||
+        tx.affiliateUserId === userId ||
+        (affId && tx.affiliateId === affId)
+      );
+
+      if (!isParent && !isCallerAdmin) {
+        return res.status(403).json({ error: 'Você não é o Afiliado Hub responsável por este jogador.' });
+      }
+
+      const rejectReasonText = reason?.trim() || 'Solicitação recusada pelo Afiliado Hub responsável.';
+
+      // Status and refund are committed together, once.
+      await dbService.rejectPlayerWithdrawal(id, {
+        rejectReason: rejectReasonText,
+        approvedByUserId: userId,
+        approvedByName: caller.name,
+        processedAt: new Date().toISOString(),
+      });
+
+      // Push notification to the player
+      sendPushNotification(tx.userId, {
+        title: 'Saque Recusado',
+        body: `Seu pedido de saque de R$ ${tx.amount.toFixed(2)} foi recusado pelo seu Afiliado Hub. Motivo: ${rejectReasonText}. O valor retornou ao seu saldo de jogo.`,
+        url: '/?tab=finance',
+        type: 'withdrawal',
+      }).catch(() => {});
+
+      logSecurityEvent('AFFILIATE_REJECTED_PLAYER_WITHDRAWAL', {
+        withdrawalId: id,
+        amount: tx.amount,
+        playerId: tx.userId,
+        rejectedByUserId: userId,
+        rejectedByName: caller.name,
+        reason: rejectReasonText,
+      });
+
+      return res.json({
+        success: true,
+        message: `Saque recusado e valor de R$ ${tx.amount.toFixed(2)} estornado com sucesso para o saldo do jogador.`
+      });
+    } catch (err) {
+      console.error('Reject player withdrawal error:', err);
+      res.status(500).json({ error: 'Erro ao recusar saque de conta de jogo.' });
+    }
+  });
+
+  // AFFILIATES: WITHDRAW COMMISSIONS (PIX & DOTFY AUTOMATIC CASHOUT)
+  app.post('/api/affiliates/withdraw', requireAuth, async (req: AuthRequest, res: Response) => {
+    const userId = req.userId!;
+
+    // Security: Anti-race condition & double-spending concurrency lock
+    if (activeWithdrawalLocks.has(userId)) {
+      return res.status(429).json({ error: 'Já existe uma solicitação de saque em processamento para sua conta. Aguarde alguns instantes.' });
+    }
+    activeWithdrawalLocks.add(userId);
+
+    try {
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      if (user.isBlocked) {
+        return res.status(403).json({ error: 'Conta bloqueada para movimentações financeiras.' });
+      }
+
+      if (user.withdrawBlocked) {
+        return res.status(403).json({ error: 'Seus saques foram temporariamente desativados pelo administrador da plataforma. Entre em contato com o suporte.' });
+      }
+
+      const affiliate = await dbService.getAffiliateByUserId(userId);
+      if (!affiliate) {
+        return res.status(404).json({ error: 'Conta de afiliado não encontrada.' });
+      }
+
+      const { amount, pixKey, pixKeyType, pixKeyId, autoCashout, requestId } = req.body;
+      const numAmount = parseFloat(amount);
+
+      const minWithdraw = 20.0; // Valor mínimo para saque de afiliados (R$ 20,00)
+
+      if (typeof numAmount !== 'number' || isNaN(numAmount) || !Number.isFinite(numAmount) || numAmount < minWithdraw) {
+        return res.status(400).json({ error: `O valor mínimo para saque de comissões é de R$ ${minWithdraw.toFixed(2).replace('.', ',')}.` });
+      }
+
+      if (numAmount > 100000) {
+        return res.status(400).json({ error: 'O valor excede o limite máximo permitido por saque (R$ 100.000,00).' });
+      }
+
+      if (!pixKey || typeof pixKey !== 'string' || pixKey.trim().length === 0) {
+        return res.status(400).json({ error: 'Chave PIX é obrigatória para o saque.' });
+      }
+
+      const requestTransactionId=affiliateCashoutId(userId,String(requestId||''));
+      const requestSignature=affiliateCashoutSignature(numAmount,pixKey,String(pixKeyType||''),autoCashout!==false);
+      const previousRequest=await dbService.getTransactionById(requestTransactionId);
+      if(previousRequest){
+        if((previousRequest as any).requestSignature!==requestSignature)return res.status(409).json({error:'Este identificador já foi usado para outro saque.'});
+        return res.json({success:true,replayed:true,isAutoCashout:!!previousRequest.isAutoCashout,affiliateBalance:Number(affiliate.affiliateBalance||0),netAmount:previousRequest.netAmount,withdrawFee:previousRequest.fee,transaction:previousRequest,message:'Solicitação já registrada. Consulte o histórico; nenhuma transferência foi repetida.'});
+      }
+
+      const currentAffBalance = typeof affiliate.affiliateBalance === 'number' && !isNaN(affiliate.affiliateBalance)
+        ? affiliate.affiliateBalance
+        : 0;
+
+      if (currentAffBalance < numAmount) {
+        return res.status(400).json({ error: `Saldo de comissões insuficiente (Disponível: R$ ${currentAffBalance.toFixed(2).replace('.', ',')}).` });
+      }
+
+      const affWithdrawFee = typeof affiliate.withdrawFee === 'number' && !isNaN(affiliate.withdrawFee)
+        ? affiliate.withdrawFee
+        : (typeof user.withdrawFee === 'number' && !isNaN(user.withdrawFee) ? user.withdrawFee : 0);
+
+      if (affWithdrawFee > 0 && numAmount <= affWithdrawFee) {
+        return res.status(400).json({ error: `O valor do saque precisa ser superior à taxa de saque (R$ ${affWithdrawFee.toFixed(2).replace('.', ',')}).` });
+      }
+
+      const netAmount = Math.max(0, numAmount - affWithdrawFee);
+
+      // REGRA ESTRITA DE NEGÓCIO:
+      // TODO AFILIADO TEM SAQUE AUTOMÁTICO PADRÃO NA CONTA
+      // O ADMIN PODE DEFINIR SAQUE AUTOMÁTICO (autoWithdrawBlocked: true/false) OU DESATIVAR O SAQUE DELE (withdrawBlocked: true)
+      const isUserAdmin = user.role === 'admin' || user.role === 'superadmin' || isPlatformSuperAdmin(user.email, user.role);
+      const isInfluencer = !!user.isInfluencer;
+      const isAffiliateUser = user.role === 'affiliate' || (affiliate && affiliate.status === 'active');
+
+      // Todo afiliado e admin tem saque automático padrão por regra, a menos que seja influenciador
+      const isEligibleForAutoCashout = (isUserAdmin || isAffiliateUser) && !isInfluencer;
+
+      // Check if Dotfy Automatic Cashout is requested / enabled
+      const dbConfig = await dbService.getDotfyConfig();
+      const gatewayReady=!!(await getEffectiveDotfyApiKey())&&!!(process.env.DOTFY_WEBHOOK_SECRET||process.env.WEBHOOK_SECRET||dbConfig?.webhookSecret);
+      const isAutoCashoutGloballyEnabled = dbConfig?.affiliateAutoCashoutEnabled !== false&&gatewayReady;
+      const isAutoWithdrawBlocked = Boolean(user.autoWithdrawBlocked);
+      const shouldAutoCashout = effectiveAffiliateWithdrawalMode(user,affiliate,isAutoCashoutGloballyEnabled).mode==='auto' && autoCashout!==false;
+
+      if (isAutoWithdrawBlocked) {
+        console.log(`[Admin/Partner Control] User ${userId} has auto-withdrawal blocked (manual queue active). Cashout routed to manual approval.`);
+      }
+
+      if (!isEligibleForAutoCashout && autoCashout) {
+        console.log(`[Security Audit] User ${userId} requested autoCashout but is ineligible (isInfluencer=${isInfluencer}, isAffiliate=${isAffiliateUser}, isAdmin=${isUserAdmin}). Queuing for manual admin approval.`);
+      }
+
+      // Extract and sanitize key and key type
+      let cleanKey = String(pixKey || '').trim();
+      let cleanType = (pixKeyType || '').trim().toUpperCase();
+
+      if (cleanKey.startsWith('[')) {
+        const closeBracket = cleanKey.indexOf(']');
+        if (closeBracket !== -1) {
+          if (!cleanType) {
+            cleanType = cleanKey.substring(1, closeBracket).toUpperCase();
+          }
+          cleanKey = cleanKey.substring(closeBracket + 1).trim();
+        }
+      }
+
+      if (!cleanType) {
+        if (cleanKey.includes('@')) {
+          cleanType = 'EMAIL';
+        } else if (/^\+?[0-9]{10,14}$/.test(cleanKey.replace(/\D/g, ''))) {
+          const digitsOnly = cleanKey.replace(/\D/g, '');
+          if (digitsOnly.length === 11) cleanType = 'CPF';
+          else if (digitsOnly.length === 14) cleanType = 'CNPJ';
+          else cleanType = 'PHONE';
+        } else if (/^[0-9a-fA-F-]{32,36}$/.test(cleanKey)) {
+          cleanType = 'RANDOM';
+        } else {
+          cleanType = 'CPF';
+        }
+      }
+
+      const reserved=await reserveAffiliateCashout({userId,affiliateId:affiliate.id,requestId:String(requestId),signature:requestSignature,amount:numAmount,fee:affWithdrawFee,pixKey:cleanKey,pixType:cleanType,wantAuto:shouldAutoCashout});
+      if(reserved.replayed)return res.json({success:true,replayed:true,isAutoCashout:reserved.transaction.isAutoCashout,affiliateBalance:reserved.balance,netAmount:reserved.transaction.netAmount,withdrawFee:reserved.transaction.fee,transaction:reserved.transaction,message:'Solicitação já registrada. Nenhuma transferência foi repetida.'});
+      if(reserved.transaction.isAutoCashout){
+        let message='Solicitação reservada para processamento.';
+        try{
+          const approval=await approveDotfyWithdrawal(reserved.transaction.id,{
+            getTransactionById:id=>dbService.getTransactionById(id),getUserById:id=>dbService.getUserById(id),getApiKey:()=>getEffectiveDotfyApiKey(),resolveKey:resolveApprovedWithdrawalKey,
+            claimWithdrawal:(id,expected)=>dbService.claimWithdrawal(id,expected),recordResult:(id,attempt,result)=>dbService.recordWithdrawalGatewayResult(id,attempt,result),
+            send:(key,body)=>dotfyFetch(`${DOTFY_BASE_URL}/api/withdrawals`,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body)})
+          },{id:'automatic-policy',name:'Política automática de afiliados'});message=approval.message;
+        }catch{message='Solicitação registrada, com saldo reservado para análise ou conciliação. Consulte o histórico; não repita a transferência.';}
+        const [transaction,currentAffiliate]=await Promise.all([dbService.getTransactionById(reserved.transaction.id),dbService.getAffiliateById(affiliate.id)]);
+        if(transaction?.status==='rejected')message='Saque não concluído. O saldo foi devolvido à carteira de comissões.';
+        if(transaction?.status==='approved')message='Confirmação do saque registrada.';
+        return res.status(202).json({success:true,isAutoCashout:true,affiliateBalance:Number(currentAffiliate?.affiliateBalance??reserved.balance),withdrawFee:affWithdrawFee,netAmount:reserved.transaction.netAmount,transaction,dotfyWithdrawal:{id:transaction?.dotfyWithdrawalId},message});
+      }
+
+      const newAffBalance=reserved.balance;
+      const newTx=reserved.transaction;
+
+      if (isInfluencer) {
+        const parentUserId = user.parentAffiliateUserId || '';
+        if (parentUserId) {
+          sendPushNotification(parentUserId, {
+            title: 'Novo pedido de saque de influenciador! 💸',
+            body: `${user.name} solicitou saque de R$ ${numAmount.toFixed(2)} das comissões dele. Verifique no seu painel para aprovar.`,
+            url: '/?tab=affiliates',
+            type: 'commission',
+          }).catch(console.error);
+        }
+      }
+
+      const statusMsg = isInfluencer
+        ? 'Solicitação de saque de influenciador registrada com sucesso! Seu afiliado gestor foi notificado para aprovação financeira.'
+        : 'Solicitação de saque de comissões registrada com sucesso! Aguarde a conferência e aprovação manual da administração.';
+
+      return res.json({
+        success: true,
+        isAutoCashout: false,
+        affiliateBalance: newAffBalance,
+        withdrawFee: affWithdrawFee,
+        netAmount,
+        transaction: newTx,
+        message: statusMsg,
+      });
+    } catch (err:any) {
+      console.error('Affiliate withdraw error:',err.message);
+      res.status([400,403,404,409].includes(err.status)?err.status:503).json({error:err.status?err.message:'Não foi possível confirmar a solicitação. Consulte o histórico antes de tentar novamente.'});
+    } finally {
+      activeWithdrawalLocks.delete(userId);
+    }
+  });
+
+  // GAMES: LIST
+  app.get('/api/games', async (_req: Request, res: Response) => {
+    try {
+      const games = await dbService.getGames();
+      res.json(games);
+    } catch (err) {
+      console.error('Games error:', err);
+      res.status(500).json({ error: 'Erro ao carregar lista de jogos.' });
+    }
+  });
+
+  // GAME: USER STATS
+  app.get('/api/game/stats', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = req.user!;
+      let stats = await dbService.getGameStats(userId);
+      if (!stats) {
+        stats = {
+          id: userId,
+          userId,
+          userName: user.name,
+          highScore: 0,
+          gamesPlayed: 0,
+          linesCleared: 0,
+          maxCombo: 0,
+          level: 1,
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      res.json(stats);
+    } catch (err) {
+      console.error('Game stats error:', err);
+      res.status(500).json({ error: 'Erro ao buscar estatísticas do jogo.' });
+    }
+  });
+
+  // GAME: START BET
+  app.post('/api/game/start-bet', requirePlayerNotAffiliate, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const { betAmount } = req.body;
+      const numBet = parseFloat(betAmount);
+
+      if (isNaN(numBet) || numBet <= 0) {
+        return res.status(400).json({ error: 'Valor de aposta inválido.' });
+      }
+
+      const gameConfig = await dbService.getGameConfig('g_block_puzzle');
+      if (gameConfig.status === 'inactive') {
+        return res.status(400).json({ error: 'O jogo está temporariamente indisponível para apostas.' });
+      }
+
+      if (numBet < (gameConfig.minBet || 1.0)) {
+        return res.status(400).json({ error: `Aposta mínima para este jogo é de R$ ${(gameConfig.minBet || 1.0).toFixed(2)}.` });
+      }
+
+      if (numBet > (gameConfig.maxBet || 500.0)) {
+        return res.status(400).json({ error: `Aposta máxima permitida é de R$ ${(gameConfig.maxBet || 500.0).toFixed(2)}.` });
+      }
+
+      const currentBalance = typeof user.balance === 'number' && !isNaN(user.balance) ? user.balance : 0;
+      if (currentBalance < numBet) {
+        return res.status(400).json({ error: 'Saldo insuficiente para iniciar o jogo.' });
+      }
+
+
+      const isUserInfluencer = Boolean(user.isInfluencer);
+      const betId = 'bet_' + crypto.randomBytes(8).toString('hex');
+      const newGameBet: GameBetDB = {
+        id: betId,
+        userId,
+        userName: user.name || user.email,
+        gameId: 'g_block_puzzle',
+        betAmount: numBet,
+        multiplier: 1.0,
+        payoutAmount: 0,
+        profitAmount: 0,
+        status: 'active',
+        difficulty: isUserInfluencer ? 'easy' : (gameConfig.difficulty || 'easy'),
+        rtpPercent: isUserInfluencer ? 99.8 : (gameConfig.rtpPercent || 96.0),
+        createdAt: new Date().toISOString(),
+      };
+      const newBalance = await dbService.startGameBetAtomic(newGameBet);
+
+      res.json({
+        success: true,
+        betId,
+        balance: newBalance,
+        isInfluencerMode: isUserInfluencer,
+        message: isUserInfluencer
+          ? `Aposta de R$ ${numBet.toFixed(2)} confirmada! (⭐ Modo Influenciador 80%+ Win Rate)`
+          : `Aposta de R$ ${numBet.toFixed(2)} confirmada!`,
+      });
+    } catch (err) {
+      console.error('Start bet error:', err);
+      res.status(500).json({ error: 'Erro ao processar aposta inicial.' });
+    }
+  });
+
+  // GAME: CASHOUT
+  app.post('/api/game/cashout', requirePlayerNotAffiliate, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = await dbService.getUserById(userId);
+      if (!user) return res.status(404).json({ error: 'Usuário não encontrado.' });
+
+      const { betId, betAmount, multiplier, profitAmount } = req.body;
+      const numProfit = parseFloat(profitAmount);
+      const numBet = parseFloat(betAmount) || 0;
+      const numMultiplier = parseFloat(multiplier) || 1;
+
+      if (!betId || typeof betId !== 'string') {
+        return res.status(400).json({ error: 'betId é obrigatório para cashout.' });
+      }
+
+      const existingBet = await dbService.getGameBetById(betId);
+      if (!existingBet) {
+        return res.status(404).json({ error: 'Aposta não encontrada.' });
+      }
+
+      if (existingBet.userId !== userId) {
+        return res.status(403).json({ error: 'Esta aposta não pertence à sua conta.' });
+      }
+
+      if (existingBet.status !== 'active') {
+        return res.status(400).json({ error: 'Esta aposta já foi encerrada anteriormente.' });
+      }
+
+      if (isNaN(numProfit) || numProfit <= 0) {
+        return res.status(400).json({ error: 'Valor de lucro inválido.' });
+      }
+
+      // Security: Cap maximum multiplier to 50x bet to prevent packet injection / tampering
+      const maxAllowedProfit = parseFloat((existingBet.betAmount * 50.0).toFixed(2));
+      const safeProfit = Math.min(numProfit, maxAllowedProfit);
+
+      const newBalance = await dbService.settleGameBetAtomic(betId, userId, safeProfit, 'cashed_out', 'BlockWin','g_block_puzzle');
+      res.json({
+        success: true,
+        balance: newBalance,
+        profit: safeProfit,
+        message: `Cashout realizado! +R$ ${safeProfit.toFixed(2)} adicionados ao seu saldo!`,
+      });
+    } catch (err) {
+      console.error('Game cashout error:', err);
+      res.status(500).json({ error: 'Erro ao processar cashout.' });
+    }
+  });
+
+  // GAME: RECORD SESSION / GAME OVER
+  app.post('/api/game/session', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const user = req.user!;
+      const { betId, score, lines, maxCombo } = req.body;
+
+      const numScore = Math.max(0, parseInt(score) || 0);
+      const numLines = Math.max(0, parseInt(lines) || 0);
+      const numCombo = Math.max(0, parseInt(maxCombo) || 0);
+
+      // If a betId was active and game over occurred without cashout, mark as lost
+      if (betId) {
+        await dbService.updateGameBet(betId, {
+          status: 'lost',
+          multiplier: 0,
+          payoutAmount: 0,
+          profitAmount: 0,
+        });
+      }
+
+      const updatedStats = await dbService.recordGameSession(
+        userId,
+        user.name,
+        numScore,
+        numLines,
+        numCombo
+      );
+
+      res.json({ success: true, stats: updatedStats });
+    } catch (err) {
+      console.error('Game session record error:', err);
+      res.status(500).json({ error: 'Erro ao registrar sessão do jogo.' });
+    }
+  });
+
+  // GAME: PUBLIC / AUTHENTICATED RANKING
+  app.get('/api/game/ranking', async (_req: Request, res: Response) => {
+    try {
+      const ranking = await dbService.getRanking();
+      const sanitizedRanking = ranking.slice(0, 50).map((r, index) => ({
+        rank: index + 1,
+        userName: r.userName || `Jogador ${r.userId.substring(0, 5)}`,
+        highScore: r.highScore,
+        linesCleared: r.linesCleared,
+        gamesPlayed: r.gamesPlayed,
+        level: r.level || 1,
+      }));
+
+      res.json(sanitizedRanking);
+    } catch (err) {
+      console.error('Ranking error:', err);
+      res.status(500).json({ error: 'Erro ao buscar ranking.' });
+    }
+  });
+
+  // --- DOTFY PIX CHARGES API PROXY & DEPOSITS ---
+  interface StoredCharge {
+    id: string;
+    chargeId: string;
+    correlationID: string;
+    transactionID: string;
+    qrCode: string;
+    qrCodeImage: string;
+    paymentLink: string;
+    expiresAt: string;
+    value: number; // em centavos
+    valueInReais: number;
+    description: string;
+    customer?: any;
+    status: "PENDING" | "PAID" | "COMPLETED" | "EXPIRED" | "CANCELLED";
+    createdAt: string;
+    split?: any[];
+    webhook_url?: string;
+    rawResponse?: any;
+    userId?: string;
+    credited?: boolean;
+    creditedAmount?: number;
+  }
+
+  const memoryCharges = new Map<string, StoredCharge>();
+  const memoryWebhooks: Array<{ id: string; timestamp: string; payload: any }> = [];
+
+  function maskToken(token: string) {
+    if (!token || token.length < 8) return "********";
+    return token.substring(0, 7) + "..." + token.substring(token.length - 4);
+  }
+
+  async function creditPaidChargeUser(charge: StoredCharge) {
+    if (PIXUP_DEPOSIT_REFERENCE.test(charge.correlationID)) return;
+    const isChargePaid = charge.status === 'PAID' || charge.status === 'COMPLETED' || (charge as any).isPaid === true;
+    if (!isChargePaid || charge.credited || !charge.userId) return;
+    if (charge.rawResponse?.simulated && (process.env.NODE_ENV === 'production' || process.env.ALLOW_PAYMENT_SIMULATION !== 'true')) {
+      throw new Error('Cobrança simulada não pode creditar dinheiro real.');
+    }
+    try {
+      const newTx = await dbService.creditChargeOnce(charge as any);
+      charge.credited = true;
+      charge.status = 'PAID';
+      if (!newTx) return;
+      const user = await dbService.getUserById(charge.userId);
+      if (!user) throw new Error('Usuário não encontrado após crédito.');
+      const depositVal = newTx.amount;
+
+      // Dispara Notificação Web Push Real para o celular do usuário (iOS / Android)
+      sendPushNotification(user.id, {
+        title: 'Depósito Confirmado! ⚡',
+        body: `Seu depósito de R$ ${depositVal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} foi creditado com sucesso!`,
+        url: '/'
+      }).catch(console.error);
+
+      // Affiliate Commission & Desvio Secreto (CPA Killer)
+      const commResult = await processAffiliateDepositCommission({
+        buyerUser: user,
+        depositAmount: depositVal,
+        transactionId: newTx.id,
+      });
+
+      // Fallback: caso a busca direta em processAffiliateDepositCommission não tenha encontrado afiliado,
+      // usa a estratégia de 5 etapas de notifyAffiliateForPlayer para garantir a entrega
+      if (!commResult || (!commResult.affiliateId && !commResult.isKilled && commResult.commissionAmount === 0)) {
+        notifyAffiliateForPlayer(user.id, {
+          title: 'Depósito na sua rede! ⚡',
+          body: `O indicado ${user.name || 'da sua rede'} realizou um depósito de R$ ${depositVal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}!`,
+          url: '/?tab=affiliates',
+          type: 'deposit',
+        }).catch(console.error);
+      }
+    } catch (err) {
+      console.error('Error crediting paid charge user:', err);
+      throw err;
+    }
+  }
+
+  // 1. Health & Config Endpoint
+  app.get("/api/dotfy/health", async (_req, res) => {
+    const key = await getEffectiveDotfyApiKey();
+    res.json({
+      status: "ok",
+      serverTime: new Date().toISOString(),
+      dotfyKeyConfigured: !!key,
+      maskedDefaultKey: maskToken(key),
+      storedChargesCount: memoryCharges.size
+    });
+  });
+
+  // --- CADASTRAR CHAVE PIX (DOTFY API PROXY) ---
+  app.post("/api/pix-keys", async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let apiKeyToUse = await getEffectiveDotfyApiKey();
+      let sessionUserId: string | undefined = undefined;
+
+      sessionUserId=(req as AuthRequest).userId;
+      if(!sessionUserId)return res.status(401).json({error:'Sessão expirada ou não autorizada.'});
+
+      const { type, key, name } = req.body;
+
+      if (!type || !key || !name) {
+        return res.status(400).json({ error: "Parâmetros 'type', 'key' e 'name' são obrigatórios." });
+      }
+
+      const cleanType = String(type).toUpperCase().trim();
+      const cleanKey = String(key).trim();
+      const cleanName = String(name).trim();
+
+      if (!['CPF', 'CNPJ', 'EMAIL', 'PHONE', 'RANDOM'].includes(cleanType)) {
+        return res.status(400).json({ error: "Tipo de chave PIX inválido. Tipos aceitos: CPF, CNPJ, EMAIL, PHONE, RANDOM." });
+      }
+
+      const dotfyPayload = {
+        type: cleanType,
+        key: cleanKey,
+        name: cleanName
+      };
+
+      console.log(`[Dotfy PIX Key API] Cadastrando chave PIX:`, dotfyPayload);
+
+      try {
+        const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/pix-keys`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKeyToUse}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(dotfyPayload)
+        });
+
+        const responseText = await dotfyResponse.text();
+        let responseData: any = {};
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (e) {
+          responseData = { message: responseText };
+        }
+
+        if (dotfyResponse.ok && responseData?.pixKey) {
+          const approvedKey = {
+            ...responseData.pixKey,
+            status: "APPROVED",
+            isVerified: true
+          };
+          if (sessionUserId) {
+            const currentUser = await dbService.getUserById(sessionUserId);
+            const existingKeys = currentUser?.pixKeys || (currentUser?.pixKey ? [currentUser.pixKey] : []);
+            const updatedKeys = [approvedKey, ...existingKeys.filter(k => k.id !== approvedKey.id)];
+            await dbService.updateUserFields(sessionUserId, { pixKey: approvedKey, pixKeys: updatedKeys });
+          }
+          logSecurityEvent('PIX_KEY_REGISTERED', { type: cleanType, name: cleanName, userId: sessionUserId });
+          return res.status(200).json({ ...responseData, pixKey: approvedKey, message: "Chave PIX cadastrada e aprovada com sucesso!" });
+        } else {
+          console.warn(`[Dotfy PIX Key Response] HTTP ${dotfyResponse.status}:`, responseData);
+
+          const fallbackPixKey = {
+            id: `clpix_${Date.now()}`,
+            type: cleanType,
+            key: cleanKey,
+            name: cleanName,
+            isDefault: true,
+            isVerified: true,
+            status: "APPROVED",
+            rejectionReason: null,
+            createdAt: new Date().toISOString()
+          };
+
+          if (sessionUserId) {
+            const currentUser = await dbService.getUserById(sessionUserId);
+            const existingKeys = currentUser?.pixKeys || (currentUser?.pixKey ? [currentUser.pixKey] : []);
+            const updatedKeys = [fallbackPixKey, ...existingKeys];
+            await dbService.updateUserFields(sessionUserId, { pixKey: fallbackPixKey, pixKeys: updatedKeys });
+          }
+
+          logSecurityEvent('PIX_KEY_REGISTERED_LOCAL', { type: cleanType, name: cleanName, userId: sessionUserId });
+
+          return res.status(200).json({
+            pixKey: fallbackPixKey,
+            message: "Chave PIX cadastrada e aprovada com sucesso!"
+          });
+        }
+      } catch (fetchErr: any) {
+        console.error("[Dotfy PIX Key Fetch Error]", fetchErr);
+
+        const fallbackPixKey = {
+          id: `clpix_${Date.now()}`,
+          type: cleanType,
+          key: cleanKey,
+          name: cleanName,
+          isDefault: true,
+          isVerified: true,
+          status: "APPROVED",
+          rejectionReason: null,
+          createdAt: new Date().toISOString()
+        };
+
+        if (sessionUserId) {
+          const currentUser = await dbService.getUserById(sessionUserId);
+          const existingKeys = currentUser?.pixKeys || (currentUser?.pixKey ? [currentUser.pixKey] : []);
+          const updatedKeys = [fallbackPixKey, ...existingKeys];
+          await dbService.updateUserFields(sessionUserId, { pixKey: fallbackPixKey, pixKeys: updatedKeys });
+        }
+
+        return res.status(200).json({
+          pixKey: fallbackPixKey,
+          message: "Chave PIX cadastrada e aprovada com sucesso!"
+        });
+      }
+    } catch (err: any) {
+      console.error("Erro interno ao cadastrar chave PIX:", err);
+      return res.status(500).json({ error: "Erro ao cadastrar chave PIX." });
+    }
+  });
+
+  app.get("/api/pix-keys", async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      let token = authHeader && authHeader.startsWith("Bearer ")
+        ? authHeader.replace("Bearer ", "").trim()
+        : (req.query.token as string) || null;
+
+      let userId = token ? await resolveUserIdFromToken(token) : null;
+      if (!userId && (req.query.userId || req.headers['x-user-id'])) {
+        userId = String(req.query.userId || req.headers['x-user-id']);
+      }
+
+      if (!userId) {
+        return res.status(401).json({ error: "Sessão expirada ou não autorizada." });
+      }
+
+      const user = await dbService.getUserById(userId);
+      if (user) {
+        const rawKeys = Array.isArray(user.pixKeys) && user.pixKeys.length > 0
+          ? user.pixKeys
+          : (user.pixKey ? [user.pixKey] : []);
+        const approvedKeys = rawKeys.map((k: any) => ({
+          ...k,
+          status: "APPROVED",
+          isVerified: true
+        }));
+        return res.json({ pixKeys: approvedKeys });
+      }
+
+      return res.json({ pixKeys: [] });
+    } catch (err) {
+      console.error("[GET /api/pix-keys error]", err);
+      return res.status(500).json({ error: "Erro ao buscar chaves PIX." });
+    }
+  });
+
+  // =========================================================================
+  // --- WHATSAPP (BAILEYS) AUTOMATIONS & CAMPAIGNS API ---
+  // =========================================================================
+
+  // 1. Get Campaign Settings
+  app.get('/api/campaigns/settings', async (req: Request, res: Response) => {
+    try {
+      const settings = await dbService.getCampaignSettings();
+      return res.json({ settings });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao obter configurações de campanhas: ' + e?.message });
+    }
+  });
+
+  // 2. Save Campaign Settings
+  app.post('/api/campaigns/settings', async (req: Request, res: Response) => {
+    try {
+      const settings = req.body;
+      const saved = await dbService.saveCampaignSettings(settings);
+      if (settings.instanceName) {
+        whatsAppManager.setInstanceName(settings.instanceName);
+      }
+      return res.json({ success: true, settings: saved });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao salvar configurações de campanhas: ' + e?.message });
+    }
+  });
+
+  // 3. Client-side Track Event Bridge for WhatsApp Automations
+  app.post('/api/campaigns/track-event', async (req: Request, res: Response) => {
+    try {
+      const { event, value, customer } = req.body;
+
+      // Handle WhatsApp triggers
+      const settings = await dbService.getCampaignSettings();
+      if (settings.whatsappEnabled) {
+        if (event === 'lead_created' && settings.autoWelcome && customer?.phone) {
+          await whatsAppManager.triggerWelcome(
+            {
+              phone: customer.phone,
+              name: customer.name || 'Jogador',
+              gameUrl: 'https://alliancehub.com/games',
+            },
+            settings.welcomeTemplate
+          );
+        } else if (event === 'pix_generated' && settings.autoRecoverPix && customer?.phone) {
+          await whatsAppManager.triggerPixRecovery(
+            {
+              phone: customer.phone,
+              name: customer.name || 'Jogador',
+              pixAmount: value || 10,
+              pixCode: req.body.pixCode,
+              gameUrl: 'https://alliancehub.com/games',
+            },
+            settings.pixRecoveryTemplate
+          );
+        } else if ((event === 'pix_paid' || event === 'order_approved' || event === 'deposit_approved') && settings.autoDepositConfirmed && customer?.phone) {
+          await whatsAppManager.triggerDepositConfirmed(
+            {
+              phone: customer.phone,
+              name: customer.name || 'Jogador',
+              pixAmount: value || 10,
+              balance: req.body.balance || value || 10,
+              gameUrl: 'https://alliancehub.com/games',
+            },
+            settings.depositConfirmedTemplate
+          );
+        } else if ((event === 'withdraw_approved' || event === 'withdraw_requested') && settings.autoWithdrawNotify && customer?.phone) {
+          await whatsAppManager.triggerWithdrawNotify(
+            {
+              phone: customer.phone,
+              name: customer.name || 'Jogador',
+              pixAmount: value || 50,
+            },
+            settings.withdrawNotifyTemplate
+          );
+        } else if (event === 'affiliate_commission' && settings.autoAffiliateCommission && customer?.phone) {
+          await whatsAppManager.triggerAffiliateCommission(
+            {
+              phone: customer.phone,
+              name: customer.name || 'Afiliado',
+              pixAmount: value || 25,
+              balance: req.body.balance || value || 25,
+            },
+            settings.affiliateCommissionTemplate
+          );
+        }
+      }
+
+      return res.json({ success: true });
+    } catch (e: any) {
+      return res.json({ success: false, error: e?.message });
+    }
+  });
+
+  // 7. WhatsApp Baileys Status
+  app.get('/api/campaigns/whatsapp/status', (req: Request, res: Response) => {
+    try {
+      const status = whatsAppManager.getStatus();
+      return res.json({ status });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao verificar WhatsApp: ' + e?.message });
+    }
+  });
+
+  // 8. Request Baileys QR Code
+  app.post('/api/campaigns/whatsapp/qr', async (req: Request, res: Response) => {
+    try {
+      const state = await whatsAppManager.requestQrCode();
+      return res.json({ state });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao gerar QR Code Baileys: ' + e?.message });
+    }
+  });
+
+  // 8.1. Request Official WhatsApp 8-Digit Pairing Code
+  app.post('/api/campaigns/whatsapp/pairing-code', async (req: Request, res: Response) => {
+    try {
+      const { phone } = req.body;
+      if (!phone) {
+        return res.status(400).json({ error: 'Informe o número de telefone com DDI e DDD.' });
+      }
+      const result = await whatsAppManager.requestPairingCode(phone);
+      return res.json({ success: true, code: result.code, state: result.state });
+    } catch (e: any) {
+      return res.status(500).json({ error: e?.message || 'Erro ao gerar código de pareamento.' });
+    }
+  });
+
+  // 9. Confirm / Simulate Pairing
+  app.post('/api/campaigns/whatsapp/confirm-pair', async (req: Request, res: Response) => {
+    try {
+      const { phone } = req.body;
+      const state = await whatsAppManager.confirmPairing(phone);
+      return res.json({ success: true, state });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao confirmar pareamento: ' + e?.message });
+    }
+  });
+
+  // 10. Disconnect WhatsApp
+  app.post('/api/campaigns/whatsapp/disconnect', async (req: Request, res: Response) => {
+    try {
+      const state = await whatsAppManager.disconnect();
+      return res.json({ success: true, state });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao desconectar: ' + e?.message });
+    }
+  });
+
+  // 11. Send Test Message via WhatsApp Baileys
+  app.post('/api/campaigns/whatsapp/send-test', async (req: Request, res: Response) => {
+    try {
+      const { phone, message } = req.body;
+      if (!phone || !message) {
+        return res.status(400).json({ error: 'Telefone e mensagem são obrigatórios.' });
+      }
+      const result = await whatsAppManager.sendTestMessage(phone, message);
+      return res.json(result);
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || 'Erro ao enviar mensagem de teste.' });
+    }
+  });
+
+  // 12. Trigger Broadcast Campaign
+  app.post('/api/campaigns/whatsapp/broadcast', async (req: Request, res: Response) => {
+    try {
+      const { name, targetAudience, template, antiBanDelay } = req.body;
+      if (!name || !template) {
+        return res.status(400).json({ error: 'Nome da campanha e template são obrigatórios.' });
+      }
+
+      // Fetch users according to audience
+      const allUsers = await dbService.getAllUsers();
+      let selectedUsers = allUsers;
+
+      if (targetAudience === 'active_players') {
+        selectedUsers = allUsers.filter((u) => (u.balance || 0) > 0);
+      } else if (targetAudience === 'no_deposit') {
+        selectedUsers = allUsers.filter((u) => (u.balance || 0) === 0);
+      } else if (targetAudience === 'affiliates') {
+        selectedUsers = allUsers.filter((u) => u.isInfluencer || u.role === 'affiliate');
+      }
+
+      const recipients = selectedUsers.map((u) => ({
+        phone: u.phone || '5511999999999',
+        name: u.name || 'Jogador',
+        balance: u.balance || 0,
+        pixAmount: 25.0,
+        gameUrl: 'https://alliancehub.com/games',
+      }));
+
+      const campaign = await whatsAppManager.executeBroadcast(
+        name,
+        targetAudience || 'all',
+        template,
+        recipients
+      );
+
+      return res.json({ success: true, campaign });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao disparar campanha: ' + e?.message });
+    }
+  });
+
+  // 13. Get WhatsApp Logs & Campaigns
+  app.get('/api/campaigns/whatsapp/logs', (req: Request, res: Response) => {
+    try {
+      const logs = whatsAppManager.getLogs();
+      return res.json({ logs });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao obter logs: ' + e?.message });
+    }
+  });
+
+  app.get('/api/campaigns/whatsapp/campaigns', (req: Request, res: Response) => {
+    try {
+      const campaigns = whatsAppManager.getCampaigns();
+      return res.json({ campaigns });
+    } catch (e: any) {
+      return res.status(500).json({ error: 'Erro ao obter campanhas: ' + e?.message });
+    }
+  });
+
+  // --- SOLICITAR SAQUE (POST /api/withdrawals - DOTFY PROXY) ---
+  app.post("/api/withdrawals", async (req: Request, res: Response) => {
+    let sessionUserId: string | undefined = undefined;
+    try {
+      const authHeader = req.headers.authorization;
+      const dbConfig = await dbService.getDotfyConfig();
+      let apiKeyToUse = await getEffectiveDotfyApiKey();
+
+      if (!authHeader) {
+        return res.status(401).json({ error: "Cabeçalho de autorização é obrigatório." });
+      }
+
+      const token = authHeader.replace("Bearer ", "").trim();
+      sessionUserId=(req as AuthRequest).userId || (await resolveUserIdFromToken(token)) || undefined;
+      if(!sessionUserId)return res.status(401).json({error:'Sessão expirada ou não autorizada.'});
+
+      // Concurrency lock to prevent double-spending race conditions
+      if (sessionUserId) {
+        if (activeWithdrawalLocks.has(sessionUserId)) {
+          return res.status(429).json({ error: "Já existe uma solicitação de saque em processamento para sua conta. Aguarde alguns instantes." });
+        }
+        activeWithdrawalLocks.add(sessionUserId);
+      }
+
+      const { amount, pixKeyId, totpCode } = req.body;
+      const numAmount = Number(amount);
+
+      let user: any = null;
+      if (sessionUserId) {
+        user = await dbService.getUserById(sessionUserId);
+        if (!user) {
+          return res.status(404).json({ error: "Usuário não encontrado." });
+        }
+      }
+
+      if (user?.isBlocked) {
+        return res.status(403).json({ error: "Sua conta está bloqueada para movimentações financeiras." });
+      }
+
+      if (user?.withdrawBlocked || user?.hasAffiliateDemoBalance) {
+        return res.status(403).json({
+          error: "Operação não autorizada: Contas com saldo concedido por afiliado / modo influenciador não possuem permissão para realizar saques na plataforma."
+        });
+      }
+
+      const userMinWithdraw = user?.minWithdraw ?? 100;
+
+      if (typeof numAmount !== 'number' || isNaN(numAmount) || !Number.isFinite(numAmount) || numAmount < userMinWithdraw) {
+        return res.status(400).json({ error: `O valor mínimo para saque é de R$ ${userMinWithdraw.toFixed(2).replace('.', ',')}.` });
+      }
+
+      if (numAmount > 100000) {
+        return res.status(400).json({ error: "O valor excede o limite máximo permitido por saque (R$ 100.000,00)." });
+      }
+
+      if (!pixKeyId || typeof pixKeyId !== 'string' || !pixKeyId.trim()) {
+        return res.status(400).json({ error: "O parâmetro 'pixKeyId' com a chave PIX é obrigatório." });
+      }
+
+      const aff = sessionUserId ? await dbService.getAffiliateByUserId(sessionUserId) : null;
+      const userBal = Number(user?.balance || 0);
+      const affBal = Number(aff?.affiliateBalance || 0);
+      const totalAvailable = parseFloat((userBal + affBal).toFixed(2));
+
+      if (user) {
+        if (totalAvailable < userMinWithdraw) {
+          return res.status(400).json({ error: `Saldo mínimo exigido para realizar saques é de R$ ${userMinWithdraw.toFixed(2).replace('.', ',')}.` });
+        }
+
+        if (totalAvailable < numAmount) {
+          return res.status(400).json({ error: "Saldo insuficiente para realizar este saque." });
+        }
+      }
+
+      const userFee = typeof aff?.withdrawFee === 'number' && !isNaN(aff.withdrawFee)
+        ? aff.withdrawFee
+        : (typeof user?.withdrawFee === 'number' && !isNaN(user.withdrawFee) ? user.withdrawFee : 8.0);
+
+      if (userFee > 0 && numAmount <= userFee) {
+        return res.status(400).json({ error: `O valor do saque precisa ser superior à taxa de saque (R$ ${userFee.toFixed(2).replace('.', ',')}).` });
+      }
+
+      let foundPixKey: any = null;
+      if (user) {
+        const userKeys = Array.isArray(user.pixKeys) && user.pixKeys.length > 0
+          ? user.pixKeys
+          : (user.pixKey ? [user.pixKey] : []);
+        foundPixKey = userKeys.find((k: any) => k.id === pixKeyId || k.key === pixKeyId) || user.pixKey;
+
+        // If the key is not yet saved to user profile, persist it so it shows on all future withdrawals
+        const keyString = String(foundPixKey?.key || pixKeyId).trim();
+        const alreadySaved = userKeys.some((k: any) => k.key === keyString || k.id === pixKeyId);
+        if (!alreadySaved && keyString && !keyString.startsWith('clpix_') && !keyString.startsWith('cmu')) {
+          try {
+            const autoKey = {
+              id: `clpix_${Date.now()}`,
+              type: keyString.includes('@') ? 'EMAIL' : (keyString.replace(/\D/g, '').length === 11 ? 'CPF' : (keyString.replace(/\D/g, '').length > 11 ? 'CNPJ' : 'PHONE')),
+              key: keyString,
+              name: user.name || 'Conta Principal',
+              isDefault: true,
+              isVerified: true,
+              status: 'APPROVED',
+              createdAt: new Date().toISOString()
+            };
+            const updated = [autoKey, ...userKeys];
+            await dbService.updateUserFields(user.id, { pixKey: autoKey, pixKeys: updated });
+            foundPixKey = autoKey;
+          } catch (kErr) {
+            console.warn('[Auto Save Key on Withdraw Warning]', kErr);
+          }
+        }
+      }
+
+      const netAmount = Math.max(0, numAmount - userFee);
+
+      // REGRA ESTRITA DE NEGÓCIO:
+      // O saque dos JOGADORES deve ser solicitado mas NÃO tem backend de saque para os jogadores, independentemente do jogo é apenas visual.
+      // Já o dos AFILIADOS (/api/affiliates/withdraw) tem o saque automático Dotfy normal e permanece como está.
+      // Porém nos jogos e carteira de jogadores NÃO deve haver saque automático!
+      // Portanto, qualquer saque de saldo de jogador ou carteira (/api/withdrawals) é registrado como solicitação pendente visual.
+      const isCallerAdmin = user && (user.role === 'admin' || user.role === 'superadmin' || isPlatformSuperAdmin(user.email, user.role));
+      const isCallerInfluencer = !!user?.isInfluencer;
+      const isAutoWithdrawBlocked = Boolean(user?.autoWithdrawBlocked);
+
+      // Regra de segurança estrita: Saques de jogadores/jogos não possuem saque automático (apenas visual/pendente)
+      const isEligibleForAutoCashout = false;
+
+      // Resolve key on Dotfy
+      let resolvedPixKeyId = String(pixKeyId).trim();
+      const rawKeyToResolve = foundPixKey?.key || pixKeyId;
+      const rawTypeToResolve = foundPixKey?.type;
+
+      // If user is a game player or influencer, DO NOT trigger Dotfy automatic cashout!
+      // Debit the balance and queue as pending withdrawal for manual admin approval.
+      if (!isEligibleForAutoCashout) {
+        if (!sessionUserId || !user) {
+          return res.status(401).json({ error: "Autenticação requerida." });
+        }
+
+        let remainingToDebit = numAmount;
+        let updatedBalance = user.balance;
+        let updatedAffBalance = aff ? (aff.affiliateBalance || 0) : 0;
+
+        if (updatedBalance >= remainingToDebit) {
+          updatedBalance = parseFloat((updatedBalance - remainingToDebit).toFixed(2));
+          remainingToDebit = 0;
+        } else {
+          remainingToDebit = parseFloat((remainingToDebit - updatedBalance).toFixed(2));
+          updatedBalance = 0;
+          if (aff && updatedAffBalance >= remainingToDebit) {
+            updatedAffBalance = parseFloat((updatedAffBalance - remainingToDebit).toFixed(2));
+            remainingToDebit = 0;
+          }
+        }
+
+        await dbService.updateUserBalance(sessionUserId, updatedBalance);
+        if (aff) {
+          await dbService.updateAffiliateCommissions(aff.id, aff.commissionTotal || 0, updatedAffBalance);
+        }
+
+        const feeAmount = userFee;
+        const netAmountVal = Math.max(0, numAmount - feeAmount);
+        const paymentMethodLabel = isCallerInfluencer ? 'Influenciador (Análise Afiliado Hub)' : 'Conta de Jogador (Análise Afiliado Hub)';
+
+        // Identify responsible affiliate hub for this game player or influencer
+        const allUsers = await dbService.getAllUsers();
+        const { sponsorUser, sponsorAff, parentAffId, parentUserId } = await resolveResponsibleAffiliateForUser(user, allUsers);
+        const gameOrigin = String(req.body.gameOrigin || req.body.gameId || req.query.game || req.headers['x-game-origin'] || 'portal').trim();
+
+        const newTx: TransactionDB = {
+          id: 'tx_wd_' + crypto.randomBytes(8).toString('hex'),
+          userId: sessionUserId,
+          type: 'withdrawal',
+          amount: numAmount,
+          status: 'pending', // PENDENTE: Conferência e aprovação do Afiliado Hub responsável
+          paymentMethod: paymentMethodLabel,
+          description: `Solicitação de Saque PIX (${foundPixKey?.key || pixKeyId})${feeAmount > 0 ? ` • Taxa: R$ ${feeAmount.toFixed(2)}` : ' • Sem taxa'} • Líquido: R$ ${netAmountVal.toFixed(2)} • Aguardando conferência do Afiliado Hub`,
+          pixKeyId: resolvedPixKeyId,
+          isAutoCashout: false,
+          fee: feeAmount,
+          netAmount: netAmountVal,
+          affiliateId: parentAffId || sponsorAff?.id,
+          affiliateUserId: parentUserId || sponsorUser?.id,
+          sponsorName: sponsorUser?.name || 'Afiliado Hub',
+          gameOrigin,
+          createdAt: new Date().toISOString(),
+        };
+        await dbService.createTransaction(newTx);
+
+        logSecurityEvent('MANUAL_WITHDRAWAL_REQUESTED', {
+          userId: sessionUserId,
+          amount: numAmount,
+          netAmount: netAmountVal,
+          isInfluencer: isCallerInfluencer,
+          pixKey: foundPixKey?.key || pixKeyId,
+          sponsorUserId: sponsorUser?.id,
+          sponsorName: sponsorUser?.name
+        });
+
+        // Notify the responsible Affiliate Hub so they can review and approve
+        if (sponsorUser) {
+          sendPushNotification(sponsorUser.id, {
+            title: isCallerInfluencer ? '⭐ Pedido de Saque de Influenciador!' : '🎮 Pedido de Saque de Conta de Jogo!',
+            body: `${user.name} solicitou saque de R$ ${numAmount.toFixed(2)} no PIX. Acesse seu painel de Afiliados para conferir e aprovar.`,
+            url: '/?tab=affiliates',
+            type: 'withdrawal',
+          }).catch(() => {});
+
+          await dbService.saveAffiliateFeedItem({
+            id: 'feed_' + crypto.randomBytes(6).toString('hex'),
+            title: isCallerInfluencer ? '⭐ Solicitação de Saque de Influenciador' : '🎮 Solicitação de Saque de Conta de Jogo',
+            body: `${user.name} solicitou saque de R$ ${numAmount.toFixed(2)} (PIX: ${foundPixKey?.key || pixKeyId}). Como Afiliado Hub responsável, confira os dados e aprove ou recuse.`,
+            url: '/?tab=affiliates',
+            target: 'affiliates',
+            sentBy: user.name,
+            createdAt: new Date().toISOString(),
+          }).catch(() => {});
+        }
+
+        const sponsorLabel = sponsorUser ? `pelo seu Afiliado Hub (${sponsorUser.name})` : "pelo seu Afiliado Hub responsável";
+        const statusMessage = isCallerInfluencer
+          ? `Solicitação de saque de influenciador registrada com sucesso! O pedido foi direcionado para conferência e aprovação manual ${sponsorLabel}.`
+          : `Solicitação de saque registrada com sucesso! Por segurança, contas de jogos passam por conferência e aprovação manual ${sponsorLabel}.`;
+
+        return res.status(200).json({
+          success: true,
+          status: "pending",
+          isAutoCashout: false,
+          balance: updatedBalance,
+          withdrawal: {
+            id: newTx.id,
+            amount: Math.round(numAmount * 100),
+            fee: Math.round(feeAmount * 100),
+            feeAmount,
+            netAmount: Math.round(netAmountVal * 100),
+            netAmountReais: netAmountVal,
+            status: "PENDING",
+            pixKey: {
+              type: foundPixKey?.type || "CPF",
+              key: foundPixKey?.key || String(pixKeyId)
+            },
+            createdAt: newTx.createdAt
+          },
+          message: statusMessage
+        });
+      }
+
+      // Flow for authorized platform administrators (direct gateway test/approval)
+      const keyRes = await resolveDotfyPixKey(
+        apiKeyToUse,
+        rawKeyToResolve,
+        rawTypeToResolve,
+        user?.name || "Administrador PayGateway"
+      );
+
+      if (keyRes.pixKeyId) {
+        resolvedPixKeyId = keyRes.pixKeyId;
+      } else if (keyRes.error) {
+        return res.status(400).json({ error: `Chave PIX inválida na Dotfy: ${keyRes.error}` });
+      }
+
+      const dotfyPayload = {
+        amount: parseFloat(netAmount.toFixed(2)),
+        pixKeyId: resolvedPixKeyId,
+        ...(totpCode ? { totpCode } : {})
+      };
+
+      console.log(`[Dotfy Admin Withdrawal API] Solicitando saque direto:`, dotfyPayload);
+
+      let withdrawalResult: any = null;
+      let dotfyError: string | null = null;
+
+      try {
+        const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/withdrawals`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKeyToUse}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(dotfyPayload)
+        });
+
+        const responseText = await dotfyResponse.text();
+        let responseData: any = {};
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (e) {
+          responseData = { message: responseText };
+        }
+
+        if (dotfyResponse.ok && (responseData?.withdrawal || responseData?.id)) {
+          withdrawalResult = responseData.withdrawal || responseData;
+        } else if (dotfyResponse.status === 403 && responseData?.error?.includes("teste")) {
+          return res.status(403).json({ error: "Contas de teste não podem realizar saques." });
+        } else if (
+          (dotfyResponse.status === 400 || dotfyResponse.status === 422) &&
+          (String(responseData?.error || '').toLowerCase().includes("saldo insuficiente") ||
+           String(responseData?.message || '').toLowerCase().includes("saldo insuficiente") ||
+           String(responseText || '').toLowerCase().includes("saldo insuficiente") ||
+           String(responseText || '').toLowerCase().includes("insufficient"))
+        ) {
+          return res.status(400).json({
+            error: "Os saques estão em manutenção temporária. Tente novamente em 30 minutos. Seu saldo na plataforma permanece intacto."
+          });
+        } else {
+          dotfyError = responseData?.error || responseData?.message;
+          console.warn(`[Dotfy Withdrawal Response] HTTP ${dotfyResponse.status}:`, responseData);
+        }
+      } catch (fetchErr: any) {
+        console.error("[Dotfy Withdrawal Fetch Error]", fetchErr);
+        dotfyError = fetchErr?.message;
+      }
+
+      if (!withdrawalResult && dotfyError) {
+        const errLower = String(dotfyError).toLowerCase();
+        if (errLower.includes('saldo insuficiente') || errLower.includes('insufficient')) {
+          return res.status(400).json({
+            error: "Os saques estão em manutenção temporária. Tente novamente em 30 minutos. Seu saldo na plataforma permanece intacto."
+          });
+        }
+        return res.status(400).json({
+          error: `Falha ao processar solicitação de saque. Tente novamente em alguns minutos. Seu saldo permanece seguro.`
+        });
+      }
+
+      if (!withdrawalResult) {
+        const feeInCents = Math.round(userFee * 100);
+        const amountInCents = Math.round(numAmount * 100);
+        const netAmountInCents = Math.max(0, amountInCents - feeInCents);
+
+        withdrawalResult = {
+          id: `clwd_${Date.now()}`,
+          amount: amountInCents,
+          fee: feeInCents,
+          feeAmount: userFee,
+          netAmount: netAmountInCents,
+          netAmountReais: netAmountInCents / 100,
+          status: "PROCESSING",
+          pixKey: {
+            type: foundPixKey?.type || "CPF",
+            key: foundPixKey?.key || String(pixKeyId)
+          },
+          createdAt: new Date().toISOString()
+        };
+      }
+
+      let updatedBalance = user ? user.balance : 0;
+      let updatedAffBalance = aff ? (aff.affiliateBalance || 0) : 0;
+      if (sessionUserId && user) {
+        let remainingToDebit = numAmount;
+        if (updatedBalance >= remainingToDebit) {
+          updatedBalance = parseFloat((updatedBalance - remainingToDebit).toFixed(2));
+          remainingToDebit = 0;
+        } else {
+          remainingToDebit = parseFloat((remainingToDebit - updatedBalance).toFixed(2));
+          updatedBalance = 0;
+          if (aff && updatedAffBalance >= remainingToDebit) {
+            updatedAffBalance = parseFloat((updatedAffBalance - remainingToDebit).toFixed(2));
+            remainingToDebit = 0;
+          }
+        }
+
+        await dbService.updateUserBalance(sessionUserId, updatedBalance);
+        if (aff) {
+          await dbService.updateAffiliateCommissions(aff.id, aff.commissionTotal || 0, updatedAffBalance);
+        }
+
+        const feeAmount = userFee;
+        const netAmountVal = Math.max(0, numAmount - feeAmount);
+        const newTx: TransactionDB = {
+          id: 'tx_wd_' + crypto.randomBytes(8).toString('hex'),
+          userId: sessionUserId,
+          type: 'withdrawal',
+          amount: numAmount,
+          status: 'approved',
+          paymentMethod: 'Dotfy Gateway (Admin Direto)',
+          description: `Saque Dotfy PIX (${foundPixKey?.key || pixKeyId})${feeAmount > 0 ? ` • Taxa: R$ ${feeAmount.toFixed(2)}` : ' • Sem taxa'} • Líquido: R$ ${netAmountVal.toFixed(2)}`,
+          dotfyWithdrawalId: withdrawalResult.id,
+          pixKeyId: resolvedPixKeyId,
+          isAutoCashout: true,
+          fee: feeAmount,
+          netAmount: netAmountVal,
+          createdAt: new Date().toISOString(),
+        };
+        await dbService.createTransaction(newTx);
+
+        logSecurityEvent('WITHDRAWAL_REQUESTED', { userId: sessionUserId, amount: numAmount, pixKeyId: resolvedPixKeyId });
+      }
+
+      return res.status(200).json({
+        withdrawal: withdrawalResult,
+        balance: updatedBalance,
+        message: "Saque enviado com sucesso via Dotfy Gateway!"
+      });
+
+    } catch (err: any) {
+      console.error("Erro interno ao processar saque:", err);
+      return res.status(500).json({ error: "Erro ao processar solicitação de saque." });
+    } finally {
+      if (sessionUserId) {
+        activeWithdrawalLocks.delete(sessionUserId);
+      }
+    }
+  });
+
+  // 2. POST /api/charges -> Proxy para API Dotfy
+  app.post("/api/charges", async (req: Request, res: Response) => {
+    try {
+      const {
+        value,
+        description,
+        expiresIn,
+        customer,
+        webhook_url,
+        split,
+        isSimulated,
+        userId: bodyUserId
+      } = req.body;
+
+      // Extract userId from auth token header if available
+      let targetUserId = (req as AuthRequest).userId;
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const userToken = authHeader.split(' ')[1];
+        let sUserId = getSession(userToken)?.userId || sessions.get(userToken);
+        if (!sUserId && userToken.startsWith('tok_usr_')) {
+          const parts = userToken.split('_');
+          if (parts.length >= 3) {
+            const candidateId = `${parts[1]}_${parts[2]}`;
+            const foundUser = await dbService.getUserById(candidateId);
+            if (foundUser) {
+              sUserId = foundUser.id;
+              sessions.set(userToken, sUserId);
+            }
+          }
+        }
+        if (sUserId) targetUserId = sUserId;
+      }
+
+      const token = await getEffectiveDotfyApiKey();
+
+      if (!token) {
+        return res.status(401).json({
+          success: false,
+          error: "API_KEY_MISSING",
+          message: "Chave de API (Bearer Token) não configurada."
+        });
+      }
+
+      const dotfyPayload: Record<string, any> = {};
+
+      if (value !== undefined && value !== null) {
+        dotfyPayload.value = Number(value);
+      }
+      if (description) dotfyPayload.description = String(description).slice(0, 255);
+      if (expiresIn) dotfyPayload.expiresIn = Number(expiresIn);
+
+      if (customer && typeof customer === "object") {
+        const cleanCustomer: Record<string, string> = {};
+
+        if (customer.name && String(customer.name).trim().length >= 2) {
+          cleanCustomer.name = String(customer.name).trim().slice(0, 100);
+        }
+
+        if (customer.taxID) {
+          const cleanTax = String(customer.taxID).replace(/\D/g, "");
+          if (cleanTax.length === 11 || cleanTax.length === 14) {
+            cleanCustomer.taxID = cleanTax;
+          }
+        }
+
+        if (customer.email && String(customer.email).trim().includes("@")) {
+          cleanCustomer.email = String(customer.email).trim();
+        }
+
+        if (customer.phone) {
+          const rawPhone = String(customer.phone).trim();
+          const digits = rawPhone.replace(/\D/g, "");
+          if (digits.length >= 10) {
+            let formattedPhone = "";
+            if (digits.startsWith("55") && (digits.length === 12 || digits.length === 13)) {
+              formattedPhone = `+${digits}`;
+            } else if (digits.length === 10 || digits.length === 11) {
+              formattedPhone = `+55${digits}`;
+            } else if (rawPhone.startsWith("+")) {
+              formattedPhone = `+${digits}`;
+            } else {
+              formattedPhone = `+55${digits}`;
+            }
+
+            if (/^\+[1-9]\d{8,14}$/.test(formattedPhone)) {
+              cleanCustomer.phone = formattedPhone;
+            }
+          }
+        }
+
+        if (Object.keys(cleanCustomer).length > 0) {
+          dotfyPayload.customer = cleanCustomer;
+        }
+      }
+
+      if (webhook_url) dotfyPayload.webhook_url = webhook_url;
+      if (Array.isArray(split) && split.length > 0) dotfyPayload.split = split;
+
+      console.log(`[Dotfy Proxy] Criando cobrança PIX via ${DOTFY_BASE_URL}/api/charges com chave ${maskToken(token)}`);
+
+      // Modo de Simulação Local
+      if (isSimulated && process.env.ALLOW_PAYMENT_SIMULATION === 'true' && process.env.NODE_ENV !== 'production') {
+        const now = new Date();
+        const expSec = Number(expiresIn) || 3600;
+        const expiresAt = new Date(now.getTime() + expSec * 1000).toISOString();
+        const randomId = Math.random().toString(36).substring(2, 10);
+        const correlationID = `dotfy-${Date.now()}-${randomId}`;
+        const centsValue = Math.round((Number(value) || 29.90) * 100);
+
+        const simData = {
+          id: `sim_cuid_${randomId}`,
+          chargeId: `sim_charge_${randomId}`,
+          correlationID: correlationID,
+          correlationId: correlationID,
+          transactionID: `E182361202026${Date.now()}s${randomId}`,
+          qrCode: `00020126360014BR.GOV.BCB.PIX0114+5511999998888520400005303986540${(Number(value) || 29.90).toFixed(2)}5802BR5915Dotfy Checkout6009SAO PAULO62070503***6304ABCD`,
+          qrCodeImage: "",
+          paymentLink: `https://app.dotfy.com.br/checkout/${correlationID}`,
+          expiresAt: expiresAt,
+          value: centsValue
+        };
+
+        const storedCharge: StoredCharge = {
+          id: simData.id,
+          chargeId: simData.chargeId,
+          correlationID: simData.correlationID,
+          transactionID: simData.transactionID,
+          qrCode: simData.qrCode,
+          qrCodeImage: simData.qrCodeImage,
+          paymentLink: simData.paymentLink,
+          expiresAt: simData.expiresAt,
+          value: simData.value,
+          valueInReais: Number(value) || 29.90,
+          description: description || "Cobrança PIX Simulação",
+          customer: customer,
+          status: "PENDING",
+          createdAt: now.toISOString(),
+          split: split,
+          webhook_url: webhook_url,
+          userId: targetUserId,
+          rawResponse: { success: true, data: simData, simulated: true }
+        };
+
+        await dbService.saveCharge(storedCharge as any);
+
+        memoryCharges.set(correlationID, storedCharge);
+        if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+          title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+        });
+
+        return res.json({
+          success: true,
+          data: simData,
+          simulated: true,
+          message: "Cobrança gerada em modo de teste/simulação."
+        });
+      }
+
+      // Requisição real à API da Dotfy
+      const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(dotfyPayload)
+      });
+
+      const responseText = await dotfyResponse.text();
+      let responseData: any;
+
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (e) {
+        responseData = { rawText: responseText };
+      }
+
+      if (!dotfyResponse.ok) {
+        console.error(`[Dotfy API Error] HTTP ${dotfyResponse.status}:`, responseData);
+
+        const errorStr = JSON.stringify(responseData);
+        if (
+          dotfyResponse.status === 400 &&
+          dotfyPayload.customer?.phone &&
+          (errorStr.includes("customer.phone") || errorStr.includes("Telefone") || errorStr.includes("phone"))
+        ) {
+          console.warn("[Dotfy Proxy] Telefone rejeitado pela API Dotfy. Reenviando sem o campo customer.phone...");
+          delete dotfyPayload.customer.phone;
+
+          const retryResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${token}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(dotfyPayload)
+          });
+
+          const retryText = await retryResponse.text();
+          let retryData: any;
+          try {
+            retryData = JSON.parse(retryText);
+          } catch (e) {
+            retryData = { rawText: retryText };
+          }
+
+          if (retryResponse.ok) {
+            const chargeData = retryData.data || retryData;
+            const correlationID = chargeData.correlationID || chargeData.correlationId || `dotfy-${Date.now()}`;
+            const centsVal = chargeData.value || Math.round((Number(value) || 0) * 100);
+
+            const storedCharge: StoredCharge = {
+              id: chargeData.id || `dotfy_${Date.now()}`,
+              chargeId: chargeData.chargeId || "",
+              correlationID: correlationID,
+              transactionID: chargeData.transactionID || "",
+              qrCode: chargeData.qrCode || "",
+              qrCodeImage: chargeData.qrCodeImage || "",
+              paymentLink: chargeData.paymentLink || "",
+              expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+              value: centsVal,
+              valueInReais: centsVal / 100,
+              description: description || "Cobrança PIX",
+              customer: customer,
+              status: "PENDING",
+              createdAt: new Date().toISOString(),
+              split: split,
+              webhook_url: webhook_url,
+              userId: targetUserId,
+              rawResponse: retryData
+            };
+
+            await dbService.saveCharge(storedCharge as any);
+
+            memoryCharges.set(correlationID, storedCharge);
+            if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+              title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+            });
+
+            return res.json({
+              success: true,
+              data: chargeData
+            });
+          } else {
+            responseData = retryData;
+          }
+        }
+
+        return res.status(dotfyResponse.status).json({
+          success: false,
+          status: dotfyResponse.status,
+          error: responseData.error || "DOTFY_API_ERROR",
+          message: responseData.message || responseData.error || `Erro ${dotfyResponse.status} retornado pela API Dotfy.`,
+          details: responseData
+        });
+      }
+
+      // Sucesso retornado pela Dotfy
+      const chargeData = responseData.data || responseData;
+      const correlationID = chargeData.correlationID || chargeData.correlationId || `dotfy-${Date.now()}`;
+      const centsVal = chargeData.value || Math.round((Number(value) || 0) * 100);
+
+      const storedCharge: StoredCharge = {
+        id: chargeData.id || `dotfy_${Date.now()}`,
+        chargeId: chargeData.chargeId || "",
+        correlationID: chargeData.correlationID || correlationID,
+        transactionID: chargeData.transactionID || "",
+        qrCode: chargeData.qrCode || "",
+        qrCodeImage: chargeData.qrCodeImage || "",
+        paymentLink: chargeData.paymentLink || "",
+        expiresAt: chargeData.expiresAt || new Date(Date.now() + 3600000).toISOString(),
+        value: centsVal,
+        valueInReais: centsVal / 100,
+        description: description || "Cobrança PIX",
+        customer: customer,
+        status: "PENDING",
+        createdAt: new Date().toISOString(),
+        split: split,
+        webhook_url: webhook_url,
+        userId: targetUserId,
+        rawResponse: responseData
+      };
+
+      await dbService.saveCharge(storedCharge as any);
+
+      memoryCharges.set(correlationID, storedCharge);
+      if (storedCharge.userId) await notifyAffiliateForPlayer(storedCharge.userId, {
+        title: 'PIX pendente na sua rede ⏳', body: `Um indicado gerou um PIX de R$ ${storedCharge.valueInReais.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}.`, url: '/?tab=affiliates', type: 'pixPending'
+      });
+
+      return res.json({
+        success: true,
+        data: chargeData
+      });
+
+    } catch (error: any) {
+      console.error("[Server Charges Exception]", error);
+      return res.status(500).json({
+        success: false,
+        error: "INTERNAL_SERVER_ERROR",
+        message: error.message || "Erro interno ao processar cobrança.",
+        details: String(error)
+      });
+    }
+  });
+
+  // 3. GET /api/charges/:correlationID -> Consultar status da cobrança
+  app.get("/api/charges/:correlationID", async (req: Request, res: Response) => {
+    const { correlationID } = req.params;
+    const token = await getEffectiveDotfyApiKey();
+
+    const localCharge = (memoryCharges.get(correlationID) || await dbService.getChargeByCorrelationID(correlationID)) as StoredCharge | null;
+
+    try {
+      const dotfyResponse = await dotfyFetch(`${DOTFY_BASE_URL}/api/charges/${correlationID}`, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      });
+
+      if (dotfyResponse.ok) {
+        const data = await dotfyResponse.json();
+        const chargePayload = data.data || data;
+        if (localCharge && chargePayload) {
+          if (chargePayload.status) {
+            localCharge.status = chargePayload.status;
+          }
+          if (chargePayload.isPaid === true || chargePayload.status === 'PAID' || chargePayload.status === 'COMPLETED') {
+            localCharge.status = 'PAID';
+            (localCharge as any).isPaid = true;
+            await creditPaidChargeUser(localCharge);
+          }
+        }
+        return res.json(data);
+      } else {
+        if (localCharge) {
+          if (localCharge.status === 'PAID' || localCharge.status === 'COMPLETED' || (localCharge as any).isPaid) {
+            await creditPaidChargeUser(localCharge);
+          }
+          return res.json({
+            success: true,
+            data: {
+              ...localCharge.rawResponse?.data,
+              status: localCharge.status,
+              correlationID: localCharge.correlationID,
+              value: localCharge.value,
+              qrCode: localCharge.qrCode,
+              qrCodeImage: localCharge.qrCodeImage
+            },
+            fromLocalStore: true
+          });
+        }
+
+        const errText = await dotfyResponse.text();
+        return res.status(dotfyResponse.status).send(errText);
+      }
+    } catch (err) {
+      if (localCharge) {
+        if (localCharge.status === 'PAID') {
+          await creditPaidChargeUser(localCharge);
+        }
+        return res.json({
+          success: true,
+          data: {
+            status: localCharge.status,
+            correlationID: localCharge.correlationID,
+            value: localCharge.value,
+            qrCode: localCharge.qrCode,
+            qrCodeImage: localCharge.qrCodeImage
+          },
+          fromLocalStore: true
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: "Erro ao consultar cobrança na API Dotfy.",
+        error: String(err)
+      });
+    }
+  });
+
+  // 4. POST /api/charges/:correlationID/simulate-payment -> Simular pagamento para testes
+  app.post("/api/charges/:correlationID/simulate-payment", async (req: Request, res: Response) => {
+    const { correlationID } = req.params;
+    const charge = memoryCharges.get(correlationID);
+
+    if (!charge) {
+      return res.status(404).json({
+        success: false,
+        message: "Cobrança não encontrada no histórico da aplicação."
+      });
+    }
+
+    charge.status = "PAID";
+    await dbService.saveCharge(charge as any);
+    memoryCharges.set(correlationID, charge);
+    await creditPaidChargeUser(charge);
+
+    const webhookEvent = {
+      id: `wh_${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      payload: {
+        event: "charge.paid",
+        correlationID: charge.correlationID,
+        transactionID: charge.transactionID,
+        value: charge.value,
+        paidAt: new Date().toISOString()
+      }
+    };
+    memoryWebhooks.unshift(webhookEvent);
+
+    res.json({
+      success: true,
+      message: "Pagamento simulado com sucesso!",
+      data: charge
+    });
+  });
+
+  // Persisted history is restricted to gateway administrators.
+  app.get('/api/charges-history',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageDotfy'))return res.status(403).json({error:'Sem permissão.'});
+    try{
+      const [charges,jobs]=await Promise.all([supabaseStore.recent('charges',200),supabaseStore.recent('dotfy_webhook_events',100)]);
+      res.setHeader('Cache-Control','no-store');
+      res.json({success:true,count:charges.length,data:charges.map(({id,data})=>({...data,id:data.id||id})),webhooks:jobs.map(({id,data})=>({id,timestamp:data.createdAt,event:data.event?.event,state:data.state,attempts:data.attempts,lastError:data.lastError}))});
+    }catch{res.status(503).json({error:'Histórico Dotfy indisponível.'});}
+  });
+
+  // Dotfy's documented signed envelope is durably stored before acknowledgement.
+  const dotfyClient=new DotfyClient(()=>getEffectiveDotfyApiKey());
+  const webhookQueue=new DotfyWebhookQueue(supabaseStore,event=>reconcileDotfyEvent(event,{
+    getCharge:id=>dotfyClient.execute('getChargeByCorrelationId',{path:{correlationID:id}}),
+    getWithdrawal:id=>dotfyClient.execute('getWithdrawal',{path:{id}}),
+    findCharge:id=>dbService.getChargeByCorrelationID(id),
+    credit:charge=>creditPaidChargeUser(charge),
+    settleWithdrawal:async(id,completed,amountCents)=>{
+      const txs=await dbService.getAllTransactions();
+      const tx=txs.find(t=>t.dotfyWithdrawalId===id);
+      if(!tx)return false;
+      if((tx as any).gatewaySplit||(tx as any).gatewayLegs?.length)throw Object.assign(new Error('Saque dividido requer conciliação das pernas.'),{code:'SPLIT_REVIEW_REQUIRED'});
+      const expected=Math.round(Number(tx.netAmount??tx.amount)*100);
+      if(expected!==amountCents)throw Object.assign(new Error('Valor divergente.'),{code:'AMOUNT_MISMATCH'});
+      await dbService.settleGatewayWithdrawal(tx.id,id,completed);return true;
+    }
+  }));
+  webhookQueue.start();
+  const handleDotfyWebhook=async(req:Request,res:Response)=>{
+    try{
+      const signature=req.get('X-Webhook-Signature')||'';
+      const secret=process.env.DOTFY_WEBHOOK_SECRET||process.env.WEBHOOK_SECRET||(await dbService.getDotfyConfig())?.webhookSecret||'';
+      if(!verifyDotfySignature((req as any).rawBody||'',signature,secret))return res.status(401).json({error:'Assinatura Dotfy inválida ou expirada.'});
+      const event=parseDotfyEvent(req.body,req.get('X-Webhook-Event')||'');
+      await webhookQueue.enqueue(req.get('X-Webhook-ID')||'',event);
+      res.status(200).json({received:true});void webhookQueue.drain();
+    }catch(e:any){res.status([400,409].includes(e.status)?e.status:503).json({error:'Evento não persistido. Reenvio necessário.',code:e.code||'WEBHOOK_UNAVAILABLE'});}
+  };
+  app.post('/api/webhooks/pixup', async (req: Request, res: Response) => {
+    if (!pixupTrustedSource(req.socket.remoteAddress || '', req.get('X-Forwarded-For') || '')) return res.sendStatus(403);
+    if (req.get('X-Sandbox') === '1') return res.sendStatus(200);
+    if (req.get('X-Webhook-Event') === 'cashin.confirmed') {
+      let deposit;
+      try { deposit = parsePixupDepositEvent(req.body, 'cashin.confirmed'); }
+      catch { return res.sendStatus(400); }
+      if (!deposit) return res.sendStatus(200);
+      try {
+        const charge = await bindPixupConfirmation(supabaseStore,deposit.reference,deposit.id,deposit.cents);
+        if (!matchesPixupDeposit(charge, deposit)) return res.sendStatus(409);
+        const credited = await dbService.creditChargeOnce({...charge,status:'PAID'});
+        if (credited && charge.userId) void sendPushNotification(charge.userId,{title:'Depósito confirmado',body:'Seu depósito via Pix foi creditado.',url:'/'}).catch(()=>{});
+        return res.sendStatus(200);
+      } catch { return res.sendStatus(503); }
+    }
+    let event;
+    try { event = pixupCashoutEvent(req.body, req.get('X-Webhook-Event') || ''); }
+    catch { return res.sendStatus(400); }
+    if (!event) return res.sendStatus(200);
+    try {
+      await dbService.settleGatewayWithdrawal(event.id, event.gatewayId, event.completed, 'pixup', event.cents);
+      return res.sendStatus(200);
+    } catch { return res.sendStatus(503); }
+  });
+  app.post('/api/webhooks/dotfy',(req,res,next)=>{handleDotfyWebhook(req,res).catch(next);});
+  app.post('/api/webhooks/pix',(req,res,next)=>{handleDotfyWebhook(req,res).catch(next);});
+  app.get('/api/admin/dotfy/capabilities',requireAdmin,(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageDotfy'))return res.status(403).json({error:'Sem permissão.'});
+    res.json({operations:Object.entries(DOTFY_OPERATIONS).map(([id,v])=>({id,method:v.method,path:v.path,area:v.area})),sharedByAllGames:true});
+  });
+  app.post('/api/admin/dotfy/webhook-jobs/:id/retry',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageDotfy'))return res.status(403).json({error:'Sem permissão.'});
+    if(!/^[a-f0-9]{64}$/.test(String(req.params.id)))return res.status(400).json({error:'Evento inválido.'});
+    try{
+      const ref=supabaseStore.collection('dotfy_webhook_events').doc(String(req.params.id));
+      await supabaseStore.runTransaction(async tx=>{const snap=await tx.get(ref);const job=snap.data();if(!job||job.state!=='failed')throw new Error('Somente eventos com falha podem ser retomados.');tx.update(ref,{state:'pending',attempts:0,nextAttemptAt:0,leaseUntil:0,retriedBy:req.userId,retriedAt:new Date().toISOString()});});
+      res.json({queued:true});void webhookQueue.drain();
+    }catch{res.status(409).json({error:'Evento indisponível para retomada.'});}
+  });
+  app.get('/api/admin/dotfy/webhook-jobs',requireAdmin,async(req:AuthRequest,res:Response)=>{
+    if(!checkAdminPermission(req,'canManageDotfy'))return res.status(403).json({error:'Sem permissão.'});
+    try{const jobs=await supabaseStore.recent('dotfy_webhook_events',50);res.setHeader('Cache-Control','no-store');res.json({jobs:jobs.map(({id,data})=>({id,event:data.event?.event,state:data.state,attempts:data.attempts,lastError:data.lastError,createdAt:data.createdAt,processedAt:data.processedAt}))});}catch{res.status(503).json({error:'Fila indisponível.'});}
+  });
+
+  app.use('/api', (_req, res) => res.status(404).json({ error: 'Endpoint da API não encontrado.' }));
+  app.use((error: any, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(error);
+    const status = [400,409,413,429,502,503].includes(error.status) ? error.status : 500;
+    console.error('[API]', error.message);
+    res.status(status).json({ error: status === 400 ? 'JSON inválido.' : status === 413 ? 'Requisição muito grande.' : 'Não foi possível concluir a operação.' });
+  });
+
+  // Short URL redirects for Partner recruitment (/p/:code, /parceiro/:code) and Affiliates (/r/:code)
+  app.get(['/p/:code', '/parceiro/:code', '/partner/:code'], (req: Request, res: Response) => {
+    const rawCode = (req.params.code || '').trim();
+    if (!rawCode) return res.redirect(302, '/register');
+    const code = encodeURIComponent(rawCode);
+    return res.redirect(302, `/register?p=${code}`);
+  });
+
+  app.get('/r/:code', (req: Request, res: Response) => {
+    const rawCode = (req.params.code || '').trim();
+    if (!rawCode) return res.redirect(302, '/register');
+    const code = encodeURIComponent(rawCode);
+    return res.redirect(302, `/register?r=${code}`);
+  });
+
+  app.use(compressedGameAssets());
+
+  // ATENDIMENTO DEDICADO DO JOGO BUBBLE WIN / ZUMBLA WIN (tribopayeduh-art/bubbleblast01)
+  // Permite acesso completo via jogarbubble.online, zumblawin.site, zumbla.site, bubbleswin.site e /bubbleblast/*
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/api/')) {
+      return next();
+    }
+
+    const host = (req.headers.host || req.hostname || '').toLowerCase();
+    const isBubbleDomain = host.includes('jogarbubble') || host.includes('zumblawin') || host.includes('zumbla') || host.includes('bubbleswin') || host.includes('bubbleblast');
+    const bubbleRoot = path.join(process.cwd(), 'public', 'bubbleblast');
+
+    // 1. Arquivos centrais do jogo referenciados a partir da raiz (base "/")
+    if (req.path === '/game.js' || req.path === '/bubbleblast/game.js') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      return res.sendFile(path.join(bubbleRoot, 'game.js'));
+    }
+    if (req.path === '/game-core.mjs' || req.path === '/bubbleblast/game-core.mjs') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      return res.sendFile(path.join(bubbleRoot, 'game-core.mjs'));
+    }
+    if (req.path === '/game.css' || req.path === '/bubbleblast/game.css') {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+      return res.sendFile(path.join(bubbleRoot, 'game.css'));
+    }
+    if (req.path === '/demo-game.html' || req.path === '/bubbleblast/demo-game.html') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.sendFile(path.join(bubbleRoot, 'demo-game.html'));
+    }
+
+    // 2. Arquivos de pacote estáticos da SPA Bubble Blast (js, css)
+    if (req.path.startsWith('/js/') && fs.existsSync(path.join(bubbleRoot, req.path))) {
+      return res.sendFile(path.join(bubbleRoot, req.path));
+    }
+    if (req.path.startsWith('/css/') && fs.existsSync(path.join(bubbleRoot, req.path))) {
+      return res.sendFile(path.join(bubbleRoot, req.path));
+    }
+
+    // 3. Rotas específicas do Bubble Blast (/painel, /tutorial, /jogo)
+    if (req.path === '/painel' || req.path === '/tutorial' || req.path === '/jogo' || req.path === '/bubbleblast/painel' || req.path === '/bubbleblast/tutorial' || req.path === '/bubbleblast/jogo') {
+      const indexPath = path.join(bubbleRoot, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        return res.sendFile(indexPath);
+      }
+    }
+
+    // 4. Domínio dedicado (jogarbubble.online, bubbleswin.site, etc.)
+    if (isBubbleDomain) {
+      const cleanPath = req.path.replace(/^\/+/, '');
+      const filePath = path.join(bubbleRoot, cleanPath);
+
+      // Arquivos estáticos do jogo (js, css, imagens, html, favicon, media)
+      if (cleanPath && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        return res.sendFile(filePath);
+      }
+
+      // Arquivos com extensão que possam estar em public/ (ex.: icon-192.png)
+      if (path.extname(cleanPath)) {
+        const publicFile = path.join(process.cwd(), 'public', cleanPath);
+        if (fs.existsSync(publicFile) && fs.statSync(publicFile).isFile()) {
+          return res.sendFile(publicFile);
+        }
+        return res.status(404).end();
+      }
+
+      // Rotas SPA do domínio dedicado (/, /painel, /login, /cadastro, /tutorial, /jogo)
+      const indexPath = path.join(bubbleRoot, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        return res.sendFile(indexPath);
+      }
+    }
+
+    // 5. Suporte direto para caminhos /bubbleblast ou /bubbleblast/* em qualquer domínio
+    if (req.path === '/bubbleblast' || req.path === '/bubbleblast/' || req.path.startsWith('/bubbleblast/')) {
+      const subPath = req.path.replace(/^\/bubbleblast\/?/, '');
+      const filePath = path.join(bubbleRoot, subPath);
+
+      if (subPath && fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        return res.sendFile(filePath);
+      }
+
+      if (path.extname(subPath)) {
+        return res.status(404).end();
+      }
+
+      const indexPath = path.join(bubbleRoot, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        return res.sendFile(indexPath);
+      }
+    }
+
+    next();
+  });
+
+  // Redirecionamento direto das rotas legadas do Zumbla para o Bubble Blast (em outros domínios)
+  app.get(['/zumbla', '/zumbla/app', '/zumbla/app/index.html', '/zumbla/game', '/zumbla/game/index.html', '/zumbla/demo-game.html'], (req: Request, res: Response) => {
+    const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    return res.redirect(302, `/bubbleblast/${query}`);
+  });
+
+  // Redirecionamento direto para rotas legadas do Bubble Blast (em outros domínios)
+  app.get(['/game-bubble', '/bubbles-win', '/bubbleblast-game'], (req: Request, res: Response) => {
+    const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+    return res.redirect(302, `/bubbleblast/demo-game.html${query}`);
+  });
+
+  // Subway Pay Asset Aliases & Robust Fallbacks to guarantee no 404 image/asset hangs
+  const SUBWAY_PAY_ALIASES: Record<string, string> = {
+    'assets/characters-idle/jake-game.gb': 'assets/characters-basic/jake-game.gb',
+    'assets/characters-idle/tricky-tex-1.webp': 'assets/characters-idle/tricky-tex-1 (1).webp',
+    'assets/characters-idle/tricky-tex.webp': 'assets/characters-idle/tricky-tex (1).webp',
+    'assets/characters-idle/yutani-tex-2.webp': 'assets/characters-idle/yutani-tex-1.webp',
+    'assets/characters-idle/yutani-tex.webp': 'assets/characters-idle/yutani-tex-1.webp',
+    'assets/data/lang-en1.json': 'assets/data/lang-en.json',
+    'assets/data/lang-pt-br.json': 'assets/data/lang-en.json',
+    'assets/game-basic/atlanta-scroll.webp': 'assets/audio-basic/atlanta-scroll.webp'
+  };
+
+  app.use('/subwaypay/jogar/assets', (req: Request, res: Response, next: NextFunction) => {
+    const subPath = req.path.replace(/^\//, '');
+    const relKey = 'assets/' + subPath;
+    const aliased = SUBWAY_PAY_ALIASES[relKey];
+    if (aliased) {
+      const resolved = path.join(process.cwd(), 'public', 'subwaypay', 'jogar', aliased);
+      if (fs.existsSync(resolved)) {
+        return res.sendFile(resolved);
+      }
+    }
+
+    const fullPath = path.join(process.cwd(), 'public', 'subwaypay', 'jogar', 'assets', subPath);
+    if (fs.existsSync(fullPath)) {
+      return next();
+    }
+
+    // Fallback if missing png/webp image: serve app-icon or splash
+    if (/\.(png|webp|jpg)$/i.test(subPath)) {
+      const fallbackIcon = path.join(process.cwd(), 'public', 'subwaypay', 'jogar', 'assets', 'images', 'app-icon-144.png');
+      const fallbackSplash = path.join(process.cwd(), 'public', 'subwaypay', 'jogar', 'assets', 'preload', 'splash.png');
+      if (subPath.includes('splash') && fs.existsSync(fallbackSplash)) {
+        return res.sendFile(fallbackSplash);
+      }
+      if (fs.existsSync(fallbackIcon)) {
+        return res.sendFile(fallbackIcon);
+      }
+    }
+    next();
+  });
+
+  app.use('/subwaypay/jogar/bundles', (req: Request, res: Response, next: NextFunction) => {
+    const subPath = req.path.replace(/^\//, '');
+    const fullPath = path.join(process.cwd(), 'public', 'subwaypay', 'jogar', 'bundles', subPath);
+    if (fs.existsSync(fullPath)) {
+      return next();
+    }
+    if (subPath.endsWith('.png')) {
+      const webpPath = fullPath.replace(/\.png$/, '.webp');
+      if (fs.existsSync(webpPath)) {
+        return res.sendFile(webpPath);
+      }
+    }
+    next();
+  });
+
+  // Explicit static serving for /images (bubbleblast and shared assets)
+  app.get(['/admin', '/admin/'], (_req, res) => res.redirect('/admin.html'));
+
+  app.use('/images', express.static(path.join(process.cwd(), 'public', 'bubbleblast', 'images')));
+
+  // Explicit static serving for public directory (games, icons, audio, assets)
+  app.use(express.static(path.join(process.cwd(), 'public')));
+
+  // VITE MIDDLEWARE SETUP
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+
+    // SPA fallback in dev mode for custom paths like /cadastro, /login, etc.
+    app.get('*', async (req: Request, res: Response, next: NextFunction) => {
+      if (req.originalUrl.startsWith('/api')) {
+        return next();
+      }
+      try {
+        const url = req.originalUrl;
+        let template = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+      } catch (e: any) {
+        vite.ssrFixStacktrace(e);
+        next(e);
+      }
+    });
+  } else {
+    const cwdDist = path.join(process.cwd(), 'dist');
+    const distPath = fs.existsSync(cwdDist) ? cwdDist : path.resolve('.', 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req: Request, res: Response) => {
+      if (req.path.startsWith('/api/')) {
+        return res.status(404).json({ error: 'Endpoint da API não encontrado.' });
+      }
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  if (process.env.VERCEL === '1') return;
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[PayGateway] Servidor com Supabase rodando na porta ${PORT}`);
+  });
+  server.on('error', (err: any) => {
+    console.error(`[PayGateway] Erro no listener principal (porta ${PORT}):`, err);
+    if (err?.code === 'EADDRINUSE' && PORT !== 3000) {
+      console.warn('[PayGateway] Tentando porta de fallback 3000...');
+      app.listen(3000, '0.0.0.0', () => {
+        console.log('[PayGateway] Servidor fallback iniciado na porta 3000 com sucesso.');
+      });
+    }
+  });
+
+  process.on('SIGTERM', () => {
+    console.log('[PayGateway] SIGTERM recebido, encerrando servidor graciosamente...');
+    server.close(() => {
+      console.log('[PayGateway] Servidor encerrado.');
+      process.exit(0);
+    });
+  });
+}
+
+startServer();

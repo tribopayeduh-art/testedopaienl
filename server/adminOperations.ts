@@ -1,0 +1,26 @@
+import crypto from 'node:crypto';
+import {supabaseStore,type SupabaseStore} from './supabaseStore.ts';
+export const MANAGED_GAME_IDS=['g_gen_dino','g_block_puzzle','g_zumbla','g_raspa_fortuna','g_subway_pay','g_bubble_blast','g_count_masters'];
+const fail=(message:string,status=400)=>Object.assign(new Error(message),{status});
+function cents(value:any){const n=typeof value==='string'&&/^\d+(\.\d{1,2})?$/.test(value.trim())?Number(value):value;if(typeof n!=='number'||!Number.isFinite(n)||n<0||!Number.isSafeInteger(Math.round(n*100))||Math.abs(n*100-Math.round(n*100))>1e-6)throw fail('Valor monetário inválido. Use até duas casas decimais.');return Math.round(n*100);}
+export async function adjustAdminWallet(input:{userId:string;affiliateId?:string;adminId:string;newBalance?:any;amount?:any;actionType?:string;note?:string;key:string;expectedBalance?:number},store:SupabaseStore=supabaseStore){
+ if(!/^[a-zA-Z0-9_-]{16,100}$/.test(input.key))throw fail('Identificador de operação inválido.');
+ const mode=input.newBalance!==undefined?'set':input.actionType||'set',hasValue=input.newBalance!==undefined||input.amount!==undefined,value=hasValue?cents(input.newBalance??input.amount):0;
+ if(!['add','subtract','set'].includes(mode))throw fail('Tipo de ajuste inválido.');
+ const id='adj_'+crypto.createHash('sha256').update(input.adminId+':'+input.key).digest('hex').slice(0,40),signature=JSON.stringify([input.userId,input.affiliateId||'',mode,value,hasValue]);
+ return store.transaction(async tx=>{const ur=store.collection('users').doc(input.userId),ar=input.affiliateId?store.collection('affiliates').doc(input.affiliateId):null,receipt=store.collection('admin_balance_adjustments').doc(id);const u=(await tx.get(ur)).data(),a=ar?(await tx.get(ar)).data():null,old=(await tx.get(receipt)).data();if(!u||ar&&(!a||a.userId!==input.userId))throw fail('Carteira não encontrada.',404);if(old){if(old.signature!==signature)throw fail('Identificador já utilizado em outro ajuste.',409);return {...old,currentBalance:ar?Number(a.affiliateBalance||0):Number(u.balance||0)};}
+ const current=cents(ar?a.affiliateBalance||0:u.balance||0);if(mode==='set'&&hasValue&&input.expectedBalance!==undefined&&cents(input.expectedBalance)!==current)throw fail('O saldo mudou desde a consulta. Atualize antes de definir um valor.',409);
+ const next=!hasValue?current:mode==='set'?value:mode==='add'?current+value:current-value;if(next<0||!Number.isSafeInteger(next))throw fail('Saldo insuficiente ou ajuste fora do limite.');
+ const result={id,signature,userId:input.userId,adminId:input.adminId,wallet:ar?'affiliate':'player',before:current/100,after:next/100,amount:Math.abs(next-current)/100,note:String(input.note||'Ajuste administrativo').slice(0,1000),createdAt:new Date().toISOString()};
+ if(ar)tx.update(ar,{affiliateBalance:next/100});else tx.update(ur,{balance:next/100,gameBalances:{...(u.gameBalances||{}),[u.registeredGame||'g_block_puzzle']:next/100}});
+ tx.create(receipt,result);if(next!==current)tx.create(store.collection('transactions').doc(id),{id,userId:input.userId,type:next>current?'deposit':'withdrawal',amount:result.amount,status:'approved',paymentMethod:ar?'ADMIN_AFFILIATE_ADJUST':'ADMIN_ADJUST',description:result.note,createdAt:result.createdAt,adminId:input.adminId});return{...result,currentBalance:next/100};});
+}
+export async function bulkGameControls(ids:string[],patch:Record<string,any>,adminId:string,store:SupabaseStore=supabaseStore){
+ if(!Array.isArray(ids)||!ids.length||ids.length>7||ids.some(id=>!MANAGED_GAME_IDS.includes(id))||new Set(ids).size!==ids.length)throw fail('Selecione jogos válidos.');
+ const keys=['status','maintenance','minBet','maxBet','rtpPercent','maxMultiplier'];if(!patch||!Object.keys(patch).length||Object.keys(patch).some(k=>!keys.includes(k)))throw fail('Selecione controles válidos.');
+ if(patch.status!==undefined&&!['active','inactive'].includes(patch.status)||patch.maintenance!==undefined&&typeof patch.maintenance!=='boolean')throw fail('Status inválido.');
+ if(patch.minBet!==undefined&&cents(patch.minBet)<1||patch.maxBet!==undefined&&cents(patch.maxBet)<1)throw fail('Limites inválidos.');
+ if(patch.rtpPercent!==undefined&&(!Number.isFinite(patch.rtpPercent)||patch.rtpPercent<.1||patch.rtpPercent>99.9))throw fail('RTP deve ficar entre 0,1 e 99,9%.');
+ if(patch.maxMultiplier!==undefined&&(!Number.isFinite(patch.maxMultiplier)||patch.maxMultiplier<1.05||patch.maxMultiplier>10))throw fail('Multiplicador deve ficar entre 1,05 e 10.');
+ return store.transaction(async tx=>{const configs=[];for(const id of ids){const ref=store.collection('gameConfigs').doc(id),old=(await tx.get(ref)).data();if(!old)throw fail('Configuração não encontrada: '+id,404);const config={...old,...patch};if(Number(config.minBet)>Number(config.maxBet))throw fail('Entrada mínima maior que a máxima em '+id);configs.push({ref,old,config});}const changedAt=new Date().toISOString();for(const c of configs)tx.set(c.ref,{...c.config,configVersion:Number(c.old.configVersion||1)+1,updatedAt:changedAt});tx.create(store.collection('admin_control_changes').doc(crypto.randomUUID()),{adminId,gameIds:ids,patch,createdAt:changedAt});return{updated:ids.length,gameIds:ids,changedAt};});
+}

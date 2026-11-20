@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>iNEX | iGAMING PAINEL</title>
+
+    <!-- SEO Meta Tags -->
+    <meta name="description" content="Painel oficial de afiliados e gateway iGaming iNEX com PIX instantâneo, comissões automáticas de até 80% RevShare e métricas em tempo real." />
+    <meta name="keywords" content="iNEX, iGAMING PAINEL, Painel de Afiliados, Afiliados iGaming, Gateway iGaming, Pix Instantaneo, Afiliados 80%, RevShare iGaming, Block Win, Bubble Blast, Subway Pay, GEN DINO, Raspa Fortuna, goalliancehub" />
+    <meta name="author" content="iNEX" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href="https://goalliancehub.com/" />
+
+    <!-- Open Graph / Facebook / WhatsApp -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="iNEX" />
+    <meta property="og:locale" content="pt_BR" />
+    <meta property="og:url" content="https://goalliancehub.com/" />
+    <meta property="og:title" content="iNEX | iGAMING PAINEL" />
+    <meta property="og:description" content="Painel oficial de afiliados e gateway iGaming iNEX com PIX instantâneo, comissões automáticas de até 80% RevShare e métricas em tempo real." />
+    <meta property="og:image" content="/allifavicon.png" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="iNEX | iGAMING PAINEL — Afiliados & Gateway PIX" />
+    <meta name="twitter:description" content="Painel de afiliados e gateway oficial de iGaming iNEX com comissões de até 80% RevShare via PIX." />
+    <meta name="twitter:image" content="/allifavicon.png" />
+
+    <!-- Schema.org Structured Data (JSON-LD) -->
+    <script type="application/ld+json" id="seo-json-ld">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "WebSite",
+          "@id": "https://goalliancehub.com/#website",
+          "url": "https://goalliancehub.com/",
+          "name": "iNEX",
+          "description": "Painel e gateway de pagamentos iGaming com alta conversão, PIX instantâneo e comissões automáticas de 75%.",
+          "inLanguage": "pt-BR",
+          "publisher": {
+            "@type": "Organization",
+            "name": "iNEX",
+            "url": "https://goalliancehub.com/",
+            "logo": {
+              "@type": "ImageObject",
+              "url": "https://goalliancehub.com/allifavicon.png"
+            }
+          }
+        },
+        {
+          "@type": "ItemList",
+          "name": "Jogos Oficiais iNEX",
+          "description": "Catálogo completo de jogos com multiplicadores e saque instantâneo via PIX.",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Block Win",
+              "url": "https://blockwinner.site/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Bubble Blast",
+              "url": "https://zumblawin.site/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 3,
+              "name": "GEN DINO",
+              "url": "https://dinopay.site/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 4,
+              "name": "Raspa Fortuna",
+              "url": "https://raspadinhaadasorte.site/"
+            }
+          ]
+        }
+      ]
+    }
+    </script>
+
+    <!-- Favicon & Icons -->
+    <link rel="icon" type="image/png" href="/allifavicon.png" />
+    <link rel="shortcut icon" type="image/png" href="/allifavicon.png" />
+    <link rel="apple-touch-icon" href="/allifavicon.png" />
+
+    <!-- PWA Settings -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- iOS iPhone PWA Support -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="iNEX" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,500;0,600;0,700;0,800;0,900;1,800;1,900&family=Outfit:wght@600;700;800;900&display=swap" rel="stylesheet">
+    <script>
+      (() => {
+        const query=new URLSearchParams(location.search);
+        const route=[query.get('site')||'',query.get('game')||'',location.pathname,location.hostname].join(' ').toLowerCase();
+        const match=route.match(/count.?masters|block.?win|block.?puzzle|bubble|zumbla|subway|raspa|gen.?dino|gendino|dinopay|dinoplay|dinipay/);
+        if(!match)return;
+        document.title='Carregando jogo';
+        document.querySelectorAll('script[type="application/ld+json"],link[rel="manifest"],link[rel="icon"],link[rel="apple-touch-icon"]').forEach(el=>el.remove());
+        document.querySelectorAll('meta[content]').forEach(el=>{if(/inex/i.test(el.content))el.content='Jogos';});
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"><div style="position:fixed;inset:0;display:grid;place-items:center;background:white;color:#64748b;font:14px system-ui" role="status">Carregando…</div></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

@@ -1,0 +1,18 @@
+.auth-app-shell:has(.inex-register){max-width:1440px;min-height:0;border:0;box-shadow:0 20px 80px #26364d10}
+.inex-register .auth-form-pane{padding:clamp(28px,5vw,80px);min-width:0}
+.inex-register .auth-form-card{max-width:465px}
+.inex-register .auth-form-card h1{font-size:clamp(26px,2.6vw,38px);font-weight:650;line-height:1.15;letter-spacing:-.045em}
+.inex-register .auth-step-caption{font-size:11px;color:#526581;font-weight:650;letter-spacing:.12em}
+.inex-register .auth-form-card label{font-size:13px;color:#34445a}
+.inex-register .auth-form-card input:not([type=checkbox]){height:56px;border-radius:14px;background:#f7f9fc;font-size:16px}
+.inex-register .auth-form-card button.w-full,.inex-register .auth-form-card button[type=submit]{min-height:54px;border-radius:14px;font-size:14px;background:#23344c}
+.inex-register .auth-form-card button:first-child:focus-visible{outline-offset:3px}
+.inex-register-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;padding:0;margin-block:28px!important;list-style:none}
+.inex-register-steps li{min-width:0;display:grid;justify-items:center;gap:8px;padding:10px 2px;border-radius:12px;background:#f6f7fa;color:#536278;font-size:11px;text-align:center}
+.inex-register-steps li span{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;background:#e8edf4;font-weight:650}
+.inex-register-steps [aria-current=step]{background:#edf3fd;color:#243f68;font-weight:700}
+.inex-register-steps [aria-current=step] span{background:#2c456b;color:white}
+.inex-register-steps [data-complete=true] span{background:#dceee4;color:#25563d}
+@media(min-width:1024px){.auth-responsive-page.inex-register:not(.auth-neutral){grid-template-columns:1.05fr 1fr;min-height:max(720px,calc(100dvh - 48px))}.inex-register .inex-login-editorial h2{font-size:clamp(40px,4vw,62px)}}
+@media(max-width:1023px){.inex-register .inex-login-showcase{display:none}}
+@media(max-width:767px){.inex-register .auth-form-pane{padding-inline:22px;background:radial-gradient(ellipse at top right,#edf3fc,transparent 42%),white}.inex-register .auth-form-card>div:first-child>button{width:44px;height:44px}}

@@ -1,0 +1,29 @@
+.bw-entry{position:relative;min-height:100svh;display:flex;flex-direction:column;justify-content:center;align-items:center;color:#f4f4ff;padding:max(58px,env(safe-area-inset-top)) 16px max(30px,env(safe-area-inset-bottom));background:linear-gradient(#02091b55,#02091b76),url('/assets/games/block-win/entry-bg.webp') center bottom / cover no-repeat,#071747}
+.bw-entry-logo{width:80px;height:80px;object-fit:contain;border-radius:18px}
+.bw-auth-stack{width:min(100%,420px);display:grid;justify-items:center;gap:30px;margin:auto 0}
+.bw-card{width:100%;padding:24px 22px 18px;background:#0e1428ef;border:1px solid #263052;border-radius:14px;box-shadow:0 15px 40px #03081f45}
+.bw-card h1{font-size:24px;font-weight:800;line-height:1.25;margin:0 0 6px}
+.bw-card p{font-size:14px;color:#a2adcd;line-height:1.4;margin:0 0 22px}
+.bw-card form{display:grid;gap:14px}
+.bw-card input{display:block;width:100%;height:47px;border-radius:10px;border:1px solid #2d365e;background:#13172a;color:white;padding:0 13px;font-size:16px}
+.bw-card input::placeholder{color:#9ba3bb}
+.bw-password{position:relative}
+.bw-password input{padding-right:48px}
+.bw-password button{position:absolute;right:0;top:0;width:44px;height:47px;display:grid;place-items:center;color:#9ca8cd}
+.bw-primary{display:block;width:100%;border-radius:11px;min-height:44px;padding:10px 16px;background:linear-gradient(110deg,#7856f8,#5636ef);color:white;text-transform:uppercase;font-weight:800;box-shadow:0 9px 25px #6d50f455}
+.bw-entry button:disabled{opacity:.65}
+.bw-entry :is(button,input):focus-visible{outline:2px solid #8adfff;outline-offset:2px}
+.bw-switch{text-align:center;margin-top:8px;color:#acb7d3;font-size:13px}
+.bw-link{color:#40d5ff;min-height:40px}
+.bw-back{position:absolute;top:max(8px,env(safe-area-inset-top));left:16px}
+.bw-error{font-size:13px;color:#ffc0cf;overflow-wrap:anywhere}
+.bw-entry--home{justify-content:space-between;text-align:center;padding-top:16px}
+.bw-entry--home header{width:min(100%,1100px);display:flex;justify-content:space-between;align-items:center;text-align:left}
+.bw-entry--home header button{padding:8px 12px;border-radius:9px;background:#131c3c;margin-left:6px;min-height:42px}
+.bw-entry--home header button:last-child{background:#5636ef}
+.bw-hero{width:min(100%,450px);padding:20px;border-radius:18px;background:#071129df}
+.bw-hero h1{font-size:clamp(33px,7vw,58px);font-weight:850;line-height:1;letter-spacing:-.035em}
+.bw-hero p{margin:14px 0 22px;color:#c2cce9}
+.bw-hero .bw-link{margin-top:10px}
+.bw-entry footer{color:#c2cce9;font-size:12px;background:#09102bd9;padding:6px 10px;border-radius:8px}
+@media(min-width:720px){.bw-entry{background-size:auto,auto 100%;background-repeat:no-repeat;background-color:#061234}.bw-entry--home{padding-inline:36px}}

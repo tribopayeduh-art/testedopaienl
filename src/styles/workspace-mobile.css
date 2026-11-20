@@ -1,0 +1,74 @@
+/* Touch ergonomics and viewport behaviour shared by the two workspaces. */
+:is(.admin-minimal,.partner-minimal){min-width:0;max-width:100%;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+:is(.admin-minimal,.partner-minimal) :is(main,section,article,form,header){min-width:0}
+:is(.admin-minimal,.partner-minimal) :is(img,video,canvas){max-width:100%}
+:is(.admin-minimal,.partner-minimal) :is(button,a,summary){touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+:is(.admin-minimal,.partner-minimal) :is(input,select,textarea){max-width:100%;scroll-margin-block:90px}
+:is(.admin-minimal,.partner-minimal) :is(.overflow-x-auto,.ws-report-table,div:has(>table)){min-width:0;max-width:100%;overflow-x:auto;overscroll-behavior-x:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:#cbd1da transparent}
+:is(.admin-minimal,.partner-minimal) :is(table td,table th){overflow-wrap:anywhere}
+.ws-panel-enter{animation:ws-panel-enter .18s ease-out both}
+@keyframes ws-panel-enter{from{opacity:.7;translate:0 4px}to{opacity:1;translate:0 0}}
+@keyframes ws-sheet-enter{from{opacity:.75;translate:0 24px}to{opacity:1;translate:0 0}}
+.partner-fullscreen.partner-clean{height:var(--ws-visible-height,100dvh);max-height:100dvh;bottom:auto}
+.partner-clean .pc-workspace{display:flex;flex-direction:column;min-height:0;max-height:100%;min-width:0;overflow:hidden}
+.partner-clean .pc-content{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;scroll-padding-bottom:24px;overscroll-behavior-y:contain}
+.partner-clean .pc-header,.partner-clean .partner-section-select{flex-shrink:0}
+:is(body.inex-admin-open,body.inex-partner-open) :is(.inex-modal-backdrop,.inex-operation-overlay){max-height:var(--ws-visible-height,100dvh);overscroll-behavior:contain}
+:is(body.inex-admin-open,body.inex-partner-open) :is(.inex-dialog,.pa-detail,.inex-operation-overlay>div){max-height:calc(var(--ws-visible-height,100dvh) - 32px)!important;min-width:0;overscroll-behavior:contain}
+:is(body.inex-admin-open,body.inex-partner-open) .inex-dialog-content{overflow-y:auto;overscroll-behavior:contain;min-height:0;-webkit-overflow-scrolling:touch}
+@media(min-width:768px) and (max-width:1023px){.admin-minimal .inex-admin-sidebar{width:194px!important}.admin-minimal .inex-admin-header{padding:17px 20px!important}.admin-minimal main{padding:20px!important}.admin-minimal .inex-admin-heading h1{font-size:20px!important}.partner-clean.partner-minimal .pc-sidebar{width:192px}.partner-clean.partner-minimal .pc-content{padding:22px!important}}
+@media(max-width:767px){
+ :is(.admin-minimal,.partner-minimal){font-size:14px;overflow-x:hidden}
+ .admin-minimal{height:var(--ws-visible-height,100dvh)!important;max-height:100dvh}
+ .admin-minimal>.flex-1{min-width:0;min-height:0;overflow:hidden}
+ .admin-minimal main{overflow-x:hidden!important;overflow-y:auto;overscroll-behavior-y:contain;padding:18px 14px calc(92px + env(safe-area-inset-bottom,0px))!important;scroll-padding-bottom:95px}
+ .admin-minimal .inex-admin-header{padding:max(12px,env(safe-area-inset-top)) 14px 12px!important;align-items:center;flex-wrap:wrap;gap:10px}
+ .admin-minimal .inex-admin-heading{flex:1;min-width:0;gap:9px}.admin-minimal .inex-admin-heading>div{min-width:0}
+ .admin-minimal .inex-admin-heading h1{font-size:18px!important;line-height:1.35;overflow-wrap:anywhere}.admin-minimal .inex-admin-heading p{display:none}
+ .admin-minimal .inex-admin-heading>div>span{font-size:9px;line-height:1.5}
+ .admin-minimal .inex-admin-actions{flex-shrink:0;gap:3px}.admin-minimal .inex-admin-actions .adm-connection{display:none}
+ .admin-minimal .inex-admin-actions>button,.admin-minimal .inex-admin-menu,.adm-header-more>summary{min-height:44px!important;min-width:44px!important;height:44px!important;width:44px!important;display:grid;place-items:center}
+ .admin-minimal .inex-admin-actions>button{border:0;background:transparent}.adm-header-more>div{max-width:calc(100vw - 28px);right:0}
+ .admin-minimal .inex-admin-sidebar.is-open{height:var(--ws-visible-height,100dvh);padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);overflow-y:auto;overscroll-behavior:contain}
+ .admin-minimal .inex-admin-sidebar nav button{min-height:46px;font-size:13px}.admin-minimal .inex-admin-sidebar>header>button{min-height:44px;min-width:44px}
+ .adm-mobile-nav{padding-bottom:max(9px,env(safe-area-inset-bottom))!important;min-height:70px;gap:2px}.adm-mobile-nav button{flex:1;min-height:48px;min-width:0;padding:5px 2px;gap:4px}.adm-mobile-nav button small{font-size:10px}
+ :is(.admin-minimal,.partner-minimal) main :is(button,a[role=button],summary){min-height:44px}
+ :is(.admin-minimal,.partner-minimal) main :is(input:not([type=checkbox]):not([type=radio]):not([type=range]),select,textarea){font-size:16px!important;min-height:46px!important;line-height:1.45}
+ :is(.admin-minimal,.partner-minimal) main textarea{min-height:105px!important;resize:vertical}
+ :is(.admin-minimal,.partner-minimal) input[type=range]{min-height:38px;width:100%;accent-color:#596879}
+ :is(.admin-minimal,.partner-minimal) :is(.adm-tabs,.adm-segments){width:100%;max-width:100%;overflow-x:auto;flex-wrap:nowrap;justify-content:flex-start;scroll-snap-type:x proximity;scrollbar-width:none}
+ :is(.admin-minimal,.partner-minimal) :is(.adm-tabs,.adm-segments) button{flex-shrink:0;scroll-snap-align:start;min-height:40px!important;font-size:12px;white-space:nowrap;padding-inline:12px}
+ .admin-minimal :is(.adm-section-intro,.adm-section-header,.aus-toolbar,.gateway-heading){flex-wrap:wrap;gap:12px}
+ .admin-minimal .aus-toolbar{display:flex!important;flex-wrap:wrap}.admin-minimal .aus-toolbar>*{min-width:0;max-width:100%}
+ .admin-minimal :is(.gateway-grid,.gateway-overview,.gateway-metrics){grid-template-columns:minmax(0,1fr)!important}
+ .partner-clean.partner-minimal .pc-header{padding:max(14px,env(safe-area-inset-top)) 16px 12px!important;min-height:72px;gap:10px}
+ .partner-clean .pc-header>div:first-child{flex:1;min-width:0}.partner-clean .pc-header strong{font-size:19px;line-height:1.35;overflow-wrap:anywhere}
+ .partner-clean .pc-header>div:last-child{flex-shrink:0;gap:6px}.partner-clean .pc-header .pc-button,.partner-clean .pc-header .pc-icon{min-width:44px;min-height:44px;padding:10px}.partner-clean .pc-header .pc-button span{display:none}
+ .partner-clean .partner-section-select{margin:0 14px 12px;width:calc(100% - 28px);max-width:calc(100% - 28px);min-height:46px;font-size:16px;background:white}
+ .partner-clean.partner-minimal .pc-content{padding:8px 14px calc(24px + env(safe-area-inset-bottom))!important}
+ .partner-minimal .pc-content :is(.grid-cols-3,.grid-cols-4){grid-template-columns:minmax(0,1fr)!important}
+ .partner-minimal .pn-kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.partner-minimal .pn-kpis article{padding:15px 13px}.partner-minimal .pn-kpis article>strong{font-size:23px}
+ .partner-minimal :is(.pn-filter-row,.pn-intro,.pn-pagination){flex-wrap:wrap;gap:12px}.partner-minimal .pn-filter-row>*{max-width:100%}
+ .partner-minimal .pn-affiliate-cards{padding:0 14px}.partner-minimal .pn-affiliate-cards button{min-height:44px;min-width:44px}
+ .partner-minimal .pn-ranking li{flex-wrap:wrap;gap:10px}.partner-minimal .pn-ranking li>div{min-width:0;flex-basis:calc(100% - 70px)}
+ :is(.ws-report-toolbar,.ws-chart-head){align-items:flex-start;gap:13px}.ws-report-toolbar>div:last-child{width:100%}.ws-report-toolbar>div:last-child button{flex:1;min-width:60px}
+ .ws-report-table{margin-inline:-4px;padding-inline:4px}.ws-report-table::before{content:'Deslize a tabela para ver todas as colunas';display:block;position:sticky;left:0;font-size:10px;color:#8b96a5;padding:4px 0 12px;max-width:calc(100vw - 65px)}
+ .ws-report-card{overflow:hidden}.ws-report-card .ws-report-table{overflow-x:auto}.ws-report-table td{padding:13px!important;white-space:nowrap}
+ .ws-report-tools{grid-template-columns:minmax(0,1fr)}.ws-tool-actions{display:grid;grid-template-columns:1fr;gap:9px}.ws-tool-actions>button{width:100%;justify-content:flex-start;min-height:46px}
+ .ws-report-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.ws-report-metrics article>span{font-size:11px}.ws-report-metrics article>strong{font-size:21px;line-height:1.4}.ws-report-metrics article>small{font-size:10px;line-height:1.5}
+ .ws-report-search{align-items:stretch}.ws-report-search>input,.ws-report-search>select{flex-basis:100%;width:100%;font-size:16px;min-height:46px}
+ .nc-grid,.nc-aside{grid-template-columns:minmax(0,1fr)!important}.nc-head{flex-wrap:wrap}.nc-head h2{font-size:20px}.nc-card{padding:17px!important}.nc-preview{padding:14px!important}.nc-stats article{min-width:0}.nc-stats strong{font-size:23px}.nc-fields{grid-template-columns:1fr!important}
+ :is(body.inex-admin-open,body.inex-partner-open) :is(.inex-modal-backdrop,.inex-operation-overlay){padding:0!important;inset:0;bottom:auto;height:var(--ws-visible-height,100dvh);align-items:flex-end!important}
+ :is(body.inex-admin-open,body.inex-partner-open) :is(.inex-dialog,.inex-operation-overlay>div,.inex-operation-overlay>section){width:100%!important;max-width:100%!important;max-height:calc(var(--ws-visible-height,100dvh) - max(12px,env(safe-area-inset-top)))!important;border-radius:20px 20px 0 0!important;overflow-y:auto;animation:ws-sheet-enter .23s cubic-bezier(.2,.8,.2,1) both;padding-bottom:max(18px,env(safe-area-inset-bottom))!important}
+ :is(body.inex-admin-open,body.inex-partner-open) .inex-dialog-heading{position:sticky;top:0;background:#fff;z-index:2;padding:16px!important;border-bottom:1px solid #eef1f5;gap:10px}
+ :is(body.inex-admin-open,body.inex-partner-open) .inex-dialog-heading button{min-height:44px;min-width:44px;flex-shrink:0}
+ :is(body.inex-admin-open,body.inex-partner-open) :is(.inex-dialog-content,.inex-operation-overlay) :is(input:not([type=checkbox]):not([type=radio]),select,textarea){font-size:16px!important;min-height:46px!important}
+ :is(body.inex-admin-open,body.inex-partner-open) .inex-dialog-content{padding:16px!important;overflow-wrap:anywhere}
+ body.ws-keyboard-open .adm-mobile-nav{display:none!important}body.ws-keyboard-open .admin-minimal main{padding-bottom:20px!important}body.ws-keyboard-open .partner-section-select{display:none}body.ws-keyboard-open :is(.pc-header,.inex-admin-header){min-height:54px!important;padding-block:8px!important}
+}
+@media(max-width:359px){.admin-minimal .inex-admin-heading>div>span{display:none}.admin-minimal .inex-admin-heading h1{font-size:16px!important}.admin-minimal .inex-admin-actions{gap:0}.admin-minimal .inex-admin-actions>button{min-width:40px!important;width:40px!important}.admin-minimal .inex-admin-header{padding-inline:10px!important}.adm-header-more>summary{min-width:32px!important;width:32px!important}.ws-report-metrics{grid-template-columns:1fr}.partner-minimal .pn-kpis article>strong{font-size:20px}.partner-minimal .pn-kpis article>div svg{display:none}}
+@media(max-height:500px) and (orientation:landscape){.partner-clean .pc-header{min-height:55px!important;padding-block:8px!important}.partner-clean .partner-section-select{margin-bottom:6px;min-height:38px}.admin-minimal .inex-admin-header{padding-block:8px!important}.admin-minimal .inex-admin-heading>div>span{display:none}.adm-mobile-nav{min-height:54px!important;padding-top:4px!important}.adm-mobile-nav button{min-height:40px!important}.adm-mobile-nav button small{display:none}}
+@media(prefers-reduced-motion:reduce){.ws-panel-enter,.inex-dialog,.inex-operation-overlay>div{animation:none!important;scroll-behavior:auto!important}}
+
+.admin-minimal .inex-admin-backdrop{touch-action:none}
+:is(.admin-minimal,.partner-minimal) .nc-stats strong{overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
