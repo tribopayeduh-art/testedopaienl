@@ -1,8 +1,10 @@
+import {Modal} from './Modal';
+import {useWorkspaceMobile} from '../lib/useWorkspaceMobile';
+import '../styles/affiliate-clean.css';
 import { readApiJson } from '../lib/readApiJson';
 import {useDashboardMotion} from '../lib/useDashboardMotion';
 import {InexLoader} from './InexLoader';
 import React, { useState, useEffect, useMemo } from 'react';
-import { createPortal } from 'react-dom';
 import { AffiliateInfo, IndicationItem, InfluencerCommissionRequest, PlayerWithdrawalRequest, User } from '../types';
 import { ReferralCard } from './ReferralCard';
 import { ManageIndicatedModal } from './ManageIndicatedModal';
@@ -33,6 +35,9 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
   onOpenSettings,
   onOpenPartnerPanel,
 }) => {
+  useWorkspaceMobile('affiliate','home');
+  useEffect(()=>{document.body.classList.add('inex-affiliate-open');return()=>document.body.classList.remove('inex-affiliate-open');},[]);
+  const jumpTo=(id:string)=>document.getElementById(id)?.scrollIntoView({block:'start',behavior:window.matchMedia('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'});
   const [selectedIndication, setSelectedIndication] = useState<IndicationItem | null>(null);
   const [manageModalOpen, setManageModalOpen] = useState<boolean>(false);
   const [withdrawModalOpen, setWithdrawModalOpen] = useState<boolean>(false);
@@ -477,12 +482,13 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
     : 0;
 
   return (
-    <div ref={motionRef} className={`affiliate-hub-view affiliate-ops-theme space-y-4 pb-24 px-2 sm:px-3 lg:px-4 pt-2 sm:pt-3.5 lg:pb-28 ${affiliateTheme === 'dark' ? 'is-dark' : ''}`}>
+    <div ref={motionRef} className={`affiliate-hub-view affiliate-clean affiliate-ops-theme space-y-4 pb-24 px-2 sm:px-3 lg:px-4 pt-2 sm:pt-3.5 lg:pb-28 ${affiliateTheme === 'dark' ? 'is-dark' : ''}`}>
       {/* Top Bar with back if rendered as subview */}
       <div className="affiliate-hub-heading flex items-center gap-3">
         {onBack && (
           <button
             onClick={onBack}
+            aria-label="Voltar"
             className="w-8 h-8 rounded-full bg-[#F5F5F5] border border-[#E5E5E5] flex items-center justify-center text-[#111111] hover:bg-[#ECECEC] transition-colors cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -496,7 +502,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
           <p className="text-xs text-[#737373]">Convide pessoas e acompanhe suas indicações.</p>
         </div>
         <span className="affiliate-version-badge lg:hidden">v5</span>
-        <button onClick={() => setAffiliateTheme(theme => theme === 'light' ? 'dark' : 'light')} className="affiliate-theme-button affiliate-theme-mobile lg:hidden" aria-label="Alternar tema">{affiliateTheme === 'light' ? <Moon className="w-4 h-4"/> : <Sun className="w-4 h-4"/>}</button>
+        <button onClick={() => setAffiliateTheme(theme => theme === 'light' ? 'dark' : 'light')} className="affiliate-theme-button affiliate-theme-mobile lg:hidden" aria-label="Alternar tema claro ou escuro">{affiliateTheme === 'light' ? <Moon className="w-4 h-4"/> : <Sun className="w-4 h-4"/>}</button>
         <div className="hidden lg:flex ml-auto items-center gap-2">
           <button onClick={() => setAffiliateTheme(theme => theme === 'light' ? 'dark' : 'light')} className="affiliate-theme-button" title="Alternar tema">{affiliateTheme === 'light' ? <Moon className="w-4 h-4"/> : <Sun className="w-4 h-4"/>}<span>{affiliateTheme === 'light' ? 'Escuro' : 'Claro'}</span></button>
           <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[11px] font-extrabold text-emerald-700">
@@ -510,14 +516,24 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
         </div>
       </div>
 
+      <nav className="af-section-nav" aria-label="Áreas do programa de afiliados"><button type="button" onClick={()=>jumpTo('af-overview')}><Wallet size={16}/>Minha conta</button><button type="button" onClick={()=>jumpTo('af-performance')}><BarChart3 size={16}/>Desempenho</button><button type="button" onClick={()=>jumpTo('af-network')}><Users size={16}/>Minha rede</button></nav>
+      {/* Referral Link & Overview Cards */}
+      <div id="af-overview" className="affiliate-hub-overview">
+        <ReferralCard
+          affiliateInfo={activeInfo}
+          onCopySuccess={onCopySuccess}
+          onOpenWithdraw={() => setWithdrawModalOpen(true)}
+        />
+      </div>
+
       {/* Affiliate Operations Center */}
-      <section className="affiliate-operations-center">
+      <section id="af-performance" className="affiliate-operations-center">
         {/* Dynamic Toolbar: Scopes, Time Periods & Real-Time Sync */}
         <div className="affiliate-ops-toolbar">
           <div className="affiliate-scope-tabs overflow-x-auto no-scrollbar max-w-full">
             <button
               type="button"
-              onClick={() => setOpsScope('influencers')}
+              onClick={() => setOpsScope('influencers')} aria-pressed={opsScope==='influencers'}
               className={`affiliate-scope-btn shrink-0 ${opsScope === 'influencers' ? 'active' : ''}`}
             >
               <Users className="w-3.5 h-3.5" />
@@ -526,7 +542,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => setOpsScope('all')}
+              onClick={() => setOpsScope('all')} aria-pressed={opsScope==='all'}
               className={`affiliate-scope-btn shrink-0 ${opsScope === 'all' ? 'active' : ''}`}
             >
               <BarChart3 className="w-3.5 h-3.5" />
@@ -534,7 +550,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => setOpsScope('direct')}
+              onClick={() => setOpsScope('direct')} aria-pressed={opsScope==='direct'}
               className={`affiliate-scope-btn shrink-0 ${opsScope === 'direct' ? 'active' : ''}`}
             >
               <UserPlus className="w-3.5 h-3.5" />
@@ -547,28 +563,28 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
             <div className="affiliate-time-tabs">
               <button
                 type="button"
-                onClick={() => setOpsTimeFilter('today')}
+                onClick={() => setOpsTimeFilter('today')} aria-pressed={opsTimeFilter==='today'}
                 className={`affiliate-time-btn ${opsTimeFilter === 'today' ? 'active' : ''}`}
               >
                 Hoje
               </button>
               <button
                 type="button"
-                onClick={() => setOpsTimeFilter('7d')}
+                onClick={() => setOpsTimeFilter('7d')} aria-pressed={opsTimeFilter==='7d'}
                 className={`affiliate-time-btn ${opsTimeFilter === '7d' ? 'active' : ''}`}
               >
                 7 Dias
               </button>
               <button
                 type="button"
-                onClick={() => setOpsTimeFilter('30d')}
+                onClick={() => setOpsTimeFilter('30d')} aria-pressed={opsTimeFilter==='30d'}
                 className={`affiliate-time-btn ${opsTimeFilter === '30d' ? 'active' : ''}`}
               >
                 30 Dias
               </button>
               <button
                 type="button"
-                onClick={() => setOpsTimeFilter('all')}
+                onClick={() => setOpsTimeFilter('all')} aria-pressed={opsTimeFilter==='all'}
                 className={`affiliate-time-btn ${opsTimeFilter === 'all' ? 'active' : ''}`}
               >
                 Geral
@@ -578,7 +594,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
             <div className="affiliate-live-sync-wrap">
               <span className="affiliate-live-badge" title={`Última sincronização: ${lastSyncedTime}`}>
                 <span className="affiliate-live-dot" />
-                <span>AO VIVO</span>
+                <span>DADOS DA REDE</span>
               </span>
               <button
                 type="button"
@@ -597,7 +613,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
         {/* Section Header */}
         <div className="affiliate-ops-header">
           <div>
-            <span className="affiliate-eyebrow"><span /> OPERAÇÃO EM TEMPO REAL</span>
+            <span className="affiliate-eyebrow"><span /> VISÃO DA SUA REDE</span>
             <h2>
               {opsScope === 'influencers' ? 'Performance dos influenciadores' : opsScope === 'all' ? 'Operação Geral da Rede' : 'Performance dos Jogadores Diretos'}
             </h2>
@@ -658,7 +674,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
           <article>
             <i className="green"><BadgeDollarSign/></i>
             <div>
-              <span>Receita gerada</span>
+              <span>Volume de depósitos</span>
               <strong>R$ {operationTotals.revenue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong>
               <small>Depósitos da rede</small>
               {averageTicket > 0 && (
@@ -1111,10 +1127,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
         </div>
       </section>
 
-      {notificationCenterOpen && <div className="affiliate-notification-overlay" role="dialog" aria-modal="true" aria-label="Central de notificações" onMouseDown={e => { if (e.target === e.currentTarget) setNotificationCenterOpen(false); }}>
-        <aside className="affiliate-notification-card affiliate-notification-sheet">
-          <div className="affiliate-sheet-handle" />
-          <div className="affiliate-card-head"><div><h3>Central de notificações</h3><p>Escolha os eventos importantes</p></div><button type="button" onClick={() => setNotificationCenterOpen(false)} aria-label="Fechar"><X className="w-4 h-4"/></button></div>
+      <Modal isOpen={notificationCenterOpen} onClose={()=>setNotificationCenterOpen(false)} title="Notificações" subtitle="Escolha quais eventos deseja acompanhar" className="affiliate-clean-notifications" maxWidth={460}>
           <div className="affiliate-mode-picker"><button className={notificationMode === 'simple' ? 'active' : ''} onClick={() => setNotificationMode('simple')}>Simples<small>Evento e valor</small></button><button className={notificationMode === 'detailed' ? 'active' : ''} onClick={() => setNotificationMode('detailed')}>Detalhada<small>Influenciador, jogador e jogo</small></button></div>
           <div className="affiliate-notification-list">
             {[
@@ -1126,17 +1139,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
           </div>
           <div className="affiliate-notification-preview"><span>PRÉVIA • {notificationMode === 'simple' ? 'SIMPLES' : 'DETALHADA'}</span><strong>Novo FTD • R$ 100,00</strong>{notificationMode === 'detailed' && <p>Influenciador: Marina S. • Jogador: Carlos M. • GEN DINO</p>}</div>
           <button type="button" onClick={enableAffiliateNotifications} className={`affiliate-enable-notifications ${browserNotificationsEnabled ? 'enabled' : ''}`}><Bell className="w-4 h-4"/>{browserNotificationsEnabled ? 'Notificações ativas' : 'Ativar notificações no aparelho'}</button>
-        </aside>
-      </div>}
-
-      {/* Referral Link & Overview Cards */}
-      <div className="affiliate-hub-overview">
-        <ReferralCard
-          affiliateInfo={activeInfo}
-          onCopySuccess={onCopySuccess}
-          onOpenWithdraw={() => setWithdrawModalOpen(true)}
-        />
-      </div>
+      </Modal>
 
       {/* Unified Hub Approvals Section for Responsible Affiliate Hub */}
       {(() => {
@@ -1488,7 +1491,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
       })()}
 
       {/* Indications List */}
-      <div className="affiliate-network-panel space-y-3 pt-2">
+      <div id="af-network" className="affiliate-network-panel space-y-3 pt-2">
         {/* Controls Bar: Category Filters + Search */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 bg-white p-2.5 rounded-2xl border border-[#E5E5E5] shadow-2xs">
           {/* Filters for Jogadores / Influenciadores */}
@@ -1571,6 +1574,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
                     setSelectedIndication(ind);
                     setManageModalOpen(true);
                   }}
+                  role="button" tabIndex={0} onKeyDown={e=>{if(e.target===e.currentTarget&&(e.key==='Enter'||e.key===' ')){e.preventDefault();setSelectedIndication(ind);setManageModalOpen(true);}}} aria-label={`Gerenciar ${ind.referredName || 'indicação'}`}
                   className="affiliate-network-row p-2 sm:p-2.5 rounded-xl bg-white hover:bg-slate-50/90 border border-[#E5E5E5] hover:border-slate-300 transition-all cursor-pointer shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-2"
                 >
                 {/* User Info */}
@@ -1778,48 +1782,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
       </div>
 
       {/* POPUP INFLUENCER METRICS MODAL */}
-      {influencerMetricsItem && typeof document !== 'undefined' && createPortal(
-        <div 
-          className="fixed inset-0 z-[99999] overflow-y-auto bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 min-h-[100dvh] animate-in fade-in duration-200"
-          onClick={() => setInfluencerMetricsItem(null)}
-        >
-          <div
-            className="relative w-full max-w-lg bg-white rounded-3xl p-5 sm:p-6 shadow-2xl border border-[#E5E5E5] max-h-[88dvh] overflow-y-auto space-y-4 my-auto animate-in zoom-in-95 duration-200"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {/* Grab Handle */}
-            <div className="w-10 h-1 bg-slate-200 rounded-full mx-auto -mt-1 mb-1" />
-
-            {/* Header */}
-            <div className="flex items-start justify-between pb-3 border-b border-slate-100">
-              <div className="flex items-center gap-3">
-                <img src={logoImg} alt="Logo" className="h-8 max-w-[120px] object-contain shrink-0" />
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-bold text-sm text-[#111111]">{influencerMetricsItem.referredName}</h3>
-                    <span className="bg-amber-50 text-amber-900 border border-amber-200/80 text-[9px] px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
-                      <img src={logoImg} alt="Logo" className="h-2.5 max-w-[14px] object-contain" /> Influenciador
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500">{influencerMetricsItem.referredEmail}</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setInfluencerMetricsItem(null)}
-                className="p-1.5 rounded-full bg-[#F5F5F5] hover:bg-[#EBEBEB] text-slate-600 transition-colors cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Title / Description */}
-            <div className="bg-[#F8FAFC] p-3 rounded-2xl border border-[#E2E8F0] flex items-center gap-2">
-              <BarChart3 className="w-4 h-4 text-slate-700 shrink-0" />
-              <p className="text-xs text-slate-700 font-medium leading-relaxed">
-                Desempenho da rede de indicados vinculados a este influenciador.
-              </p>
-            </div>
-
+      {influencerMetricsItem && <Modal isOpen onClose={()=>setInfluencerMetricsItem(null)} title={influencerMetricsItem.referredName || 'Indicador'} subtitle={influencerMetricsItem.referredEmail} maxWidth={540} className="affiliate-clean-metrics"><div className="space-y-4">
             {/* Metrics Grid */}
             <div className="grid grid-cols-2 gap-2.5">
               {/* Total Depósitos da Rede */}
@@ -1923,10 +1886,7 @@ export const AffiliatesView: React.FC<AffiliatesViewProps> = ({
                 Fechar
               </button>
             </div>
-          </div>
-        </div>,
-        document.body
-      )}
+        </div></Modal>}
 
       <ManageIndicatedModal
         isOpen={manageModalOpen}

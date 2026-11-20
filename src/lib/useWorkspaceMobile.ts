@@ -1,6 +1,6 @@
 import {useEffect} from 'react';
 /** Keep full-screen workspaces inside the viewport left visible by the mobile keyboard. */
-export function useWorkspaceMobile(kind:'admin'|'partner',section:string){
+export function useWorkspaceMobile(kind:'admin'|'partner'|'affiliate',section:string){
  useEffect(()=>{
   const body=document.body,v=window.visualViewport;
   let baselineHeight=window.innerHeight;
@@ -17,7 +17,7 @@ export function useWorkspaceMobile(kind:'admin'|'partner',section:string){
   return()=>{v?.removeEventListener('resize',update);window.removeEventListener('resize',update);document.removeEventListener('focusin',focus);document.removeEventListener('focusout',update);body.classList.remove('ws-keyboard-open');body.style.removeProperty('--ws-visible-height');};
  },[kind]);
  useEffect(()=>{
-  const main=document.querySelector<HTMLElement>(kind==='admin'?'.admin-minimal main':'.partner-minimal .pc-content');if(!main)return;
+  const main=document.querySelector<HTMLElement>(kind==='admin'?'.admin-minimal main':kind==='partner'?'.partner-minimal .pc-content':'.affiliate-hub-view');if(!main)return;
   document.querySelectorAll<HTMLDetailsElement>('.adm-header-more[open]').forEach(menu=>{menu.open=false;});
   main.scrollTo({top:0,behavior:'auto'});main.classList.remove('ws-panel-enter');
   const frame=requestAnimationFrame(()=>main.classList.add('ws-panel-enter'));return()=>cancelAnimationFrame(frame);

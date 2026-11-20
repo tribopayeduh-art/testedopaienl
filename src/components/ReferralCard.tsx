@@ -10,8 +10,11 @@ interface ReferralCardProps {
 
 export const ReferralCard: React.FC<ReferralCardProps> = ({ affiliateInfo, onCopySuccess, onOpenWithdraw }) => {
   const [copied, setCopied] = useState(false);
+  const [copyError,setCopyError]=useState('');
+  const [sharing,setSharing]=useState(false);
 
   const handleCopy = async () => {
+    setCopyError('');
     try {
       await navigator.clipboard.writeText(affiliateInfo.referralLink);
     } catch {
@@ -19,15 +22,16 @@ export const ReferralCard: React.FC<ReferralCardProps> = ({ affiliateInfo, onCop
       input.value = affiliateInfo.referralLink;
       input.style.position = 'fixed';
       input.style.opacity = '0';
-      document.body.appendChild(input);
-      input.select();
-      document.execCommand('copy');
-      input.remove();
+      let success=false;
+      try{document.body.appendChild(input);input.select();success=document.execCommand('copy')===true;}catch{}finally{input.remove();}
+      if(!success){setCopyError('Não foi possível copiar. Selecione o link acima e copie manualmente.');return;}
     }
     setCopied(true);
     if (onCopySuccess) onCopySuccess();
     setTimeout(() => setCopied(false), 2000);
   };
+
+  const share=async()=>{if(!navigator.share){await handleCopy();return;}setSharing(true);try{await navigator.share({title:'Meu convite iNEX',text:'Acesse pelo meu link de convite.',url:affiliateInfo.referralLink});}catch(e:any){if(e.name!=='AbortError')setCopyError('Não foi possível compartilhar. Use a opção Copiar link.');}finally{setSharing(false);}};
 
   const formatCurrency = (val: number) => {
     return val.toLocaleString('pt-BR', {
@@ -42,10 +46,10 @@ export const ReferralCard: React.FC<ReferralCardProps> = ({ affiliateInfo, onCop
       <div className="affiliate-commission-banner bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-3 flex items-center justify-between text-emerald-900">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-          <span className="text-xs font-bold">Comissão sobre Depósitos</span>
+          <span className="text-xs font-bold">Taxa de comissão da conta</span>
         </div>
         <span className="text-xs font-extrabold bg-emerald-600 text-white px-2.5 py-0.5 rounded-full shadow-xs">
-          {affiliateInfo.revSharePercent ?? 70}% em todos os depósitos
+          {affiliateInfo.revSharePercent == null ? 'Consultar regras' : `${affiliateInfo.revSharePercent}% configurado`}
         </span>
       </div>
 
@@ -114,12 +118,10 @@ export const ReferralCard: React.FC<ReferralCardProps> = ({ affiliateInfo, onCop
         </div>
 
         <div className="bg-[#F5F5F5] border border-[#E5E5E5] rounded-xl p-3 flex items-center justify-between gap-2">
-          <span className="text-xs font-mono text-[#111111] truncate select-all">
-            {affiliateInfo.referralLink}
-          </span>
+          <input aria-label="Seu link de indicação" readOnly value={affiliateInfo.referralLink} onFocus={e=>e.currentTarget.select()} className="w-full min-w-0 bg-transparent text-xs text-[#111111] outline-none"/>
         </div>
 
-        <button
+        <div className="af-invite-actions"><button
           onClick={handleCopy}
           className={`w-full h-11 rounded-xl font-medium text-xs flex items-center justify-center gap-2 transition-all cursor-pointer ${
             copied
@@ -138,7 +140,7 @@ export const ReferralCard: React.FC<ReferralCardProps> = ({ affiliateInfo, onCop
               Copiar link
             </>
           )}
-        </button>
+        </button><button type="button" onClick={share} disabled={sharing} className="af-share-button"><Share2 size={16}/>{sharing?'Abrindo…':'Compartilhar convite'}</button></div>{copyError&&<p className="af-copy-error" role="alert">{copyError}</p>}
       </div>
     </div>
   );

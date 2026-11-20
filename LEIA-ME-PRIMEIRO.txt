@@ -1,7 +1,8 @@
-iNEX — Admin e parceiros: versão mobile
+iNEX — Programa de afiliados clean e mobile
 
-Esta versão está preparada para o repositório tribopayeduh-art/platazinha.
-Consulte MOBILE-PAINEIS.md para os ajustes móveis.
+Esta versão está preparada para o repositório tribopayeduh-art/testedopaienl.
+Consulte AFILIADOS-CLEAN.md para esta atualização.
+Os painéis admin e parceiros anteriores foram preservados.
 O visual geral está documentado em DESIGN-ADMIN-PARCEIROS.md.
 A central de notificações continua documentada em NOTIFICACOES-ADMIN.md.
 
